@@ -1,6 +1,7 @@
 import json
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from typing import Callable, List, Optional
 
@@ -17,7 +18,31 @@ def resolve_tool(configured_path: str, executable_name: str) -> Optional[str]:
         candidate = Path(configured_path)
         if candidate.exists():
             return str(candidate)
+    bundled = _resolve_bundled_tool(executable_name)
+    if bundled is not None:
+        return str(bundled)
     return shutil.which(executable_name)
+
+
+def _resolve_bundled_tool(executable_name: str) -> Optional[Path]:
+    candidates = []
+    names = [executable_name]
+    if not executable_name.lower().endswith(".exe"):
+        names.append(executable_name + ".exe")
+
+    portable_root = Path(sys.executable).resolve().parent
+    bundle_root = Path(getattr(sys, "_MEIPASS", portable_root)).resolve()
+    source_root = Path(__file__).resolve().parents[1]
+
+    for root in (portable_root, bundle_root, source_root):
+        for name in names:
+            candidates.append(root / "ffmpeg" / name)
+            candidates.append(root / name)
+
+    for candidate in candidates:
+        if candidate.exists() and candidate.is_file():
+            return candidate
+    return None
 
 
 def require_tool(configured_path: str, executable_name: str) -> str:

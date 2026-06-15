@@ -46,6 +46,31 @@ Use the large **Export Clips** button under the match editor to export the curre
 
 Set **Event** above the match list to include the event name in thumbnails, metadata, titles, and descriptions. Choose an optional thumbnail background image in **Settings -> Thumbnail background**. Put reusable social links or other upload boilerplate in **Settings -> Description boilerplate**.
 
+## Portable Windows Build
+
+Build scripts live in `build/`. The release package is a portable zip, not an installer:
+
+```powershell
+.\build\build.ps1 -Version 0.1.0 -FfmpegDir C:\tools\ffmpeg\bin
+```
+
+That creates:
+
+```text
+dist\TekkenVodHelper-v0.1.0-windows-portable.zip
+```
+
+Upload that zip to a GitHub Release. Users extract it and run `TekkenVodHelper.exe`.
+
+If the zip includes:
+
+```text
+ffmpeg\ffmpeg.exe
+ffmpeg\ffprobe.exe
+```
+
+the app finds those tools automatically. VLC media player is still installed separately for embedded playback with sound.
+
 ## Portraits
 
 By default, portraits load from the app's bundled `portraits` folder. In development, that is the repository-level `portraits` folder; in an executable build, include that folder as bundled data. You can override the folder in **Settings**. If a saved project points to a portrait folder that no longer exists, the app falls back to the bundled portraits.

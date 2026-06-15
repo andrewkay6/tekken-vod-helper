@@ -3,4 +3,10 @@ __pycache__/
 .pytest_cache/
 .venv/
 portraits/
+build/work/
+build/output/
+build/home/
+build/pyinstaller/
+dist/
+*.zip
 *_matches/
