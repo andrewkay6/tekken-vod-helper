@@ -41,6 +41,92 @@ class MatchSegment:
             notes=str(data.get("notes", "") or ""),
         )
 
+
+@dataclass
+class OverlayState:
+    description: str = ""
+    subtitle: str = ""
+    p1name: str = ""
+    p1country: str = ""
+    p1score: int = 0
+    p1team: str = ""
+    p2name: str = ""
+    p2country: str = ""
+    p2score: int = 0
+    p2team: str = ""
+    font: str = "Bahnschrift"
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "description": self.description,
+            "subtitle": self.subtitle,
+            "p1name": self.p1name,
+            "p1country": self.p1country,
+            "p1score": self.p1score,
+            "p1team": self.p1team,
+            "p2name": self.p2name,
+            "p2country": self.p2country,
+            "p2score": self.p2score,
+            "p2team": self.p2team,
+            "font": self.font,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "OverlayState":
+        return cls(
+            description=str(data.get("description", "") or ""),
+            subtitle=str(data.get("subtitle", "") or ""),
+            p1name=str(data.get("p1name", "") or ""),
+            p1country=str(data.get("p1country", "") or ""),
+            p1score=int(data.get("p1score", 0) or 0),
+            p1team=str(data.get("p1team", "") or ""),
+            p2name=str(data.get("p2name", "") or ""),
+            p2country=str(data.get("p2country", "") or ""),
+            p2score=int(data.get("p2score", 0) or 0),
+            p2team=str(data.get("p2team", "") or ""),
+            font=str(data.get("font", "Bahnschrift") or "Bahnschrift"),
+        )
+
+
+@dataclass
+class ObsSettings:
+    host: str = "127.0.0.1"
+    port: int = 4455
+    password: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "host": self.host,
+            "port": self.port,
+            "password": self.password,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "ObsSettings":
+        return cls(
+            host=str(data.get("host", "127.0.0.1") or "127.0.0.1"),
+            port=int(data.get("port", 4455) or 4455),
+            password=str(data.get("password", "") or ""),
+        )
+
+
+@dataclass
+class StartggSettings:
+    token: str = ""
+    tournament_slug: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "tournament_slug": self.tournament_slug,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "StartggSettings":
+        return cls(
+            tournament_slug=str(data.get("tournament_slug", "") or ""),
+        )
+
+
 @dataclass
 class ProjectState:
     video_path: str = ""
@@ -56,6 +142,9 @@ class ProjectState:
     players: List[str] = field(default_factory=list)
     characters: List[str] = field(default_factory=list)
     matches: List[MatchSegment] = field(default_factory=list)
+    overlay: OverlayState = field(default_factory=OverlayState)
+    obs: ObsSettings = field(default_factory=ObsSettings)
+    startgg: StartggSettings = field(default_factory=StartggSettings)
 
     def sorted_matches(self) -> List[MatchSegment]:
         return sorted(self.matches, key=lambda segment: segment.start)
@@ -75,6 +164,9 @@ class ProjectState:
             "players": self.players,
             "characters": self.characters,
             "matches": [match.to_dict() for match in self.sorted_matches()],
+            "overlay": self.overlay.to_dict(),
+            "obs": self.obs.to_dict(),
+            "startgg": self.startgg.to_dict(),
         }
 
     @classmethod
@@ -97,6 +189,9 @@ class ProjectState:
                 for item in data.get("matches", [])
                 if isinstance(item, dict)
             ],
+            overlay=OverlayState.from_dict(data.get("overlay", {}) if isinstance(data.get("overlay"), dict) else {}),
+            obs=ObsSettings.from_dict(data.get("obs", {}) if isinstance(data.get("obs"), dict) else {}),
+            startgg=StartggSettings.from_dict(data.get("startgg", {}) if isinstance(data.get("startgg"), dict) else {}),
         )
 
 

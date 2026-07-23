@@ -60,20 +60,13 @@ That creates:
 dist\TekkenVodHelper-v0.1.0-windows-portable.zip
 ```
 
-Upload that zip to a GitHub Release. Users extract it and run `TekkenVodHelper.exe`.
+Upload that zip to a GitHub Release. Users extract it and run the single `TekkenVodHelper.exe`.
 
-If the zip includes:
-
-```text
-ffmpeg\ffmpeg.exe
-ffmpeg\ffprobe.exe
-```
-
-the app finds those tools automatically. VLC media player is still installed separately for embedded playback with sound.
+Character portraits are embedded in the executable. If `-FfmpegDir` is provided, `ffmpeg.exe` and `ffprobe.exe` are embedded too. VLC media player is still installed separately for embedded playback with sound.
 
 ## Portraits
 
-By default, portraits load from the app's bundled `portraits` folder. In development, that is the repository-level `portraits` folder; in an executable build, include that folder as bundled data. You can override the folder in **Settings**. If a saved project points to a portrait folder that no longer exists, the app falls back to the bundled portraits.
+By default, portraits load from the app's bundled `portraits` folder. In development, that is the repository-level `portraits` folder; in an executable build, the portraits are embedded into `TekkenVodHelper.exe`. You can override the folder in **Settings**. If a saved project points to a portrait folder that no longer exists, the app falls back to the bundled portraits.
 
 Portrait filenames should match character names after simple normalization:
 
@@ -106,3 +99,25 @@ Explicit match ends are used when set. If a match has no end marked, export uses
 By default, clips export as `.mp4` using FFmpeg stream copy/remux for speed. Enable **Re-encode for more exact cuts** in **Settings** when starts need to be closer to the exact marked frame or the source codecs cannot be remuxed into MP4.
 
 Each match folder also includes `title.txt` and `description.txt` for manual YouTube uploads without using the YouTube API.
+
+## YouTube 1440p Upscale
+
+To upscale exported clips to 1440p with NVIDIA NVENC before uploading to YouTube:
+
+```powershell
+.\scripts\upscale-to-1440p.ps1
+```
+
+By default, this reads videos from `C:\Users\ak\Videos` and writes `.mp4` files to `C:\Users\ak\Videos\youtube_1440p`.
+
+Useful options:
+
+```powershell
+.\scripts\upscale-to-1440p.ps1 -InputDir "C:\path\to\clips"
+.\scripts\upscale-to-1440p.ps1 -InputDir "C:\path\to\clips" -Recurse
+.\scripts\upscale-to-1440p.ps1 -Cq 16
+.\scripts\upscale-to-1440p.ps1 -NvencPreset p7
+```
+
+Lower `-Cq` values produce larger, higher-quality files. The default is `18`.
+The default NVENC preset is `p5`, which is faster than `p7` and still a good fit for 1440p YouTube uploads that will be re-encoded.

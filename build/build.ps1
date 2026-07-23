@@ -31,7 +31,29 @@ $env:HOME = $ToolHome
 $env:USERPROFILE = $ToolHome
 $env:PYINSTALLER_CONFIG_DIR = $ToolConfig
 
-pyinstaller --clean --noconfirm --workpath $WorkRoot --distpath $BuildOutputRoot $SpecPath
+$PreviousBundledFfmpegDir = $env:TEKKEN_VOD_HELPER_FFMPEG_DIR
+try {
+    if ($FfmpegDir) {
+        $ResolvedFfmpegDir = Resolve-Path $FfmpegDir
+        foreach ($Tool in @("ffmpeg.exe", "ffprobe.exe")) {
+            $ToolPath = Join-Path $ResolvedFfmpegDir $Tool
+            if (-not (Test-Path -LiteralPath $ToolPath)) {
+                throw "Missing $Tool in $ResolvedFfmpegDir"
+            }
+        }
+        $env:TEKKEN_VOD_HELPER_FFMPEG_DIR = $ResolvedFfmpegDir
+    } else {
+        Remove-Item Env:\TEKKEN_VOD_HELPER_FFMPEG_DIR -ErrorAction SilentlyContinue
+    }
+
+    pyinstaller --clean --noconfirm --workpath $WorkRoot --distpath $BuildOutputRoot $SpecPath
+} finally {
+    if ($null -eq $PreviousBundledFfmpegDir) {
+        Remove-Item Env:\TEKKEN_VOD_HELPER_FFMPEG_DIR -ErrorAction SilentlyContinue
+    } else {
+        $env:TEKKEN_VOD_HELPER_FFMPEG_DIR = $PreviousBundledFfmpegDir
+    }
+}
 
 if (Test-Path -LiteralPath $PortableDir) {
     Get-ChildItem -LiteralPath $PortableDir -Force | Remove-Item -Recurse -Force
@@ -45,30 +67,18 @@ if (-not (Test-Path -LiteralPath $ExePath)) {
 }
 Copy-Item -LiteralPath $ExePath -Destination (Join-Path $PortableDir "TekkenVodHelper.exe") -Force
 
-if ($FfmpegDir) {
-    $ResolvedFfmpegDir = Resolve-Path $FfmpegDir
-    $RequiredTools = @("ffmpeg.exe", "ffprobe.exe")
-    $PortableFfmpegDir = Join-Path $PortableDir "ffmpeg"
-    New-Item -ItemType Directory -Force -Path $PortableFfmpegDir | Out-Null
-
-    foreach ($Tool in $RequiredTools) {
-        $ToolPath = Join-Path $ResolvedFfmpegDir $Tool
-        if (-not (Test-Path -LiteralPath $ToolPath)) {
-            throw "Missing $Tool in $ResolvedFfmpegDir"
-        }
-        Copy-Item -LiteralPath $ToolPath -Destination (Join-Path $PortableFfmpegDir $Tool) -Force
-    }
-}
-
 $ReadmePath = Join-Path $PortableDir "README.txt"
 @"
 Tekken VOD Helper v$Version
 
-Extract this folder and run TekkenVodHelper.exe.
+Run TekkenVodHelper.exe.
 
 FFmpeg:
-- If this package includes an ffmpeg folder, exports and previews should work without separate FFmpeg setup.
+- If this build was created with -FfmpegDir, FFmpeg is embedded in TekkenVodHelper.exe.
 - If not, install FFmpeg separately or choose ffmpeg.exe and ffprobe.exe in Settings.
+
+Portraits:
+- Character portraits are embedded in TekkenVodHelper.exe.
 
 VLC:
 - Install VLC media player separately to use embedded video playback with sound.

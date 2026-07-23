@@ -14,7 +14,7 @@ python -m pip install pyinstaller
 - Optional: a local FFmpeg folder containing `ffmpeg.exe` and `ffprobe.exe`
 - VLC media player remains a separate install for embedded playback with sound
 
-## Build a portable zip
+## Build a portable single-exe zip
 
 From the repository root:
 
@@ -29,9 +29,9 @@ dist\TekkenVodHelper-v0.1.0-windows-portable\
 dist\TekkenVodHelper-v0.1.0-windows-portable.zip
 ```
 
-The zip is the file to upload to a GitHub Release.
+The zip is the file to upload to a GitHub Release. It contains a single `TekkenVodHelper.exe` plus a short README.
 
-If you do not pass `-FfmpegDir`, the portable package is still built, but users must install FFmpeg separately or choose `ffmpeg.exe` and `ffprobe.exe` in Settings.
+Portraits are embedded in `TekkenVodHelper.exe`. If you pass `-FfmpegDir`, `ffmpeg.exe` and `ffprobe.exe` are embedded in `TekkenVodHelper.exe` too. If you do not pass `-FfmpegDir`, the portable package is still built, but users must install FFmpeg separately or choose `ffmpeg.exe` and `ffprobe.exe` in Settings.
 
 ## GitHub Release
 

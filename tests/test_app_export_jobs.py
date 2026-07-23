@@ -1,3 +1,6 @@
+from pathlib import Path
+
+from tekken_vod_helper import app as app_module
 from tekken_vod_helper.app import TekkenVodHelperApp
 from tekken_vod_helper.models import ExportJob, MatchSegment, ProjectState
 
@@ -131,3 +134,68 @@ def test_upload_sidecars_include_event_and_boilerplate(tmp_path):
     description = (tmp_path / "description.txt").read_text(encoding="utf-8")
     assert "Event: Friday Night Tekken" in description
     assert "Follow us: https://example.test" in description
+
+
+def test_export_artifacts_use_resolved_portrait_dir(tmp_path, monkeypatch):
+    state = ProjectState(event_name="Event", thumbnail_background_path="")
+    match = MatchSegment(start=10.0, end=90.0, player1="Alice", player2="Bob", character1="Jin")
+    app = make_app(state)
+    app._resolved_portrait_dir = lambda: str(tmp_path / "bundled_portraits")
+    calls = []
+
+    def fake_make_thumbnail(*args, **kwargs):
+        calls.append((args, kwargs))
+        Path(args[4]).write_text("thumbnail", encoding="utf-8")
+
+    monkeypatch.setattr(app_module, "make_thumbnail", fake_make_thumbnail)
+    job = ExportJob(
+        match=match,
+        index=1,
+        start=match.start,
+        end=match.end,
+        folder_name="match",
+        clip_path=str(tmp_path / "clip.mp4"),
+        thumbnail_path=str(tmp_path / "thumbnail.jpg"),
+        metadata_path=str(tmp_path / "match.json"),
+        title_path=str(tmp_path / "title.txt"),
+        description_path=str(tmp_path / "description.txt"),
+    )
+
+    app._write_export_artifacts(job)
+
+    assert calls[0][0][5] == str(tmp_path / "bundled_portraits")
+    assert (tmp_path / "match.json").exists()
+    assert (tmp_path / "title.txt").exists()
+    assert (tmp_path / "description.txt").exists()
+
+
+def test_metadata_only_worker_writes_artifacts_without_video_clip(tmp_path, monkeypatch):
+    state = ProjectState(event_name="Event")
+    match = MatchSegment(start=10.0, end=90.0, player1="Alice", player2="Bob")
+    app = make_app(state)
+    app._resolved_portrait_dir = lambda: str(tmp_path / "portraits")
+    app.log_queue = type("DummyQueue", (), {"items": [], "put": lambda self, item: self.items.append(item)})()
+
+    def fake_make_thumbnail(*args, **_kwargs):
+        Path(args[4]).write_text("thumbnail", encoding="utf-8")
+
+    monkeypatch.setattr(app_module, "make_thumbnail", fake_make_thumbnail)
+    job = ExportJob(
+        match=match,
+        index=1,
+        start=match.start,
+        end=match.end,
+        folder_name="match",
+        clip_path=str(tmp_path / "match" / "clip.mp4"),
+        thumbnail_path=str(tmp_path / "match" / "thumbnail.jpg"),
+        metadata_path=str(tmp_path / "match" / "match.json"),
+        title_path=str(tmp_path / "match" / "title.txt"),
+        description_path=str(tmp_path / "match" / "description.txt"),
+    )
+
+    app._metadata_only_worker([job], str(tmp_path))
+
+    assert not (tmp_path / "match" / "clip.mp4").exists()
+    assert (tmp_path / "match" / "thumbnail.jpg").read_text(encoding="utf-8") == "thumbnail"
+    assert (tmp_path / "match" / "match.json").exists()
+    assert app.log_queue.items == [("done", "Metadata generation complete.")]
