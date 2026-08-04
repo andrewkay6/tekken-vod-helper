@@ -29,9 +29,9 @@ dist\TekkenVodHelper-v0.1.0-windows-portable\
 dist\TekkenVodHelper-v0.1.0-windows-portable.zip
 ```
 
-The zip is the file to upload to a GitHub Release. It contains a single `TekkenVodHelper.exe` plus a short README.
+The zip is the file to upload to a GitHub Release. It contains `TekkenVodHelper.exe`, a short README, and an `ffmpeg` folder when `-FfmpegDir` is provided.
 
-Portraits are embedded in `TekkenVodHelper.exe`. If you pass `-FfmpegDir`, `ffmpeg.exe` and `ffprobe.exe` are embedded in `TekkenVodHelper.exe` too. If you do not pass `-FfmpegDir`, the portable package is still built, but users must install FFmpeg separately or choose `ffmpeg.exe` and `ffprobe.exe` in Settings.
+Portraits are embedded in `TekkenVodHelper.exe`. If you pass `-FfmpegDir`, `ffmpeg.exe` and `ffprobe.exe` are embedded in `TekkenVodHelper.exe` and copied next to the exe in `ffmpeg\` for a more inspectable portable package. If you do not pass `-FfmpegDir`, the portable package is still built, the stream overlay still works, but users must install FFmpeg separately or choose `ffmpeg.exe` and `ffprobe.exe` in Settings before loading/exporting video.
 
 ## GitHub Release
 

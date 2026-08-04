@@ -1,6 +1,9 @@
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+DEFAULT_OVERLAY_ACCENT_COLOR = "#f3135e"
+DEFAULT_OVERLAY_OPACITY = 1.0
+
 
 @dataclass
 class MatchSegment:
@@ -55,6 +58,8 @@ class OverlayState:
     p2score: int = 0
     p2team: str = ""
     font: str = "Bahnschrift"
+    accent_color: str = DEFAULT_OVERLAY_ACCENT_COLOR
+    opacity: float = DEFAULT_OVERLAY_OPACITY
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -69,6 +74,8 @@ class OverlayState:
             "p2score": self.p2score,
             "p2team": self.p2team,
             "font": self.font,
+            "accent_color": self.accent_color,
+            "opacity": self.opacity,
         }
 
     @classmethod
@@ -85,6 +92,8 @@ class OverlayState:
             p2score=int(data.get("p2score", 0) or 0),
             p2team=str(data.get("p2team", "") or ""),
             font=str(data.get("font", "Bahnschrift") or "Bahnschrift"),
+            accent_color=str(data.get("accent_color", DEFAULT_OVERLAY_ACCENT_COLOR) or DEFAULT_OVERLAY_ACCENT_COLOR),
+            opacity=float(data.get("opacity", DEFAULT_OVERLAY_OPACITY) or DEFAULT_OVERLAY_OPACITY),
         )
 
 

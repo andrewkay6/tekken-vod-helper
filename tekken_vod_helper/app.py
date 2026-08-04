@@ -10,7 +10,7 @@ from tkinter import filedialog, messagebox, ttk
 from typing import Dict, List, Optional, Tuple
 
 from .ffmpeg_tools import FfmpegError, extract_frame, probe_duration, require_tool, slice_clip
-from .models import ExportJob, MatchSegment, OverlayState, ProjectState
+from .models import DEFAULT_OVERLAY_ACCENT_COLOR, DEFAULT_OVERLAY_OPACITY, ExportJob, MatchSegment, OverlayState, ProjectState
 from .obs_client import ObsClient, ObsError
 from .overlay_server import OverlayServer
 from .startgg_client import BracketSet, TournamentSummary, fetch_bracket_sets, fetch_owned_tournaments, normalize_tournament_slug
@@ -66,6 +66,8 @@ class TekkenVodHelperApp(tk.Tk):
         self.fetching_startgg_events = False
         self.fetching_startgg_sets = False
         self.overlay_server = OverlayServer(self._overlay_static_dir())
+        self.overlay_apply_after_id: Optional[str] = None
+        self.overlay_auto_apply_enabled = False
         self.output_var = tk.StringVar(value=self.state.output_dir)
         self.event_var = tk.StringVar(value=self.state.event_name)
         self.portrait_var = tk.StringVar(value=self.state.portrait_dir)
@@ -82,6 +84,8 @@ class TekkenVodHelperApp(tk.Tk):
         self.overlay_p1score_var = tk.IntVar(value=self.state.overlay.p1score)
         self.overlay_p2score_var = tk.IntVar(value=self.state.overlay.p2score)
         self.overlay_font_var = tk.StringVar(value=self.state.overlay.font)
+        self.overlay_accent_color_var = tk.StringVar(value=self.state.overlay.accent_color)
+        self.overlay_opacity_var = tk.StringVar(value="{:.0f}".format(self.state.overlay.opacity * 100))
         self.overlay_url_var = tk.StringVar(value=self.overlay_server.url)
         self.obs_host_var = tk.StringVar(value=self.state.obs.host)
         self.obs_port_var = tk.StringVar(value=str(self.state.obs.port))
@@ -108,8 +112,10 @@ class TekkenVodHelperApp(tk.Tk):
         self.current_mode = "overlay"
         self._build_menu()
         self._build_ui()
+        self._bind_overlay_auto_apply()
         self._start_overlay_server()
         self.apply_overlay(log_message=False)
+        self.overlay_auto_apply_enabled = True
         self._refresh_combo_values()
         self._refresh_tree()
         self.after(150, self._poll_log_queue)
@@ -290,13 +296,15 @@ class TekkenVodHelperApp(tk.Tk):
     def _mousewheel_belongs_to_combobox(self, event) -> bool:
         widget = getattr(event, "widget", None)
         try:
-            if widget is not None and widget.winfo_class() == "TCombobox":
-                return True
-            if widget is not None and widget.winfo_class() == "Listbox":
+            if isinstance(widget, str):
+                widget = self.nametowidget(widget)
+            widget_class = widget.winfo_class() if widget is not None and hasattr(widget, "winfo_class") else ""
+            if widget_class in ("TCombobox", "Listbox"):
                 return True
             focus = self.focus_get()
-            return focus is not None and focus.winfo_class() == "TCombobox"
-        except tk.TclError:
+            focus_class = focus.winfo_class() if focus is not None and hasattr(focus, "winfo_class") else ""
+            return focus_class == "TCombobox"
+        except (KeyError, tk.TclError):
             return False
 
     def _build_overlay_panel(self, parent: ttk.Frame) -> None:
@@ -336,9 +344,7 @@ class TekkenVodHelperApp(tk.Tk):
         buttons.columnconfigure(1, weight=1)
         ttk.Button(buttons, text="Swap", command=self.swap_overlay_players).grid(row=0, column=0, sticky="ew", padx=(0, 4))
         ttk.Button(buttons, text="Reset Scores", command=self.reset_overlay_scores).grid(row=0, column=1, sticky="ew", padx=4)
-        ttk.Button(buttons, text="Apply Overlay", command=self.apply_overlay).grid(row=1, column=0, sticky="ew", padx=(0, 4), pady=(6, 0))
-        ttk.Button(buttons, text="Apply + Capture Match", command=self.apply_overlay_and_capture_match).grid(row=1, column=1, sticky="ew", padx=4, pady=(6, 0))
-        ttk.Button(buttons, text="Match JSON", command=self.open_match_json_window).grid(row=2, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        ttk.Button(buttons, text="Match JSON", command=self.open_match_json_window).grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 0))
 
         bracket = ttk.LabelFrame(parent, text="start.gg Bracket", padding=8)
         bracket.grid(row=1, column=0, sticky="nsew", padx=4, pady=(0, 8))
@@ -357,15 +363,30 @@ class TekkenVodHelperApp(tk.Tk):
         self.startgg_tournament_combo = ttk.Combobox(self.startgg_controls, textvariable=self.startgg_tournament_var, state="readonly")
         self.startgg_tournament_combo.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 3))
         self.startgg_tournament_combo.bind("<<ComboboxSelected>>", lambda _event: self.use_selected_tournament())
-        ttk.Label(self.startgg_controls, text="Tournament").grid(row=1, column=0, sticky="w", padx=(0, 6), pady=3)
-        ttk.Entry(self.startgg_controls, textvariable=self.startgg_slug_var).grid(row=1, column=1, sticky="ew", pady=3)
         self.bracket_set_combo = ttk.Combobox(self.startgg_controls, textvariable=self.bracket_set_var, state="readonly")
-        self.bracket_set_combo.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(6, 3))
+        self.bracket_set_combo.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(6, 3))
         self.bracket_set_combo.bind("<<ComboboxSelected>>", lambda _event: self.use_selected_bracket_set())
         self._set_startgg_controls_visible(False)
 
-        obs = ttk.LabelFrame(parent, text="OBS Recording Time", padding=8)
-        obs.grid(row=2, column=0, sticky="ew", padx=4, pady=(0, 8))
+        history = ttk.LabelFrame(parent, text="VOD History", padding=8)
+        history.grid(row=2, column=0, sticky="ew", padx=4, pady=(0, 8))
+        history.columnconfigure(0, weight=1)
+        ttk.Button(
+            history,
+            text="Save Current Overlay as VOD Match",
+            command=self.apply_overlay_and_capture_match,
+        ).grid(row=0, column=0, sticky="ew")
+
+        advanced = ttk.LabelFrame(parent, text="Technical Settings", padding=8)
+        advanced.grid(row=3, column=0, sticky="ew", padx=4, pady=(0, 4))
+        advanced.columnconfigure(1, weight=1)
+        self.advanced_section = advanced
+        ttk.Label(advanced, text="Browser source").grid(row=0, column=0, sticky="w", padx=(0, 6), pady=3)
+        ttk.Entry(advanced, textvariable=self.overlay_url_var, state="readonly").grid(row=0, column=1, sticky="ew", pady=3)
+        ttk.Label(advanced, text="start.gg slug").grid(row=1, column=0, sticky="w", padx=(0, 6), pady=3)
+        ttk.Entry(advanced, textvariable=self.startgg_slug_var).grid(row=1, column=1, sticky="ew", pady=3)
+        obs = ttk.LabelFrame(advanced, text="OBS Recording Time", padding=8)
+        obs.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 0))
         obs.columnconfigure(1, weight=1)
         ttk.Label(obs, text="Host").grid(row=0, column=0, sticky="w", padx=(0, 6), pady=3)
         ttk.Entry(obs, textvariable=self.obs_host_var).grid(row=0, column=1, sticky="ew", pady=3)
@@ -375,14 +396,7 @@ class TekkenVodHelperApp(tk.Tk):
         ttk.Entry(obs, textvariable=self.obs_password_var, show="*").grid(row=1, column=1, columnspan=3, sticky="ew", pady=3)
         ttk.Button(obs, text="Test OBS", command=self.test_obs_connection).grid(row=2, column=0, sticky="ew", pady=(6, 0))
         ttk.Label(obs, textvariable=self.obs_status_var, anchor="w").grid(row=2, column=1, columnspan=3, sticky="ew", padx=(8, 0), pady=(6, 0))
-
-        advanced = ttk.LabelFrame(parent, text="Technical Settings", padding=8)
-        advanced.grid(row=3, column=0, sticky="ew", padx=4, pady=(0, 4))
-        advanced.columnconfigure(1, weight=1)
-        self.advanced_section = advanced
-        ttk.Label(advanced, text="Browser source").grid(row=0, column=0, sticky="w", padx=(0, 6), pady=3)
-        ttk.Entry(advanced, textvariable=self.overlay_url_var, state="readonly").grid(row=0, column=1, sticky="ew", pady=3)
-        self._build_log_panel(advanced, row=1, padx=0, pady=(8, 0))
+        self._build_log_panel(advanced, row=3, padx=0, pady=(8, 0))
         self.toggle_advanced_data()
 
     def toggle_advanced_data(self) -> None:
@@ -937,9 +951,17 @@ class TekkenVodHelperApp(tk.Tk):
             p2name=self.overlay_p2_var.get().strip(),
             p2score=self._int_var(self.overlay_p2score_var),
             font=self.overlay_font_var.get().strip() or "Bahnschrift",
+            accent_color=self._normalized_overlay_accent_color(),
+            opacity=self._normalized_overlay_opacity() / 100.0,
         )
 
     def apply_overlay(self, log_message: bool = True) -> None:
+        if self.overlay_apply_after_id is not None:
+            try:
+                self.after_cancel(self.overlay_apply_after_id)
+            except tk.TclError:
+                pass
+            self.overlay_apply_after_id = None
         self.state.overlay = self._overlay_state_from_controls()
         self.overlay_server.write_state(self.state.overlay)
         self.state.players = unique_sorted(self.state.players + [self.state.overlay.p1name, self.state.overlay.p2name])
@@ -949,6 +971,33 @@ class TekkenVodHelperApp(tk.Tk):
         self._refresh_combo_values()
         if log_message:
             self.log("Overlay applied.")
+
+    def _bind_overlay_auto_apply(self) -> None:
+        variables = [
+            self.overlay_description_var,
+            self.overlay_subtitle_var,
+            self.overlay_p1_var,
+            self.overlay_p2_var,
+            self.overlay_character1_var,
+            self.overlay_character2_var,
+            self.overlay_p1score_var,
+            self.overlay_p2score_var,
+            self.overlay_font_var,
+            self.overlay_accent_color_var,
+            self.overlay_opacity_var,
+        ]
+        for variable in variables:
+            variable.trace_add("write", lambda *_args: self._schedule_overlay_apply())
+
+    def _schedule_overlay_apply(self) -> None:
+        if not self.overlay_auto_apply_enabled or self.loading_form:
+            return
+        if self.overlay_apply_after_id is not None:
+            try:
+                self.after_cancel(self.overlay_apply_after_id)
+            except tk.TclError:
+                pass
+        self.overlay_apply_after_id = self.after(120, lambda: self.apply_overlay(log_message=False))
 
     def apply_overlay_and_capture_match(self) -> None:
         self.apply_overlay(log_message=False)
@@ -1120,14 +1169,24 @@ class TekkenVodHelperApp(tk.Tk):
         self.bracket_sets = sets
         self.bracket_set_by_label = {}
         labels = []
+        label_counts: Dict[str, int] = {}
         for item in sets:
-            label = "{} [{}]".format(item.label, item.id)
+            base_label = item.label
+            label_counts[base_label] = label_counts.get(base_label, 0) + 1
+            label = base_label if label_counts[base_label] == 1 else "{} ({})".format(base_label, label_counts[base_label])
             labels.append(label)
             self.bracket_set_by_label[label] = item
         for combo in self._bracket_set_combos():
             combo.configure(values=labels)
         if labels:
             self.bracket_set_var.set("")
+            self.state.players = unique_sorted(
+                self.state.players + [player for item in sets for player in (item.player1, item.player2)]
+            )
+            self.state.characters = unique_sorted(
+                self.state.characters + [character for item in sets for character in (item.character1, item.character2)]
+            )
+            self._refresh_combo_values()
             self._set_startgg_controls_visible(True)
             self.startgg_status_var.set("Loaded bracket sets. Choose a set to populate the current mode.")
         else:
@@ -1296,63 +1355,82 @@ class TekkenVodHelperApp(tk.Tk):
         ffprobe_var = tk.StringVar(value=self.state.ffprobe_path)
         startgg_token_var = tk.StringVar(value=self.startgg_token_var.get())
         overlay_font_var = tk.StringVar(value=self.overlay_font_var.get())
+        overlay_accent_color_var = tk.StringVar(value=self.overlay_accent_color_var.get())
+        overlay_opacity_var = tk.StringVar(value=self.overlay_opacity_var.get())
         reencode_var = tk.BooleanVar(value=self.state.reencode)
 
         body = ttk.Frame(dialog, padding=12)
         body.grid(row=0, column=0, sticky="nsew")
-        body.columnconfigure(1, weight=1)
+        body.columnconfigure(0, weight=1)
 
-        ttk.Label(body, text="Output override").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=4)
-        ttk.Entry(body, textvariable=output_var, width=56).grid(row=0, column=1, sticky="ew", pady=4)
-        ttk.Button(body, text="Browse", command=lambda: self._choose_directory(output_var, "Choose output folder")).grid(row=0, column=2, padx=(6, 0), pady=4)
-        ttk.Label(body, text="Blank uses <video name>_matches.").grid(row=1, column=1, sticky="w", pady=(0, 8))
+        notebook = ttk.Notebook(body)
+        notebook.grid(row=0, column=0, sticky="nsew")
+        general_tab = ttk.Frame(notebook, padding=10)
+        visual_tab = ttk.Frame(notebook, padding=10)
+        notebook.add(general_tab, text="General")
+        notebook.add(visual_tab, text="Stream Visual Settings")
+        general_tab.columnconfigure(1, weight=1)
+        visual_tab.columnconfigure(1, weight=1)
 
-        ttk.Label(body, text="Portrait folder").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=4)
-        ttk.Entry(body, textvariable=portrait_var, width=56).grid(row=2, column=1, sticky="ew", pady=4)
-        ttk.Button(body, text="Browse", command=lambda: self._choose_directory(portrait_var, "Choose portrait folder")).grid(row=2, column=2, padx=(6, 0), pady=4)
-        ttk.Label(body, text="Blank uses bundled portraits.").grid(row=3, column=1, sticky="w", pady=(0, 8))
+        ttk.Label(general_tab, text="Output override").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Entry(general_tab, textvariable=output_var, width=56).grid(row=0, column=1, sticky="ew", pady=4)
+        ttk.Button(general_tab, text="Browse", command=lambda: self._choose_directory(output_var, "Choose output folder")).grid(row=0, column=2, padx=(6, 0), pady=4)
+        ttk.Label(general_tab, text="Blank uses <video name>_matches.").grid(row=1, column=1, sticky="w", pady=(0, 8))
 
-        ttk.Label(body, text="Thumbnail background").grid(row=4, column=0, sticky="w", padx=(0, 8), pady=4)
-        ttk.Entry(body, textvariable=thumbnail_background_var, width=56).grid(row=4, column=1, sticky="ew", pady=4)
-        ttk.Button(body, text="Browse", command=lambda: self._choose_image(thumbnail_background_var)).grid(row=4, column=2, padx=(6, 0), pady=4)
-        ttk.Label(body, text="Blank uses a black background.").grid(row=5, column=1, sticky="w", pady=(0, 8))
+        ttk.Label(general_tab, text="Portrait folder").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Entry(general_tab, textvariable=portrait_var, width=56).grid(row=2, column=1, sticky="ew", pady=4)
+        ttk.Button(general_tab, text="Browse", command=lambda: self._choose_directory(portrait_var, "Choose portrait folder")).grid(row=2, column=2, padx=(6, 0), pady=4)
+        ttk.Label(general_tab, text="Blank uses bundled portraits.").grid(row=3, column=1, sticky="w", pady=(0, 8))
 
-        ttk.Label(body, text="ffmpeg").grid(row=6, column=0, sticky="w", padx=(0, 8), pady=4)
-        ttk.Entry(body, textvariable=ffmpeg_var, width=56).grid(row=6, column=1, sticky="ew", pady=4)
-        ttk.Button(body, text="Browse", command=lambda: self._choose_executable(ffmpeg_var)).grid(row=6, column=2, padx=(6, 0), pady=4)
+        ttk.Label(general_tab, text="Thumbnail background").grid(row=4, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Entry(general_tab, textvariable=thumbnail_background_var, width=56).grid(row=4, column=1, sticky="ew", pady=4)
+        ttk.Button(general_tab, text="Browse", command=lambda: self._choose_image(thumbnail_background_var)).grid(row=4, column=2, padx=(6, 0), pady=4)
+        ttk.Label(general_tab, text="Blank uses a black background.").grid(row=5, column=1, sticky="w", pady=(0, 8))
 
-        ttk.Label(body, text="ffprobe").grid(row=7, column=0, sticky="w", padx=(0, 8), pady=4)
-        ttk.Entry(body, textvariable=ffprobe_var, width=56).grid(row=7, column=1, sticky="ew", pady=4)
-        ttk.Button(body, text="Browse", command=lambda: self._choose_executable(ffprobe_var)).grid(row=7, column=2, padx=(6, 0), pady=4)
+        ttk.Label(general_tab, text="ffmpeg").grid(row=6, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Entry(general_tab, textvariable=ffmpeg_var, width=56).grid(row=6, column=1, sticky="ew", pady=4)
+        ttk.Button(general_tab, text="Browse", command=lambda: self._choose_executable(ffmpeg_var)).grid(row=6, column=2, padx=(6, 0), pady=4)
 
-        ttk.Label(body, text="start.gg token").grid(row=8, column=0, sticky="w", padx=(0, 8), pady=4)
-        ttk.Entry(body, textvariable=startgg_token_var, show="*", width=56).grid(row=8, column=1, sticky="ew", pady=4)
-        token_buttons = ttk.Frame(body)
+        ttk.Label(general_tab, text="ffprobe").grid(row=7, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Entry(general_tab, textvariable=ffprobe_var, width=56).grid(row=7, column=1, sticky="ew", pady=4)
+        ttk.Button(general_tab, text="Browse", command=lambda: self._choose_executable(ffprobe_var)).grid(row=7, column=2, padx=(6, 0), pady=4)
+
+        ttk.Label(general_tab, text="start.gg token").grid(row=8, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Entry(general_tab, textvariable=startgg_token_var, show="*", width=56).grid(row=8, column=1, sticky="ew", pady=4)
+        token_buttons = ttk.Frame(general_tab)
         token_buttons.grid(row=8, column=2, sticky="ew", padx=(6, 0), pady=4)
         ttk.Button(token_buttons, text="Save", command=lambda: self._save_startgg_token_value(startgg_token_var.get())).grid(row=0, column=0, sticky="ew")
         ttk.Button(token_buttons, text="Clear", command=lambda: self._clear_startgg_token_value(startgg_token_var)).grid(row=0, column=1, sticky="ew", padx=(4, 0))
 
-        ttk.Label(body, text="Overlay font").grid(row=9, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Label(general_tab, text="Description boilerplate").grid(row=9, column=0, sticky="nw", padx=(0, 8), pady=4)
+        boilerplate_text = tk.Text(general_tab, width=56, height=5, wrap="word")
+        boilerplate_text.grid(row=9, column=1, columnspan=2, sticky="ew", pady=4)
+        boilerplate_text.insert("1.0", self.state.description_boilerplate)
+
+        ttk.Checkbutton(general_tab, text="Re-encode for more exact cuts", variable=reencode_var).grid(row=10, column=1, sticky="w", pady=(6, 10))
+
+        ttk.Label(visual_tab, text="Overlay font").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=4)
         ttk.Combobox(
-            body,
+            visual_tab,
             textvariable=overlay_font_var,
             values=["Bahnschrift", "Segoe UI", "Arial", "Trebuchet MS", "Tahoma", "Verdana"],
             state="readonly",
             width=53,
-        ).grid(row=9, column=1, sticky="ew", pady=4)
+        ).grid(row=0, column=1, sticky="ew", pady=4)
 
-        ttk.Label(body, text="Description boilerplate").grid(row=10, column=0, sticky="nw", padx=(0, 8), pady=4)
-        boilerplate_text = tk.Text(body, width=56, height=5, wrap="word")
-        boilerplate_text.grid(row=10, column=1, columnspan=2, sticky="ew", pady=4)
-        boilerplate_text.insert("1.0", self.state.description_boilerplate)
+        ttk.Label(visual_tab, text="Accent color").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Entry(visual_tab, textvariable=overlay_accent_color_var, width=56).grid(row=1, column=1, sticky="ew", pady=4)
+        ttk.Label(visual_tab, text="Hex color, e.g. {}.".format(DEFAULT_OVERLAY_ACCENT_COLOR)).grid(row=2, column=1, sticky="w", pady=(0, 8))
 
-        ttk.Checkbutton(body, text="Re-encode for more exact cuts", variable=reencode_var).grid(row=11, column=1, sticky="w", pady=(6, 10))
+        ttk.Label(visual_tab, text="Plate opacity").grid(row=3, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Spinbox(visual_tab, textvariable=overlay_opacity_var, from_=0, to=100, increment=5, width=8).grid(row=3, column=1, sticky="w", pady=4)
+        ttk.Label(visual_tab, text="0-100%, defaults to 100.").grid(row=4, column=1, sticky="w", pady=(0, 8))
 
         buttons = ttk.Frame(body)
-        buttons.grid(row=12, column=0, columnspan=3, sticky="e")
-        ttk.Button(buttons, text="Use Defaults", command=lambda: self._reset_settings_dialog(output_var, portrait_var, thumbnail_background_var, ffmpeg_var, ffprobe_var, startgg_token_var, overlay_font_var, reencode_var, boilerplate_text)).grid(row=0, column=0, padx=(0, 6))
+        buttons.grid(row=1, column=0, sticky="e", pady=(10, 0))
+        ttk.Button(buttons, text="Use Defaults", command=lambda: self._reset_settings_dialog(output_var, portrait_var, thumbnail_background_var, ffmpeg_var, ffprobe_var, startgg_token_var, overlay_font_var, overlay_accent_color_var, overlay_opacity_var, reencode_var, boilerplate_text)).grid(row=0, column=0, padx=(0, 6))
         ttk.Button(buttons, text="Cancel", command=dialog.destroy).grid(row=0, column=1, padx=6)
-        ttk.Button(buttons, text="Save", command=lambda: self._save_settings_dialog(dialog, output_var, portrait_var, thumbnail_background_var, ffmpeg_var, ffprobe_var, startgg_token_var, overlay_font_var, reencode_var, boilerplate_text)).grid(row=0, column=2, padx=(6, 0))
+        ttk.Button(buttons, text="Save", command=lambda: self._save_settings_dialog(dialog, output_var, portrait_var, thumbnail_background_var, ffmpeg_var, ffprobe_var, startgg_token_var, overlay_font_var, overlay_accent_color_var, overlay_opacity_var, reencode_var, boilerplate_text)).grid(row=0, column=2, padx=(6, 0))
 
         dialog.bind("<Escape>", lambda _event: dialog.destroy())
         dialog.wait_window()
@@ -2074,13 +2152,13 @@ class TekkenVodHelperApp(tk.Tk):
         characters = unique_sorted(self.state.characters)
         self.state.players = players
         self.state.characters = characters
-        if hasattr(self, "player1_combo"):
+        if "player1_combo" in self.__dict__:
             self.player1_combo.configure(values=players)
             self.player2_combo.configure(values=players)
             self.character1_combo.configure(values=characters)
             self.character2_combo.configure(values=characters)
             self._refresh_character_picker()
-        if hasattr(self, "overlay_p1_combo"):
+        if "overlay_p1_combo" in self.__dict__:
             self.overlay_p1_combo.configure(values=players)
             self.overlay_p2_combo.configure(values=players)
             self.overlay_character1_combo.configure(values=characters)
@@ -2357,6 +2435,8 @@ class TekkenVodHelperApp(tk.Tk):
         self.overlay_p1score_var.set(self.state.overlay.p1score)
         self.overlay_p2score_var.set(self.state.overlay.p2score)
         self.overlay_font_var.set(self.state.overlay.font)
+        self.overlay_accent_color_var.set(self.state.overlay.accent_color)
+        self.overlay_opacity_var.set("{:.0f}".format(self.state.overlay.opacity * 100))
         self.obs_host_var.set(self.state.obs.host)
         self.obs_port_var.set(str(self.state.obs.port))
         self.obs_password_var.set(self.state.obs.password)
@@ -2489,6 +2569,8 @@ class TekkenVodHelperApp(tk.Tk):
         ffprobe_var: tk.StringVar,
         startgg_token_var: tk.StringVar,
         overlay_font_var: tk.StringVar,
+        overlay_accent_color_var: tk.StringVar,
+        overlay_opacity_var: tk.StringVar,
         reencode_var: tk.BooleanVar,
         boilerplate_text: tk.Text,
     ) -> None:
@@ -2499,6 +2581,8 @@ class TekkenVodHelperApp(tk.Tk):
         ffprobe_var.set("")
         startgg_token_var.set("")
         overlay_font_var.set("Bahnschrift")
+        overlay_accent_color_var.set(DEFAULT_OVERLAY_ACCENT_COLOR)
+        overlay_opacity_var.set("{:.0f}".format(DEFAULT_OVERLAY_OPACITY * 100))
         reencode_var.set(False)
         boilerplate_text.delete("1.0", "end")
 
@@ -2512,6 +2596,8 @@ class TekkenVodHelperApp(tk.Tk):
         ffprobe_var: tk.StringVar,
         startgg_token_var: tk.StringVar,
         overlay_font_var: tk.StringVar,
+        overlay_accent_color_var: tk.StringVar,
+        overlay_opacity_var: tk.StringVar,
         reencode_var: tk.BooleanVar,
         boilerplate_text: tk.Text,
     ) -> None:
@@ -2522,11 +2608,30 @@ class TekkenVodHelperApp(tk.Tk):
         self.ffprobe_var.set(ffprobe_var.get().strip())
         self.startgg_token_var.set(startgg_token_var.get().strip())
         self.overlay_font_var.set(overlay_font_var.get().strip() or "Bahnschrift")
+        self.overlay_accent_color_var.set(self._normalized_overlay_accent_color(overlay_accent_color_var.get()))
+        self.overlay_opacity_var.set("{:.0f}".format(self._normalized_overlay_opacity(overlay_opacity_var.get())))
         self.reencode_var.set(bool(reencode_var.get()))
         self.state.description_boilerplate = boilerplate_text.get("1.0", "end").strip()
         self._sync_paths_to_state()
+        self.apply_overlay(log_message=False)
         dialog.destroy()
         self.log("Settings saved.")
+
+    def _normalized_overlay_accent_color(self, value: Optional[str] = None) -> str:
+        color = (self.overlay_accent_color_var.get() if value is None else value).strip()
+        if len(color) == 7 and color.startswith("#"):
+            digits = color[1:]
+            if all(character in "0123456789abcdefABCDEF" for character in digits):
+                return "#" + digits.lower()
+        return DEFAULT_OVERLAY_ACCENT_COLOR
+
+    def _normalized_overlay_opacity(self, value: Optional[str] = None) -> float:
+        raw = (self.overlay_opacity_var.get() if value is None else value).strip().rstrip("%")
+        try:
+            opacity = float(raw)
+        except ValueError:
+            return DEFAULT_OVERLAY_OPACITY * 100
+        return max(0.0, min(100.0, opacity))
 
     def _poll_log_queue(self) -> None:
         while True:

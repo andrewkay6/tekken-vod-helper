@@ -1,6 +1,8 @@
 from tekken_vod_helper.app import TekkenVodHelperApp
 from tekken_vod_helper.models import MatchSegment, OverlayState, ProjectState
 from tekken_vod_helper import startgg_client
+from tekken_vod_helper import ffmpeg_tools
+from tekken_vod_helper.overlay_server import OverlayServer
 from tekken_vod_helper.startgg_client import BracketSet, parse_tournament_sets, normalize_tournament_slug
 
 
@@ -45,7 +47,28 @@ def test_overlay_state_matches_browser_json_shape():
         "p2score": 1,
         "p2team": "",
         "font": "Bahnschrift",
+        "accent_color": "#f3135e",
+        "opacity": 1.0,
     }
+
+
+def test_overlay_server_starts_without_ffmpeg(tmp_path, monkeypatch):
+    static_dir = tmp_path / "static"
+    static_dir.mkdir()
+    (static_dir / "index.html").write_text("<!doctype html><title>overlay</title>", encoding="utf-8")
+
+    monkeypatch.setattr(ffmpeg_tools.shutil, "which", lambda _name: None)
+    monkeypatch.setattr(ffmpeg_tools.sys, "executable", str(tmp_path / "TekkenVodHelper.exe"))
+
+    server = OverlayServer(static_dir, port=0)
+    try:
+        server.start()
+        server.write_state(OverlayState(description="Overlay Only"))
+
+        assert (server.runtime_dir / "index.html").exists()
+        assert '"description": "Overlay Only"' in (server.runtime_dir / "state.json").read_text(encoding="utf-8")
+    finally:
+        server.stop()
 
 
 def test_project_state_round_trips_overlay_obs_and_startgg_settings():
@@ -195,7 +218,84 @@ def test_loading_bracket_sets_does_not_preselect_without_applying():
     )
 
     assert app.bracket_set_var.get() == ""
-    assert combo.values == ["Tekken 8 - Winners Finals - Alice vs Bob [1]"]
+    assert combo.values == ["Tekken 8 - Winners Finals - Alice vs Bob"]
+
+
+def test_loading_duplicate_bracket_set_labels_stays_selectable_without_preview_ids():
+    app = make_app(ProjectState())
+    combo = DummyCombo()
+    app.bracket_set_var = DummyVar()
+    app._bracket_set_combos = lambda: [combo]
+    app._set_startgg_controls_visible = lambda _visible: None
+    app.startgg_status_var = DummyVar()
+    app.log = lambda _message: None
+    app._refresh_combo_values = lambda: None
+
+    app._load_bracket_sets(
+        [
+            BracketSet(
+                id="preview_1",
+                event_name="Tekken 8",
+                round_name="Winners Round 1",
+                player1="Alice",
+                player2="Bob",
+                state=1,
+            ),
+            BracketSet(
+                id="preview_2",
+                event_name="Tekken 8",
+                round_name="Winners Round 1",
+                player1="Alice",
+                player2="Bob",
+                state=1,
+            ),
+        ]
+    )
+
+    assert combo.values == [
+        "Tekken 8 - Winners Round 1 - Alice vs Bob",
+        "Tekken 8 - Winners Round 1 - Alice vs Bob (2)",
+    ]
+    assert app.bracket_set_by_label[combo.values[1]].id == "preview_2"
+
+
+def test_loading_bracket_sets_populates_player_dropdown_values():
+    state = ProjectState(players=["Existing"])
+    app = make_app(state)
+    combo = DummyCombo()
+    app.bracket_set_var = DummyVar()
+    app._bracket_set_combos = lambda: []
+    app._set_startgg_controls_visible = lambda _visible: None
+    app.startgg_status_var = DummyVar()
+    app.log = lambda _message: None
+    app.overlay_p1_combo = combo
+    app.overlay_p2_combo = DummyCombo()
+    app.overlay_character1_combo = DummyCombo()
+    app.overlay_character2_combo = DummyCombo()
+
+    app._load_bracket_sets(
+        [
+            BracketSet(
+                id="1",
+                event_name="Tekken 8",
+                round_name="Winners Finals",
+                player1="Alice",
+                player2="Bob",
+                state=1,
+            ),
+            BracketSet(
+                id="2",
+                event_name="Tekken 8",
+                round_name="Grand Finals",
+                player1="Alice",
+                player2="Carol",
+                state=1,
+            ),
+        ]
+    )
+
+    assert state.players == ["Alice", "Bob", "Carol", "Existing"]
+    assert combo.values == ["Alice", "Bob", "Carol", "Existing"]
 
 
 def test_matches_json_text_can_be_edited_and_applied():
@@ -303,6 +403,35 @@ def test_startgg_tournament_sets_parse_events_as_a_list():
     assert sets[0].player2 == "Bob"
     assert sets[0].character1 == "Jun"
     assert sets[0].character2 == "King"
+
+
+def test_startgg_tournament_sets_strip_preview_suffixes_from_names():
+    sets = parse_tournament_sets(
+        {
+            "events": [
+                {
+                    "name": "Tekken 8 Singles",
+                    "sets": {
+                        "nodes": [
+                            {
+                                "id": "123",
+                                "fullRoundText": "Winners Round 1",
+                                "state": 1,
+                                "slots": [
+                                    {"entrant": {"id": 1, "name": "Alice [preview_423234908]"}},
+                                    {"entrant": {"id": 2, "name": "Bob [preview_987]"}},
+                                ],
+                            }
+                        ]
+                    },
+                }
+            ]
+        }
+    )
+
+    assert sets[0].player1 == "Alice"
+    assert sets[0].player2 == "Bob"
+    assert sets[0].label == "Tekken 8 Singles - Winners Round 1 - Alice vs Bob"
 
 
 def test_startgg_owned_tournaments_reads_all_pages(monkeypatch):

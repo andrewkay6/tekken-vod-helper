@@ -1,21 +1,29 @@
 <!DOCTYPE html>
 <meta charset="utf-8" />
 <title>Tekken Overlay</title>
+<style>
+  html,
+  body,
+  #scoreboard {
+    width: 100%;
+    height: 100%;
+    margin: 0;
+    overflow: hidden;
+  }
+</style>
+<link href="index.css" rel="stylesheet" />
 <body>
   <main id="scoreboard">
-    <section class="player player-one">
-      <div class="score" id="p1score">0</div>
-      <div class="name" id="p1name"></div>
-    </section>
-    <section class="meta">
-      <div class="event" id="description"></div>
-      <div class="subtitle" id="subtitle"></div>
-    </section>
-    <section class="player player-two">
-      <div class="name" id="p2name"></div>
-      <div class="score" id="p2score">0</div>
-    </section>
+    <div id="plate-host" class="scoreboard-plate"></div>
+
+    <div id="description"></div>
+    <div id="subtitle"></div>
+
+    <div id="p1score">0</div>
+    <div id="p1name"></div>
+
+    <div id="p2score">0</div>
+    <div id="p2name"></div>
   </main>
+  <script src="index.js"></script>
 </body>
-<link href="index.css" rel="stylesheet" />
-<script src="index.js"></script>

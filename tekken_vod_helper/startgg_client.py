@@ -194,7 +194,12 @@ def _slot_name(slot: Dict[str, Any]) -> str:
     entrant = slot.get("entrant") if isinstance(slot, dict) else None
     if not isinstance(entrant, dict):
         return ""
-    return str(entrant.get("name", "") or "")
+    return _clean_entrant_name(str(entrant.get("name", "") or ""))
+
+
+def _clean_entrant_name(name: str) -> str:
+    cleaned = re.sub(r"\s*\[preview_[^\]]+\]", "", name)
+    return re.sub(r"\s+", " ", cleaned).strip()
 
 
 def _slot_entrant_id(slot: Dict[str, Any]) -> str:

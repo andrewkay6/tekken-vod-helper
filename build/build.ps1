@@ -16,6 +16,7 @@ $SpecPath = Join-Path $RepoRoot "build\TekkenVodHelper.spec"
 $PortableName = "TekkenVodHelper-v$Version-windows-portable"
 $PortableDir = Join-Path $DistRoot $PortableName
 $ZipPath = Join-Path $DistRoot "$PortableName.zip"
+$BundledFfmpegDir = $null
 
 if (-not (Get-Command pyinstaller -ErrorAction SilentlyContinue)) {
     throw "PyInstaller was not found. Install it with: python -m pip install pyinstaller"
@@ -42,6 +43,7 @@ try {
             }
         }
         $env:TEKKEN_VOD_HELPER_FFMPEG_DIR = $ResolvedFfmpegDir
+        $BundledFfmpegDir = $ResolvedFfmpegDir
     } else {
         Remove-Item Env:\TEKKEN_VOD_HELPER_FFMPEG_DIR -ErrorAction SilentlyContinue
     }
@@ -67,6 +69,14 @@ if (-not (Test-Path -LiteralPath $ExePath)) {
 }
 Copy-Item -LiteralPath $ExePath -Destination (Join-Path $PortableDir "TekkenVodHelper.exe") -Force
 
+if ($BundledFfmpegDir) {
+    $PortableFfmpegDir = Join-Path $PortableDir "ffmpeg"
+    New-Item -ItemType Directory -Force -Path $PortableFfmpegDir | Out-Null
+    foreach ($Tool in @("ffmpeg.exe", "ffprobe.exe")) {
+        Copy-Item -LiteralPath (Join-Path $BundledFfmpegDir $Tool) -Destination (Join-Path $PortableFfmpegDir $Tool) -Force
+    }
+}
+
 $ReadmePath = Join-Path $PortableDir "README.txt"
 @"
 Tekken VOD Helper v$Version
@@ -74,8 +84,9 @@ Tekken VOD Helper v$Version
 Run TekkenVodHelper.exe.
 
 FFmpeg:
-- If this build was created with -FfmpegDir, FFmpeg is embedded in TekkenVodHelper.exe.
+- If this build was created with -FfmpegDir, FFmpeg is embedded in TekkenVodHelper.exe and copied to the portable ffmpeg folder.
 - If not, install FFmpeg separately or choose ffmpeg.exe and ffprobe.exe in Settings.
+- The stream overlay does not require FFmpeg.
 
 Portraits:
 - Character portraits are embedded in TekkenVodHelper.exe.

@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg
+  version="1.1"
+  width="1920"
+  height="1080"
+  viewBox="0 0 1920 1080"
+  xmlns="http://www.w3.org/2000/svg">
+  <g id="scoreboard-plate">
+    <rect
+      id="p1-score-plate"
+      class="scoreboard-accent"
+      x="174.901"
+      y="0"
+      width="66.514"
+      height="68.977"
+      fill="#ff00ff" />
+    <rect
+      id="p1-name-plate"
+      class="scoreboard-base"
+      x="241.004"
+      y="0.411"
+      width="409.346"
+      height="65.282"
+      fill="#000000" />
+    <rect
+      id="center-title-plate"
+      class="scoreboard-base"
+      x="712.935"
+      y="0.581"
+      width="494.129"
+      height="37.742"
+      fill="#000000" />
+    <rect
+      id="p2-name-plate"
+      class="scoreboard-base"
+      x="1269.650"
+      y="0.199"
+      width="409.346"
+      height="65.282"
+      fill="#000000" />
+    <rect
+      id="p2-score-plate"
+      class="scoreboard-accent"
+      x="1678.585"
+      y="0"
+      width="66.514"
+      height="68.977"
+      fill="#ff00ff" />
+  </g>
+</svg>
