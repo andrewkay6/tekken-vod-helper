@@ -1,14 +1,14 @@
-from tekken_vod_helper.app import TekkenVodHelperApp
+﻿from tekken_vod_helper.app import TekkenVodHelperApp
 from tekken_vod_helper.models import MatchSegment, OverlayState, ProjectState
 from tekken_vod_helper import startgg_client
 from tekken_vod_helper import ffmpeg_tools
 from tekken_vod_helper.overlay_server import OverlayServer
-from tekken_vod_helper.startgg_client import BracketSet, parse_tournament_sets, normalize_tournament_slug
+from tekken_vod_helper.startgg_client import BracketSet, TournamentSummary, parse_tournament_sets, normalize_tournament_slug
 
 
 def make_app(state):
     app = TekkenVodHelperApp.__new__(TekkenVodHelperApp)
-    app.state = state
+    app.project_state = state
     return app
 
 
@@ -71,6 +71,18 @@ def test_overlay_server_starts_without_ffmpeg(tmp_path, monkeypatch):
         server.stop()
 
 
+def test_overlay_static_runtime_includes_svg_and_obs_safe_script():
+    static_dir = Path(__file__).resolve().parents[1] / "tekken_vod_helper" / "overlay_static"
+    server = OverlayServer(static_dir, port=0)
+
+    server._prepare_runtime_dir()
+
+    assert (server.runtime_dir / "assets" / "scoreboard.svg").exists()
+    script = (server.runtime_dir / "index.js").read_text(encoding="utf-8")
+    assert "replaceAll" not in script
+    assert "fallbackPlateSvg" in script
+
+
 def test_project_state_round_trips_overlay_obs_and_startgg_settings():
     state = ProjectState()
     state.overlay = OverlayState(description="Event", p1name="Alice", p2name="Bob")
@@ -79,6 +91,7 @@ def test_project_state_round_trips_overlay_obs_and_startgg_settings():
     state.obs.password = "secret"
     state.startgg.token = "token"
     state.startgg.tournament_slug = "tournament/test-event"
+    state.player_characters = {"alice": "Jun"}
 
     payload = state.to_dict()
     loaded = ProjectState.from_dict(payload)
@@ -91,6 +104,7 @@ def test_project_state_round_trips_overlay_obs_and_startgg_settings():
     assert "token" not in payload["startgg"]
     assert loaded.startgg.token == ""
     assert loaded.startgg.tournament_slug == "tournament/test-event"
+    assert loaded.player_characters == {"alice": "Jun"}
 
 
 def test_project_state_ignores_startgg_token_from_project_json():
@@ -158,7 +172,7 @@ def test_capture_match_from_overlay_allows_zero_zero_drafts():
 
 
 def test_startgg_set_populates_vod_fields_without_selected_match():
-    state = ProjectState()
+    state = ProjectState(player_characters={"alice": "Jin", "bob": "King"})
     app = make_app(state)
     app.bracket_set_var = DummyVar("set")
     app.bracket_set_by_label = {
@@ -169,8 +183,6 @@ def test_startgg_set_populates_vod_fields_without_selected_match():
             player1="Alice",
             player2="Bob",
             state=1,
-            character1="Jin",
-            character2="King",
         )
     }
     app.player1_var = DummyVar()
@@ -298,6 +310,131 @@ def test_loading_bracket_sets_populates_player_dropdown_values():
     assert combo.values == ["Alice", "Bob", "Carol", "Existing"]
 
 
+def test_picker_tournament_selection_clears_uncached_bracket_and_refreshes_board():
+    app = make_app(ProjectState())
+    app.startgg_slug_var = DummyVar()
+    app.overlay_description_var = DummyVar()
+    app.event_var = DummyVar()
+    app.bracket_set_var = DummyVar("old")
+    app.bracket_sets = [BracketSet("old", "Old", "Winners Final", "Alice", "Bob", 1)]
+    app.bracket_set_by_label = {"old": app.bracket_sets[0]}
+    app._sync_paths_to_state = lambda: None
+    refreshes = []
+    app._refresh_startgg_picker = lambda: refreshes.append(True)
+
+    app._set_selected_tournament_without_fetch(TournamentSummary("Basement Brawl 4", "tournament/basement-brawl-4"))
+
+    assert app.startgg_slug_var.get() == "tournament/basement-brawl-4"
+    assert app.overlay_description_var.get() == "Basement Brawl 4"
+    assert app.event_var.get() == "Basement Brawl 4"
+    assert app.bracket_sets == []
+    assert app.bracket_set_by_label == {}
+    assert app.bracket_set_var.get() == ""
+    assert refreshes == [True]
+
+
+def test_picker_tournament_selection_uses_cached_bracket_without_fetching():
+    app = make_app(ProjectState())
+    app.startgg_slug_var = DummyVar()
+    app.overlay_description_var = DummyVar()
+    app.event_var = DummyVar()
+    app.bracket_set_var = DummyVar()
+    app._sync_paths_to_state = lambda: None
+    app._bracket_set_combos = lambda: []
+    app._set_startgg_controls_visible = lambda _visible: None
+    app.startgg_status_var = DummyVar()
+    app.log = lambda _message: None
+    app._refresh_combo_values = lambda: None
+    cached_set = BracketSet("1", "Tekken 8 Singles", "Winners Round 1", "Alice", "Bob", 1)
+    app.startgg_sets_cache = {"tournament/basement-brawl-4": [cached_set]}
+
+    app._set_selected_tournament_without_fetch(TournamentSummary("Basement Brawl 4", "tournament/basement-brawl-4"))
+
+    assert app.bracket_sets == [cached_set]
+    assert app.bracket_set_by_label == {"Tekken 8 Singles - Winners Round 1 - Alice vs Bob": cached_set}
+
+
+def test_bracket_picker_groups_winners_above_losers_and_sorts_early_to_late():
+    app = make_app(ProjectState())
+    app.bracket_set_by_label = {
+        "gf": BracketSet("gf", "Tekken 8 Singles", "Grand Final", "TBD", "TBD", 1),
+        "lr2": BracketSet("lr2", "Tekken 8 Singles", "Losers Round 2", "TBD", "TBD", 1),
+        "wqf": BracketSet("wqf", "Tekken 8 Singles", "Winners Quarter-Final", "TBD", "TBD", 1),
+        "lr1": BracketSet("lr1", "Tekken 8 Singles", "Losers Round 1", "TBD", "TBD", 1),
+        "wf": BracketSet("wf", "Tekken 8 Singles", "Winners Final", "TBD", "TBD", 1),
+        "wr1": BracketSet("wr1", "Tekken 8 Singles", "Winners Round 1", "TBD", "TBD", 1),
+    }
+
+    grouped = app._bracket_sets_by_event_and_section()
+
+    assert [section for section, _rounds in grouped[0][1]] == ["Winners", "Losers"]
+    winners = grouped[0][1][0][1]
+    losers = grouped[0][1][1][1]
+    assert [round_name for round_name, _sets in winners] == ["Winners Round 1", "Winners Quarter-Final", "Winners Final", "Grand Final"]
+    assert [round_name for round_name, _sets in losers] == ["Losers Round 1", "Losers Round 2"]
+
+
+def test_bracket_picker_offsets_smaller_rounds_for_bracket_shape():
+    app = make_app(ProjectState())
+
+    assert app._bracket_round_top_offset(4, 4) == 0
+    assert app._bracket_round_top_offset(4, 2) > 0
+    assert app._bracket_card_gap(4, 2) > app._bracket_card_gap(4, 4)
+
+
+def test_bracket_picker_connector_fallback_pairs_sources_by_round_size():
+    app = make_app(ProjectState())
+
+    assert app._fallback_connector_source_indexes(4, 2, 0) == [0, 1]
+    assert app._fallback_connector_source_indexes(4, 2, 1) == [2, 3]
+    assert app._fallback_connector_source_indexes(2, 4, 2) == [1]
+
+
+def test_bracket_picker_centers_child_between_parent_cards():
+    app = make_app(ProjectState())
+    rounds = [
+        (
+            "Winners Round 1",
+            [
+                ("p1", BracketSet("p1", "Tekken 8 Singles", "Winners Round 1", "Alice", "Bob", 1)),
+                ("p2", BracketSet("p2", "Tekken 8 Singles", "Winners Round 1", "Carol", "Drew", 1)),
+            ],
+        ),
+        (
+            "Winners Final",
+            [
+                (
+                    "child",
+                    BracketSet(
+                        "child",
+                        "Tekken 8 Singles",
+                        "Winners Final",
+                        "TBD",
+                        "TBD",
+                        1,
+                        parent_set_ids=["p1", "p2"],
+                    ),
+                )
+            ],
+        ),
+    ]
+
+    centers = app._bracket_round_card_centers(rounds)
+
+    assert centers[1][0] == sum(centers[0]) / 2
+
+
+def test_player_character_memory_is_case_insensitive_and_overwritten():
+    state = ProjectState()
+    app = make_app(state)
+
+    app._remember_player_character(" Alice  Smith ", "Jun")
+    app._remember_player_character("alice smith", "Lili")
+
+    assert app._remembered_player_character("ALICE SMITH") == "Lili"
+    assert state.player_characters == {"alice smith": "Lili"}
+
+
 def test_matches_json_text_can_be_edited_and_applied():
     state = ProjectState(
         matches=[
@@ -370,23 +507,11 @@ def test_startgg_tournament_sets_parse_events_as_a_list():
                             {
                                 "id": "123",
                                 "fullRoundText": "Winners Round 1",
+                                "round": 1,
                                 "state": 1,
                                 "slots": [
                                     {"entrant": {"id": 1, "name": "Alice"}},
-                                    {"entrant": {"id": 2, "name": "Bob"}},
-                                ],
-                                "games": [
-                                    {
-                                        "selections": [
-                                            {"entrant": {"id": 1}, "character": {"name": "Jin"}},
-                                            {"entrant": {"id": 2}, "character": {"name": "King"}},
-                                        ]
-                                    },
-                                    {
-                                        "selections": [
-                                            {"entrant": {"id": 1}, "character": {"name": "Jun"}},
-                                        ]
-                                    },
+                                    {"entrant": {"id": 2, "name": "Bob"}, "prereqId": "99", "prereqType": "set"},
                                 ],
                             }
                         ]
@@ -401,8 +526,8 @@ def test_startgg_tournament_sets_parse_events_as_a_list():
     assert sets[0].round_name == "Winners Round 1"
     assert sets[0].player1 == "Alice"
     assert sets[0].player2 == "Bob"
-    assert sets[0].character1 == "Jun"
-    assert sets[0].character2 == "King"
+    assert sets[0].round == 1
+    assert sets[0].parent_set_ids == ["99"]
 
 
 def test_startgg_tournament_sets_strip_preview_suffixes_from_names():
@@ -471,3 +596,4 @@ def test_startgg_owned_tournaments_reads_all_pages(monkeypatch):
         "tournament/recent-2",
         "tournament/older",
     ]
+from pathlib import Path

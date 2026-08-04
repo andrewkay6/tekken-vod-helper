@@ -10,6 +10,18 @@ const FONT_STACKS = {
 let plateSvg = "";
 let currentAccent = "#f3135e";
 
+const fallbackPlateSvg = [
+  '<svg width="1920" height="1080" viewBox="0 0 1920 1080" xmlns="http://www.w3.org/2000/svg">',
+  '<path class="scoreboard-base" d="M150 0h560l-28 68H178z"/>',
+  '<path class="scoreboard-accent" d="M682 0h58l-28 68h-58z"/>',
+  '<path class="scoreboard-base" d="M1210 0h560l-28 68h-504z"/>',
+  '<path class="scoreboard-accent" d="M1180 0h58l28 68h-58z"/>',
+  '<path class="scoreboard-base" d="M706 0h508l-34 38H740z"/>',
+  '<path class="scoreboard-accent" d="M168 0h70v68h-70z"/>',
+  '<path class="scoreboard-accent" d="M1682 0h70v68h-70z"/>',
+  '</svg>',
+].join("");
+
 const clamp = (value) => Math.max(0, Math.min(255, Math.round(value)));
 
 const parseHexColor = (color) => {
@@ -43,7 +55,7 @@ const renderPlate = (accent) => {
     return;
   }
   const base = parseHexColor(accent) || parseHexColor("#f3135e");
-  const svg = plateSvg.replaceAll("#ff00ff", toHex(base));
+  const svg = plateSvg.replace(/#ff00ff/g, toHex(base));
   host.innerHTML = svg;
 };
 
@@ -63,14 +75,22 @@ const applyOpacityVariables = (opacity) => {
 
 const loadPlate = () => {
   fetch("assets/scoreboard.svg", { cache: "no-store" })
-    .then((response) => response.text())
+    .then((response) => {
+      if (!response.ok) {
+        throw new Error("Could not load scoreboard SVG: " + response.status);
+      }
+      return response.text();
+    })
     .then((text) => {
       plateSvg = text
         .replace(/<\?xml[^>]*>\s*/i, "")
         .replace(/<!DOCTYPE[^>]*>\s*/i, "");
       renderPlate(currentAccent);
     })
-    .catch(() => {});
+    .catch(() => {
+      plateSvg = fallbackPlateSvg;
+      renderPlate(currentAccent);
+    });
 };
 
 const updateText = (id, value) => {

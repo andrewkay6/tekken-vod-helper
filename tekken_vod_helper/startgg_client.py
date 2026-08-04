@@ -2,7 +2,7 @@ import json
 import re
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List
 
 
@@ -21,8 +21,8 @@ class BracketSet:
     player1: str
     player2: str
     state: int
-    character1: str = ""
-    character2: str = ""
+    round: int = 0
+    parent_set_ids: List[str] = field(default_factory=list)
 
     @property
     def label(self) -> str:
@@ -68,21 +68,15 @@ query TournamentSets($slug: String!) {
         nodes {
           id
           fullRoundText
+          round
           state
           slots {
+            prereqId
+            prereqType
+            prereqPlacement
             entrant {
               id
               name
-            }
-          }
-          games {
-            selections {
-              entrant {
-                id
-              }
-              character {
-                name
-              }
             }
           }
         }
@@ -169,12 +163,8 @@ def parse_tournament_sets(tournament: Dict[str, Any]) -> List[BracketSet]:
                 continue
             slots = node.get("slots", []) or []
             names = [_slot_name(slot) for slot in slots[:2]]
-            entrant_ids = [_slot_entrant_id(slot) for slot in slots[:2]]
             while len(names) < 2:
                 names.append("")
-            while len(entrant_ids) < 2:
-                entrant_ids.append("")
-            characters_by_entrant = _latest_characters_by_entrant(node)
             results.append(
                 BracketSet(
                     id=str(node.get("id", "") or ""),
@@ -183,8 +173,8 @@ def parse_tournament_sets(tournament: Dict[str, Any]) -> List[BracketSet]:
                     player1=names[0],
                     player2=names[1],
                     state=int(node.get("state", 0) or 0),
-                    character1=characters_by_entrant.get(entrant_ids[0], ""),
-                    character2=characters_by_entrant.get(entrant_ids[1], ""),
+                    round=int(node.get("round", 0) or 0),
+                    parent_set_ids=_slot_parent_set_ids(slots),
                 )
             )
     return sorted(results, key=lambda item: (item.state not in (1, 2), item.event_name.casefold(), item.round_name, item.id))
@@ -202,27 +192,15 @@ def _clean_entrant_name(name: str) -> str:
     return re.sub(r"\s+", " ", cleaned).strip()
 
 
-def _slot_entrant_id(slot: Dict[str, Any]) -> str:
-    entrant = slot.get("entrant") if isinstance(slot, dict) else None
-    if not isinstance(entrant, dict):
-        return ""
-    return str(entrant.get("id", "") or "")
-
-
-def _latest_characters_by_entrant(set_node: Dict[str, Any]) -> Dict[str, str]:
-    result: Dict[str, str] = {}
-    for game in set_node.get("games", []) or []:
-        if not isinstance(game, dict):
+def _slot_parent_set_ids(slots: List[Dict[str, Any]]) -> List[str]:
+    result: List[str] = []
+    for slot in slots:
+        if not isinstance(slot, dict):
             continue
-        for selection in game.get("selections", []) or []:
-            if not isinstance(selection, dict):
-                continue
-            entrant = selection.get("entrant") or {}
-            character = selection.get("character") or {}
-            entrant_id = str(entrant.get("id", "") or "")
-            character_name = str(character.get("name", "") or "")
-            if entrant_id and character_name:
-                result[entrant_id] = character_name
+        prereq_id = slot.get("prereqId")
+        prereq_type = str(slot.get("prereqType", "") or "").casefold()
+        if prereq_id is not None and prereq_type == "set":
+            result.append(str(prereq_id))
     return result
 
 

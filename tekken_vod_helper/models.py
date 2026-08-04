@@ -150,6 +150,7 @@ class ProjectState:
     duration: float = 0.0
     players: List[str] = field(default_factory=list)
     characters: List[str] = field(default_factory=list)
+    player_characters: Dict[str, str] = field(default_factory=dict)
     matches: List[MatchSegment] = field(default_factory=list)
     overlay: OverlayState = field(default_factory=OverlayState)
     obs: ObsSettings = field(default_factory=ObsSettings)
@@ -172,6 +173,7 @@ class ProjectState:
             "duration": self.duration,
             "players": self.players,
             "characters": self.characters,
+            "player_characters": self.player_characters,
             "matches": [match.to_dict() for match in self.sorted_matches()],
             "overlay": self.overlay.to_dict(),
             "obs": self.obs.to_dict(),
@@ -193,6 +195,7 @@ class ProjectState:
             duration=float(data.get("duration", 0.0) or 0.0),
             players=_string_list(data.get("players")),
             characters=_string_list(data.get("characters")),
+            player_characters=_string_dict(data.get("player_characters")),
             matches=[
                 MatchSegment.from_dict(item)
                 for item in data.get("matches", [])
@@ -222,3 +225,15 @@ def _string_list(value: Optional[Any]) -> List[str]:
     if not isinstance(value, list):
         return []
     return [str(item) for item in value if str(item).strip()]
+
+
+def _string_dict(value: Optional[Any]) -> Dict[str, str]:
+    if not isinstance(value, dict):
+        return {}
+    result: Dict[str, str] = {}
+    for key, item in value.items():
+        clean_key = str(key).strip()
+        clean_item = str(item).strip()
+        if clean_key and clean_item:
+            result[clean_key] = clean_item
+    return result

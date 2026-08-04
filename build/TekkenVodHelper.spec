@@ -3,6 +3,8 @@
 from pathlib import Path
 import os
 
+from PyInstaller.utils.hooks import collect_data_files
+
 
 project_root = Path(SPECPATH).parent
 if project_root.name == "build":
@@ -18,6 +20,8 @@ datas = [
     (str(project_root / "tekken_vod_helper" / "kwtekken-icon-256.png"), "tekken_vod_helper"),
     (str(project_root / "tekken_vod_helper" / "overlay_static"), "tekken_vod_helper/overlay_static"),
 ]
+
+datas += collect_data_files("customtkinter")
 
 portrait_dir = project_root / "portraits"
 if portrait_dir.exists():

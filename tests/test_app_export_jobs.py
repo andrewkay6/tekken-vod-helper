@@ -1,4 +1,4 @@
-from pathlib import Path
+﻿from pathlib import Path
 
 from tekken_vod_helper import app as app_module
 from tekken_vod_helper.app import TekkenVodHelperApp
@@ -7,7 +7,7 @@ from tekken_vod_helper.models import ExportJob, MatchSegment, ProjectState
 
 def make_app(state):
     app = TekkenVodHelperApp.__new__(TekkenVodHelperApp)
-    app.state = state
+    app.project_state = state
     app.log_messages = []
     app.log = app.log_messages.append
     app._thread_log = app.log_messages.append
