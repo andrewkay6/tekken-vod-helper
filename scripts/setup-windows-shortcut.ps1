@@ -41,24 +41,43 @@ if (-not (Test-Path -LiteralPath $IconPath)) {
     throw "Could not find shortcut icon: $IconPath"
 }
 
+function Join-OptionalPath {
+    param(
+        [string]$BasePath,
+        [string]$ChildPath
+    )
+
+    if ([string]::IsNullOrWhiteSpace($BasePath)) {
+        return $null
+    }
+    return Join-Path $BasePath $ChildPath
+}
+
 function Get-ShellFolderPath {
     param(
         [Parameter(Mandatory = $true)]
         [string]$Name,
 
         [Parameter(Mandatory = $true)]
-        [string]$DotNetName
+        [string]$DotNetName,
+
+        [Parameter(Mandatory = $true)]
+        [string[]]$FallbackPaths
     )
 
+    $Candidates = @()
     $Shell = New-Object -ComObject WScript.Shell
-    $FolderPath = $Shell.SpecialFolders.Item($Name)
-    if ([string]::IsNullOrWhiteSpace($FolderPath)) {
-        $FolderPath = [Environment]::GetFolderPath($DotNetName)
+    $Candidates += $Shell.SpecialFolders.Item($Name)
+    $Candidates += [Environment]::GetFolderPath($DotNetName)
+    $Candidates += $FallbackPaths
+
+    foreach ($FolderPath in $Candidates) {
+        if (-not [string]::IsNullOrWhiteSpace($FolderPath)) {
+            return $FolderPath
+        }
     }
-    if ([string]::IsNullOrWhiteSpace($FolderPath)) {
-        throw "Windows did not return a path for the $Name folder."
-    }
-    return $FolderPath
+
+    throw "Windows did not return a path for the $Name folder."
 }
 
 function New-AppShortcut {
@@ -77,7 +96,13 @@ function New-AppShortcut {
     $Shortcut.Save()
 }
 
-$ProgramsDir = Get-ShellFolderPath -Name "Programs" -DotNetName "Programs"
+$ProgramsDir = Get-ShellFolderPath `
+    -Name "Programs" `
+    -DotNetName "Programs" `
+    -FallbackPaths @(
+        (Join-OptionalPath $env:APPDATA "Microsoft\Windows\Start Menu\Programs"),
+        (Join-OptionalPath $env:USERPROFILE "AppData\Roaming\Microsoft\Windows\Start Menu\Programs")
+    )
 $StartMenuDir = Join-Path $ProgramsDir "KWTekken"
 New-Item -ItemType Directory -Force -Path $StartMenuDir | Out-Null
 $StartMenuShortcut = Join-Path $StartMenuDir $ShortcutName
@@ -85,7 +110,13 @@ New-AppShortcut -Path $StartMenuShortcut
 Write-Host "Start Menu shortcut: $StartMenuShortcut"
 
 if ($Desktop) {
-    $DesktopDir = Get-ShellFolderPath -Name "Desktop" -DotNetName "Desktop"
+    $DesktopDir = Get-ShellFolderPath `
+        -Name "Desktop" `
+        -DotNetName "Desktop" `
+        -FallbackPaths @(
+            (Join-OptionalPath $env:USERPROFILE "Desktop"),
+            (Join-OptionalPath $env:OneDrive "Desktop")
+        )
     $DesktopShortcut = Join-Path $DesktopDir $ShortcutName
     New-AppShortcut -Path $DesktopShortcut
     Write-Host "Desktop shortcut: $DesktopShortcut"
