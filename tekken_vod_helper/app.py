@@ -672,10 +672,7 @@ class TekkenVodHelperApp(AppWindow):
         action_row = ttk.Frame(bracket)
         action_row.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(6, 0))
         action_row.columnconfigure(0, weight=1)
-        action_row.columnconfigure(1, weight=1)
-        ttk.Button(action_row, text="Open Bracket Picker", style="OverlayAction.TButton", command=lambda: self.open_startgg_bracket_picker("overlay")).grid(row=0, column=0, sticky="ew", padx=(0, 6))
-        self.startgg_events_button = ttk.Button(action_row, text="Refresh start.gg", style="OverlayAction.TButton", command=self.fetch_startgg_tournaments)
-        self.startgg_events_button.grid(row=0, column=1, sticky="ew", padx=(6, 0))
+        ttk.Button(action_row, text="Open Bracket Picker", style="OverlayAction.TButton", command=lambda: self.open_startgg_bracket_picker("overlay")).grid(row=0, column=0, sticky="ew")
 
         self.startgg_tournament_combo = ttk.Combobox(self.startgg_controls, textvariable=self.startgg_tournament_var, state="readonly")
         self.startgg_tournament_combo.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 3))
@@ -870,10 +867,7 @@ class TekkenVodHelperApp(AppWindow):
         bracket_row = ttk.Frame(editor)
         bracket_row.grid(row=3, column=0, sticky="ew", pady=(8, 0))
         bracket_row.columnconfigure(0, weight=1)
-        bracket_row.columnconfigure(1, weight=1)
-        ttk.Button(bracket_row, text="Open Bracket Picker", command=lambda: self.open_startgg_bracket_picker("vod")).grid(row=0, column=0, sticky="ew", padx=(0, 4))
-        self.vod_startgg_events_button = ttk.Button(bracket_row, text="Refresh start.gg", command=self.fetch_startgg_tournaments)
-        self.vod_startgg_events_button.grid(row=0, column=1, sticky="ew", padx=(4, 0))
+        ttk.Button(bracket_row, text="Open Bracket Picker", command=lambda: self.open_startgg_bracket_picker("vod")).grid(row=0, column=0, sticky="ew")
 
         self.vod_startgg_controls = ttk.Frame(editor)
         self.vod_startgg_controls.grid(row=4, column=0, sticky="ew", pady=(6, 0))
