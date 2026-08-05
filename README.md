@@ -23,9 +23,11 @@ The first version is a manual-review workflow:
 - VLC media player, for embedded video playback
 - Pillow
 
-Install Python dependencies:
+Create and activate a virtual environment, then install Python dependencies. On Python 3.14, this installs Pillow 12 because Pillow 10.x does not support Python 3.14:
 
 ```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 ```
 
