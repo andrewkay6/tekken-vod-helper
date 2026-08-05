@@ -58,7 +58,7 @@ def test_overlay_server_starts_without_ffmpeg(tmp_path, monkeypatch):
     (static_dir / "index.html").write_text("<!doctype html><title>overlay</title>", encoding="utf-8")
 
     monkeypatch.setattr(ffmpeg_tools.shutil, "which", lambda _name: None)
-    monkeypatch.setattr(ffmpeg_tools.sys, "executable", str(tmp_path / "TekkenVodHelper.exe"))
+    monkeypatch.setattr(ffmpeg_tools.sys, "executable", str(tmp_path / "python.exe"))
 
     server = OverlayServer(static_dir, port=0)
     try:
@@ -543,7 +543,7 @@ def test_matches_json_text_can_be_edited_and_applied():
     assert "Winners Finals" in app._matches_json_text()
 
 
-def test_bundled_portrait_path_is_saved_as_portable_default(tmp_path):
+def test_default_portrait_path_is_saved_as_empty_setting(tmp_path):
     bundled = tmp_path / "portraits"
     bundled.mkdir()
     custom = tmp_path / "custom"
@@ -551,9 +551,9 @@ def test_bundled_portrait_path_is_saved_as_portable_default(tmp_path):
     app = make_app(ProjectState())
     app._default_portrait_dir = lambda: bundled
 
-    assert app._portable_portrait_setting("") == ""
-    assert app._portable_portrait_setting(str(bundled)) == ""
-    assert app._portable_portrait_setting(str(custom)) == str(custom)
+    assert app._saved_portrait_setting("") == ""
+    assert app._saved_portrait_setting(str(bundled)) == ""
+    assert app._saved_portrait_setting(str(custom)) == str(custom)
     assert app._portrait_dir_or_default("") == str(bundled)
 
 

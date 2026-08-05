@@ -18,23 +18,23 @@ def resolve_tool(configured_path: str, executable_name: str) -> Optional[str]:
         candidate = Path(configured_path)
         if candidate.exists():
             return str(candidate)
-    bundled = _resolve_bundled_tool(executable_name)
-    if bundled is not None:
-        return str(bundled)
+    local = _resolve_local_tool(executable_name)
+    if local is not None:
+        return str(local)
     return shutil.which(executable_name)
 
 
-def _resolve_bundled_tool(executable_name: str) -> Optional[Path]:
+def _resolve_local_tool(executable_name: str) -> Optional[Path]:
     candidates = []
     names = [executable_name]
     if not executable_name.lower().endswith(".exe"):
         names.append(executable_name + ".exe")
 
-    portable_root = Path(sys.executable).resolve().parent
-    bundle_root = Path(getattr(sys, "_MEIPASS", portable_root)).resolve()
+    runtime_root = Path(sys.executable).resolve().parent
+    bundle_root = Path(getattr(sys, "_MEIPASS", runtime_root)).resolve()
     source_root = Path(__file__).resolve().parents[1]
 
-    for root in (portable_root, bundle_root, source_root):
+    for root in (runtime_root, bundle_root, source_root):
         for name in names:
             candidates.append(root / "ffmpeg" / name)
             candidates.append(root / name)

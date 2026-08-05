@@ -2308,7 +2308,7 @@ class TekkenVodHelperApp(AppWindow):
         dialog.resizable(False, False)
 
         output_var = tk.StringVar(value=self.project_state.output_dir)
-        portrait_var = tk.StringVar(value=self._portable_portrait_setting(self.project_state.portrait_dir))
+        portrait_var = tk.StringVar(value=self._saved_portrait_setting(self.project_state.portrait_dir))
         thumbnail_background_var = tk.StringVar(value=self.project_state.thumbnail_background_path)
         ffmpeg_var = tk.StringVar(value=self.project_state.ffmpeg_path)
         ffprobe_var = tk.StringVar(value=self.project_state.ffprobe_path)
@@ -3411,7 +3411,7 @@ class TekkenVodHelperApp(AppWindow):
     def _sync_paths_to_state(self) -> None:
         self.project_state.event_name = self.event_var.get().strip()
         self.project_state.output_dir = self.output_var.get().strip()
-        self.project_state.portrait_dir = self._portable_portrait_setting(self.portrait_var.get().strip())
+        self.project_state.portrait_dir = self._saved_portrait_setting(self.portrait_var.get().strip())
         self.project_state.thumbnail_background_path = self.thumbnail_background_var.get().strip()
         self.project_state.ffmpeg_path = self.ffmpeg_var.get().strip()
         self.project_state.ffprobe_path = self.ffprobe_var.get().strip()
@@ -3429,7 +3429,7 @@ class TekkenVodHelperApp(AppWindow):
     def _state_to_controls(self) -> None:
         self.event_var.set(self.project_state.event_name)
         self.output_var.set(self.project_state.output_dir)
-        self.portrait_var.set(self._portable_portrait_setting(self.project_state.portrait_dir))
+        self.portrait_var.set(self._saved_portrait_setting(self.project_state.portrait_dir))
         self.thumbnail_background_var.set(self.project_state.thumbnail_background_path)
         self.ffmpeg_var.set(self.project_state.ffmpeg_path)
         self.ffprobe_var.set(self.project_state.ffprobe_path)
@@ -3539,7 +3539,7 @@ class TekkenVodHelperApp(AppWindow):
             return configured
         return str(self._default_portrait_dir())
 
-    def _portable_portrait_setting(self, configured: str) -> str:
+    def _saved_portrait_setting(self, configured: str) -> str:
         configured = configured.strip()
         if not configured:
             return ""
@@ -3610,7 +3610,7 @@ class TekkenVodHelperApp(AppWindow):
         boilerplate_text: tk.Text,
     ) -> None:
         self.output_var.set(output_var.get().strip())
-        self.portrait_var.set(self._portable_portrait_setting(portrait_var.get().strip()))
+        self.portrait_var.set(self._saved_portrait_setting(portrait_var.get().strip()))
         self.thumbnail_background_var.set(thumbnail_background_var.get().strip())
         self.ffmpeg_var.set(ffmpeg_var.get().strip())
         self.ffprobe_var.set(ffprobe_var.get().strip())

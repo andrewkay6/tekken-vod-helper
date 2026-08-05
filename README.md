@@ -23,6 +23,37 @@ The first version is a manual-review workflow:
 - VLC media player, for embedded video playback
 - Pillow
 
+## Windows Setup
+
+Clone the repository, then run the setup script from the repository root:
+
+```powershell
+git clone <repository-url>
+cd tekken-vod-helper
+.\scripts\setup-windows-shortcut.ps1
+```
+
+The script creates `.venv` if needed, installs `requirements.txt`, and adds a **Tekken VOD Helper** shortcut to the current user's Start Menu. The shortcut runs:
+
+```text
+.venv\Scripts\pythonw.exe -m tekken_vod_helper
+```
+
+It uses the checked-in `tekken_vod_helper\kwtekken-icon.ico`, so the Start Menu entry and launched app use the KW Tekken icon. To refresh dependencies or repair the shortcut after moving the clone, run the setup script again.
+
+Install FFmpeg separately and either add it to `PATH` or configure `ffmpeg.exe` and `ffprobe.exe` in **Settings**. Install VLC separately so `python-vlc` can load the VLC runtime for embedded playback.
+
+Optional setup flags:
+
+```powershell
+.\scripts\setup-windows-shortcut.ps1 -Desktop
+.\scripts\setup-windows-shortcut.ps1 -SkipDependencies
+```
+
+`-Desktop` also creates a desktop shortcut. `-SkipDependencies` only creates or repairs shortcuts.
+
+## Manual Development Setup
+
 Create and activate a virtual environment, then install Python dependencies. On Python 3.14, this installs Pillow 12 because Pillow 10.x does not support Python 3.14:
 
 ```powershell
@@ -30,8 +61,6 @@ python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 ```
-
-Install FFmpeg separately and either add it to `PATH` or configure `ffmpeg.exe` and `ffprobe.exe` in **Settings**. Install VLC separately so `python-vlc` can load the VLC runtime for embedded playback.
 
 ## Run
 
@@ -48,27 +77,9 @@ Use the large **Export Clips** button under the match editor to export the curre
 
 Set **Event** above the match list to include the event name in thumbnails, metadata, titles, and descriptions. Choose an optional thumbnail background image in **Settings -> Thumbnail background**. Put reusable social links or other upload boilerplate in **Settings -> Description boilerplate**.
 
-## Portable Windows Build
-
-Build scripts live in `build/`. The release package is a portable zip, not an installer:
-
-```powershell
-.\build\build.ps1 -Version 0.1.0 -FfmpegDir C:\tools\ffmpeg\bin
-```
-
-That creates:
-
-```text
-dist\TekkenVodHelper-v0.1.0-windows-portable.zip
-```
-
-Upload that zip to a GitHub Release. Users extract it and run the single `TekkenVodHelper.exe`.
-
-Character portraits are embedded in the executable. If `-FfmpegDir` is provided, `ffmpeg.exe` and `ffprobe.exe` are embedded too. VLC media player is still installed separately for embedded playback with sound.
-
 ## Portraits
 
-By default, portraits load from the app's bundled `portraits` folder. In development, that is the repository-level `portraits` folder; in an executable build, the portraits are embedded into `TekkenVodHelper.exe`. You can override the folder in **Settings**. If a saved project points to a portrait folder that no longer exists, the app falls back to the bundled portraits.
+By default, portraits load from the repository-level `portraits` folder. You can override the folder in **Settings**. If a saved project points to a portrait folder that no longer exists, the app falls back to the default portraits.
 
 Portrait filenames should match character names after simple normalization:
 
@@ -80,7 +91,7 @@ The character selectors are editable, so new characters or local aliases can be 
 
 ## Developer Roster Update
 
-Roster sync is a developer-only workflow. Before building an executable, update the bundled character list and portraits from the command line:
+Roster sync is a developer-only workflow. Update the bundled character list and portraits from the command line:
 
 You can also run it from the command line:
 

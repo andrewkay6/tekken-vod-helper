@@ -15,21 +15,21 @@ def test_slugify_keeps_names_filesystem_safe():
 def test_resolve_tool_prefers_configured_path(tmp_path, monkeypatch):
     configured = tmp_path / "custom-ffmpeg.exe"
     configured.write_text("", encoding="utf-8")
-    portable = tmp_path / "ffmpeg" / "ffmpeg.exe"
-    portable.parent.mkdir()
-    portable.write_text("", encoding="utf-8")
+    local = tmp_path / "ffmpeg" / "ffmpeg.exe"
+    local.parent.mkdir()
+    local.write_text("", encoding="utf-8")
     monkeypatch.setattr(ffmpeg_tools.shutil, "which", lambda _name: None)
 
     assert ffmpeg_tools.resolve_tool(str(configured), "ffmpeg") == str(configured)
 
 
-def test_resolve_tool_finds_portable_ffmpeg_folder(tmp_path, monkeypatch):
-    app_exe = tmp_path / "TekkenVodHelper.exe"
-    app_exe.write_text("", encoding="utf-8")
+def test_resolve_tool_finds_local_ffmpeg_folder(tmp_path, monkeypatch):
+    app_python = tmp_path / "python.exe"
+    app_python.write_text("", encoding="utf-8")
     ffmpeg = tmp_path / "ffmpeg" / "ffmpeg.exe"
     ffmpeg.parent.mkdir()
     ffmpeg.write_text("", encoding="utf-8")
-    monkeypatch.setattr(ffmpeg_tools.sys, "executable", str(app_exe))
+    monkeypatch.setattr(ffmpeg_tools.sys, "executable", str(app_python))
     monkeypatch.setattr(ffmpeg_tools.sys, "_MEIPASS", str(tmp_path / "_MEI"), raising=False)
     monkeypatch.setattr(ffmpeg_tools.shutil, "which", lambda _name: None)
 
