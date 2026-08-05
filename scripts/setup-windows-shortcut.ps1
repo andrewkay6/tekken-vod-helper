@@ -41,6 +41,26 @@ if (-not (Test-Path -LiteralPath $IconPath)) {
     throw "Could not find shortcut icon: $IconPath"
 }
 
+function Get-ShellFolderPath {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Name,
+
+        [Parameter(Mandatory = $true)]
+        [string]$DotNetName
+    )
+
+    $Shell = New-Object -ComObject WScript.Shell
+    $FolderPath = $Shell.SpecialFolders.Item($Name)
+    if ([string]::IsNullOrWhiteSpace($FolderPath)) {
+        $FolderPath = [Environment]::GetFolderPath($DotNetName)
+    }
+    if ([string]::IsNullOrWhiteSpace($FolderPath)) {
+        throw "Windows did not return a path for the $Name folder."
+    }
+    return $FolderPath
+}
+
 function New-AppShortcut {
     param(
         [Parameter(Mandatory = $true)]
@@ -57,14 +77,16 @@ function New-AppShortcut {
     $Shortcut.Save()
 }
 
-$StartMenuDir = Join-Path ([Environment]::GetFolderPath("Programs")) "KWTekken"
+$ProgramsDir = Get-ShellFolderPath -Name "Programs" -DotNetName "Programs"
+$StartMenuDir = Join-Path $ProgramsDir "KWTekken"
 New-Item -ItemType Directory -Force -Path $StartMenuDir | Out-Null
 $StartMenuShortcut = Join-Path $StartMenuDir $ShortcutName
 New-AppShortcut -Path $StartMenuShortcut
 Write-Host "Start Menu shortcut: $StartMenuShortcut"
 
 if ($Desktop) {
-    $DesktopShortcut = Join-Path ([Environment]::GetFolderPath("Desktop")) $ShortcutName
+    $DesktopDir = Get-ShellFolderPath -Name "Desktop" -DotNetName "Desktop"
+    $DesktopShortcut = Join-Path $DesktopDir $ShortcutName
     New-AppShortcut -Path $DesktopShortcut
     Write-Host "Desktop shortcut: $DesktopShortcut"
 }
