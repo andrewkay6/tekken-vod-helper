@@ -2,6 +2,7 @@
 
 from pathlib import Path
 import os
+import tkinter
 
 from PyInstaller.utils.hooks import collect_data_files
 
@@ -22,6 +23,13 @@ datas = [
 ]
 
 datas += collect_data_files("customtkinter")
+
+tcl_dir = Path(tkinter.Tcl().eval("info library"))
+tk_dir = tcl_dir.parent / "tk{}".format(tkinter.TkVersion)
+if tcl_dir.exists():
+    datas.append((str(tcl_dir), "_tcl_data"))
+if tk_dir.exists():
+    datas.append((str(tk_dir), "_tk_data"))
 
 portrait_dir = project_root / "portraits"
 if portrait_dir.exists():

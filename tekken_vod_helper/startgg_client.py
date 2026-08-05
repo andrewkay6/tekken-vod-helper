@@ -23,6 +23,7 @@ class BracketSet:
     state: int
     round: int = 0
     parent_set_ids: List[str] = field(default_factory=list)
+    identifier: str = ""
 
     @property
     def label(self) -> str:
@@ -67,10 +68,11 @@ query TournamentSets($slug: String!) {
       sets(page: 1, perPage: 120, sortType: STANDARD) {
         nodes {
           id
+          identifier
           fullRoundText
           round
           state
-          slots {
+          slots(includeByes: true) {
             prereqId
             prereqType
             prereqPlacement
@@ -175,9 +177,10 @@ def parse_tournament_sets(tournament: Dict[str, Any]) -> List[BracketSet]:
                     state=int(node.get("state", 0) or 0),
                     round=int(node.get("round", 0) or 0),
                     parent_set_ids=_slot_parent_set_ids(slots),
+                    identifier=str(node.get("identifier", "") or ""),
                 )
             )
-    return sorted(results, key=lambda item: (item.state not in (1, 2), item.event_name.casefold(), item.round_name, item.id))
+    return results
 
 
 def _slot_name(slot: Dict[str, Any]) -> str:
@@ -198,11 +201,9 @@ def _slot_parent_set_ids(slots: List[Dict[str, Any]]) -> List[str]:
         if not isinstance(slot, dict):
             continue
         prereq_id = slot.get("prereqId")
-        prereq_type = str(slot.get("prereqType", "") or "").casefold()
-        if prereq_id is not None and prereq_type == "set":
+        if prereq_id is not None:
             result.append(str(prereq_id))
     return result
-
 
 def _graphql(token: str, query: str, variables: Dict[str, Any]) -> Dict[str, Any]:
     body = json.dumps({"query": query, "variables": variables}).encode("utf-8")

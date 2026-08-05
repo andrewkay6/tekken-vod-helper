@@ -424,6 +424,82 @@ def test_bracket_picker_centers_child_between_parent_cards():
     assert centers[1][0] == sum(centers[0]) / 2
 
 
+def test_bracket_picker_centers_child_from_any_earlier_parent_round():
+    app = make_app(ProjectState())
+    rounds = [
+        (
+            "Winners Round 1",
+            [
+                ("p1", BracketSet("p1", "Tekken 8 Singles", "Winners Round 1", "Pillaibro", "King Kuma", 1)),
+                ("p2", BracketSet("p2", "Tekken 8 Singles", "Winners Round 1", "Other", "Player", 1)),
+            ],
+        ),
+        (
+            "Winners Quarter-Final",
+            [
+                ("empty", BracketSet("empty", "Tekken 8 Singles", "Winners Quarter-Final", "TBD", "TBD", 1)),
+            ],
+        ),
+        (
+            "Winners Semi-Final",
+            [
+                (
+                    "child",
+                    BracketSet(
+                        "child",
+                        "Tekken 8 Singles",
+                        "Winners Semi-Final",
+                        "andy",
+                        "TBD",
+                        1,
+                        parent_set_ids=["p1"],
+                    ),
+                )
+            ],
+        ),
+    ]
+
+    centers = app._bracket_round_card_centers(rounds)
+
+    assert centers[2][0] == centers[0][0]
+
+
+def test_bracket_picker_uses_projected_grid_when_later_round_has_byes():
+    app = make_app(ProjectState())
+    first_round = [
+        ("A", BracketSet("A", "Tekken 8 Singles", "Winners Round 1", "A1", "A2", 1, identifier="A")),
+        ("B", BracketSet("B", "Tekken 8 Singles", "Winners Round 1", "B1", "B2", 1, identifier="B")),
+        ("C", BracketSet("C", "Tekken 8 Singles", "Winners Round 1", "C1", "C2", 1, identifier="C")),
+        ("D", BracketSet("D", "Tekken 8 Singles", "Winners Round 1", "D1", "D2", 1, identifier="D")),
+    ]
+    second_round = [
+        (identifier, BracketSet(identifier, "Tekken 8 Singles", "Winners Round 2", "TBD", "TBD", 1, identifier=identifier))
+        for identifier in ("E", "F", "G", "H", "I", "J", "K", "L")
+    ]
+
+    centers = app._bracket_round_card_centers([("Winners Round 1", first_round), ("Winners Round 2", second_round)])
+
+    assert centers[0] == [41.0, 229.0, 417.0, 605.0]
+    assert centers[1] == [41.0, 135.0, 229.0, 323.0, 417.0, 511.0, 605.0, 699.0]
+
+
+def test_bracket_picker_keeps_first_round_spacing_without_byes():
+    app = make_app(ProjectState())
+    first_round = [
+        (str(index), BracketSet(str(index), "Tekken 8 Singles", "Winners Round 1", "TBD", "TBD", 1))
+        for index in range(8)
+    ]
+    second_round = [
+        (str(index), BracketSet(str(index), "Tekken 8 Singles", "Winners Round 2", "TBD", "TBD", 1))
+        for index in range(4)
+    ]
+
+    centers = app._bracket_round_card_centers([("Winners Round 1", first_round), ("Winners Round 2", second_round)])
+
+    assert centers[0] == [41.0, 135.0, 229.0, 323.0, 417.0, 511.0, 605.0, 699.0]
+    assert centers[1] == [88.0, 276.0, 464.0, 652.0]
+
+
 def test_player_character_memory_is_case_insensitive_and_overwritten():
     state = ProjectState()
     app = make_app(state)
@@ -506,12 +582,13 @@ def test_startgg_tournament_sets_parse_events_as_a_list():
                         "nodes": [
                             {
                                 "id": "123",
+                                "identifier": "A",
                                 "fullRoundText": "Winners Round 1",
                                 "round": 1,
                                 "state": 1,
                                 "slots": [
                                     {"entrant": {"id": 1, "name": "Alice"}},
-                                    {"entrant": {"id": 2, "name": "Bob"}, "prereqId": "99", "prereqType": "set"},
+                                    {"entrant": {"id": 2, "name": "Bob"}, "prereqId": "99", "prereqType": "winner"},
                                 ],
                             }
                         ]
@@ -528,6 +605,7 @@ def test_startgg_tournament_sets_parse_events_as_a_list():
     assert sets[0].player2 == "Bob"
     assert sets[0].round == 1
     assert sets[0].parent_set_ids == ["99"]
+    assert sets[0].identifier == "A"
 
 
 def test_startgg_tournament_sets_strip_preview_suffixes_from_names():
@@ -557,6 +635,26 @@ def test_startgg_tournament_sets_strip_preview_suffixes_from_names():
     assert sets[0].player1 == "Alice"
     assert sets[0].player2 == "Bob"
     assert sets[0].label == "Tekken 8 Singles - Winners Round 1 - Alice vs Bob"
+
+
+def test_startgg_tournament_sets_preserve_standard_api_order():
+    sets = parse_tournament_sets(
+        {
+            "events": [
+                {
+                    "name": "Tekken 8 Singles",
+                    "sets": {
+                        "nodes": [
+                            {"id": "2", "fullRoundText": "Winners Round 2", "slots": []},
+                            {"id": "1", "fullRoundText": "Winners Round 1", "slots": []},
+                        ]
+                    },
+                }
+            ]
+        }
+    )
+
+    assert [bracket_set.id for bracket_set in sets] == ["2", "1"]
 
 
 def test_startgg_owned_tournaments_reads_all_pages(monkeypatch):

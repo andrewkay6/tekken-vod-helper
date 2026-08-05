@@ -1878,24 +1878,22 @@ class TekkenVodHelperApp(AppWindow):
         card_height = 82
         min_gap = 12
         min_spacing = card_height + min_gap
+        projected_centers = self._projected_bracket_round_card_centers(rounds, card_height, min_spacing)
+        if projected_centers is not None:
+            return projected_centers
         result: List[List[float]] = []
-        previous_ids: List[str] = []
         previous_centers: List[float] = []
+        center_by_set_id: Dict[str, float] = {}
         for column, (_round_name, items) in enumerate(rounds):
             if column == 0:
                 centers = [(card_height / 2) + (index * min_spacing) for index, _item in enumerate(items)]
             else:
-                previous_center_by_id = {
-                    bracket_set.id: previous_centers[index]
-                    for index, (_label, bracket_set) in enumerate(rounds[column - 1][1])
-                    if index < len(previous_centers) and bracket_set.id
-                }
                 desired_centers = []
                 for index, (_label, bracket_set) in enumerate(items):
                     parent_centers = [
-                        previous_center_by_id[parent_id]
+                        center_by_set_id[parent_id]
                         for parent_id in getattr(bracket_set, "parent_set_ids", [])
-                        if parent_id in previous_center_by_id
+                        if parent_id in center_by_set_id
                     ]
                     if not parent_centers:
                         parent_centers = [
@@ -1906,7 +1904,38 @@ class TekkenVodHelperApp(AppWindow):
                     desired_centers.append(sum(parent_centers) / len(parent_centers) if parent_centers else (card_height / 2) + (index * min_spacing))
                 centers = self._space_bracket_card_centers(desired_centers, min_spacing)
             result.append(centers)
+            for index, (_label, bracket_set) in enumerate(items):
+                if index < len(centers) and bracket_set.id:
+                    center_by_set_id[bracket_set.id] = centers[index]
             previous_centers = centers
+        return result
+
+    def _projected_bracket_round_card_centers(self, rounds, card_height: int, min_spacing: int) -> Optional[List[List[float]]]:
+        counts = [len(items) for _round_name, items in rounds]
+        if not counts:
+            return []
+        first_count = counts[0]
+        base_count = max(counts)
+        if first_count <= 0 or base_count <= first_count:
+            return None
+
+        result: List[List[float]] = []
+        for column, (_round_name, items) in enumerate(rounds):
+            count = len(items)
+            if count <= 0:
+                result.append([])
+            elif count == base_count:
+                result.append([(card_height / 2) + (index * min_spacing) for index in range(count)])
+            elif column == 0 and base_count == count * 2:
+                result.append([(card_height / 2) + (index * min_spacing * 2) for index in range(count)])
+            else:
+                group_size = max(1.0, base_count / count)
+                result.append(
+                    [
+                        (card_height / 2) + ((index * group_size) + ((group_size - 1) / 2)) * min_spacing
+                        for index in range(count)
+                    ]
+                )
         return result
 
     def _space_bracket_card_centers(self, centers: List[float], min_spacing: int) -> List[float]:
@@ -1935,7 +1964,7 @@ class TekkenVodHelperApp(AppWindow):
                 for parent_id in getattr(right_set, "parent_set_ids", [])
                 if parent_id in left_by_id
             ]
-            if not source_buttons:
+            if not source_buttons and len(right_cards) <= len(left_cards):
                 source_buttons = [
                     left_cards[index][2]
                     for index in self._fallback_connector_source_indexes(len(left_cards), len(right_cards), right_index)
@@ -1997,12 +2026,28 @@ class TekkenVodHelperApp(AppWindow):
                 if not rounds:
                     continue
                 ordered_rounds = [
-                    (round_name, rounds[round_name])
+                    (round_name, sorted(rounds[round_name], key=self._bracket_set_sort_key))
                     for round_name in sorted(rounds, key=self._round_sort_key)
                 ]
                 sections.append((section_name, ordered_rounds))
             result.append((event_name, sections))
         return result
+
+    def _bracket_set_sort_key(self, item):
+        _label, bracket_set = item
+        identifier_rank = self._bracket_identifier_rank(getattr(bracket_set, "identifier", ""))
+        if identifier_rank:
+            return (0, identifier_rank)
+        return (1, getattr(bracket_set, "round", 0), getattr(bracket_set, "id", ""))
+
+    def _bracket_identifier_rank(self, identifier: str) -> int:
+        value = identifier.strip().upper()
+        if not value or not value.isalpha():
+            return 0
+        rank = 0
+        for character in value:
+            rank = (rank * 26) + (ord(character) - ord("A") + 1)
+        return rank
 
     def _bracket_section_name(self, round_name: str) -> str:
         lowered = round_name.casefold()

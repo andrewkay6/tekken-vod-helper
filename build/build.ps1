@@ -32,6 +32,13 @@ $env:HOME = $ToolHome
 $env:USERPROFILE = $ToolHome
 $env:PYINSTALLER_CONFIG_DIR = $ToolConfig
 
+$TkInfo = python -c "import pathlib, tkinter; tcl_dir = pathlib.Path(tkinter.Tcl().eval('info library')); print(tcl_dir); print(tcl_dir.parent / ('tk' + str(tkinter.TkVersion)))"
+if ($LASTEXITCODE -ne 0 -or $TkInfo.Count -lt 2) {
+    throw "Could not locate Tcl/Tk libraries from the active Python."
+}
+$env:TCL_LIBRARY = $TkInfo[0]
+$env:TK_LIBRARY = $TkInfo[1]
+
 $PreviousBundledFfmpegDir = $env:TEKKEN_VOD_HELPER_FFMPEG_DIR
 try {
     if ($FfmpegDir) {
