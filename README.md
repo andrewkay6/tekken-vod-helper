@@ -113,7 +113,13 @@ By default, clips export as `.mp4` using FFmpeg stream copy/remux for speed. Ena
 
 Each match folder also includes `title.txt` and `description.txt` for manual YouTube uploads without using the YouTube API.
 
-Exports also create an `_youtube_uploads` folder inside the output directory. All exported `.mp4` files are copied there with stable `tvh-...` IDs in their filenames so the whole folder can be drag-dropped into YouTube Studio at once. Each match folder includes a `youtube.json` file, and `_youtube_uploads/manifest.json` points from each video file to its generated title, description, thumbnail, and match metadata. The **Upload Manager** tab can load this queue for review before a future API metadata sync.
+Exports also create an `_youtube_uploads` folder inside the output directory. All exported `.mp4` files are copied there with stable `tvh-...` IDs in their filenames so the whole folder can be drag-dropped into YouTube Studio at once. Each match folder includes a `youtube.json` file, and `_youtube_uploads/manifest.json` points from each video file to its generated title, description, thumbnail, and match metadata.
+
+In **Upload Manager**, click **Load Videos** and **Load Metadata Folder...**. Matching accepts spaces or underscores in place of the upload ID's hyphens. The status shows whether a match came from the title or a saved YouTube video ID. For missing IDs or ambiguous uploads, select the YouTube row and use **Match Selected Video...**. Manual matches and matches submitted to YouTube are saved in `_youtube_uploads/video_matches.json`, so they survive title changes; keep this file with the export folder.
+
+The playlist dropdown applies to all videos in the submitted batch. It suggests a close event-name match when the tournament numbers agree; review the suggestion or choose **No playlist change**. Submission adds videos without duplicating existing playlist entries. Review each matched entry, save its changes locally, and use **Submit to YouTube...** to confirm the updates and playlist choice.
+
+Generated titles over 100 characters drop the entire event suffix, retaining the players, characters, and round. Loading existing metadata uses the same rule. Exceptionally long remaining titles are shortened at a word boundary with an ellipsis.
 
 ## YouTube 1440p Upscale
 

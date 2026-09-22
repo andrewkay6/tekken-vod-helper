@@ -1,4 +1,7 @@
 import json
+import re
+import unicodedata
+from difflib import SequenceMatcher
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -188,6 +191,69 @@ def set_video_thumbnail(video_id: str, thumbnail_path: str, access_token: Option
         },
     )
     return _json_request(request)
+
+
+def list_playlists(access_token: Optional[str] = None) -> List[Dict[str, str]]:
+    token = access_token or refresh_access_token()
+    playlists = []
+    params = {"part": "snippet", "mine": "true", "maxResults": "50"}
+    while True:
+        response = _api_get("/playlists", token, params)
+        playlists.extend({"id": item["id"], "title": item["snippet"]["title"]} for item in response.get("items", []))
+        if not response.get("nextPageToken"):
+            return playlists
+        params["pageToken"] = response["nextPageToken"]
+
+
+def suggest_playlist(event_name: str, playlists: List[Dict[str, str]]) -> str:
+    def normalize(value):
+        value = unicodedata.normalize("NFKD", value.casefold())
+        return " ".join(re.findall(r"[a-z0-9]+", "".join(c for c in value if not unicodedata.combining(c))))
+
+    event = normalize(event_name)
+    if not event:
+        return ""
+    ranked = []
+    for playlist in playlists:
+        title = normalize(playlist["title"])
+        # Tournament numbers must agree; a similar name for another event is not a match.
+        if re.findall(r"\d+", title) != re.findall(r"\d+", event):
+            continue
+        score = SequenceMatcher(None, event, title).ratio()
+        ranked.append((score, playlist["id"]))
+    ranked.sort(reverse=True)
+    if not ranked or ranked[0][0] < 0.6 or (len(ranked) > 1 and ranked[0][0] - ranked[1][0] < 0.08):
+        return ""
+    return ranked[0][1]
+
+
+def add_video_to_playlist(video_id: str, playlist_id: str, access_token: Optional[str] = None) -> Dict[str, Any]:
+    token = access_token or refresh_access_token()
+    existing = _api_get("/playlistItems", token, {
+        "part": "id", "playlistId": playlist_id, "videoId": video_id, "maxResults": "1",
+    })
+    if existing.get("items"):
+        return {"already_present": True}
+    payload = {"snippet": {"playlistId": playlist_id, "resourceId": {"kind": "youtube#video", "videoId": video_id}}}
+    request = urllib.request.Request(
+        YOUTUBE_API_ROOT + "/playlistItems?part=snippet", data=json.dumps(payload).encode("utf-8"), method="POST",
+        headers={"Authorization": "Bearer " + token, "Content-Type": "application/json; charset=utf-8"},
+    )
+    return _json_request(request)
+
+
+def fit_video_title(title: str, event_name: str = "") -> str:
+    title = title.strip()
+    if len(title) <= 100:
+        return title
+    suffix = " - " + event_name.strip()
+    if event_name.strip() and title.endswith(suffix):
+        title = title[:-len(suffix)].rstrip()
+    if len(title) <= 100:
+        return title
+    # Preserve complete words when unusually long player/round names still exceed the limit.
+    shortened = title[:99].rsplit(" ", 1)[0]
+    return (shortened if shortened else title[:99]).rstrip(" -") + "…"
 
 
 def videos_as_rows(videos: Iterable[YouTubeVideo]) -> List[Dict[str, str]]:

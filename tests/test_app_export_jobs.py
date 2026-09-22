@@ -1,6 +1,7 @@
 ﻿from pathlib import Path
 
 import json
+import queue
 
 import pytest
 
@@ -19,6 +20,58 @@ def make_app(state):
     return app
 
 
+@pytest.mark.parametrize("title", [
+    "tvh 002 5e0341  Mattiniero Reina vs Buk Nina   Winners Quarter Final   Basement Brawl 7 CAFÉ EDITION",
+    "TVH_002_5E0341 Match", "tvh-002-5e0341 Match",
+])
+def test_matching_accepts_upload_title_separator_changes(title):
+    app = make_app(ProjectState())
+    app.upload_youtube_rows = [{"video_id": "video", "title": title}]
+    app.upload_metadata_by_id = {"tvh-002-5e0341": {"metadata": {"title": "Restored title"}}}
+    rows = app._upload_review_rows()
+    assert len(rows) == 1
+    assert rows[0]["proposed_title"] == "Restored title"
+    assert rows[0]["match_method"] == "upload ID in title"
+
+
+def test_duplicate_uploads_require_explicit_match(tmp_path):
+    app = make_app(ProjectState())
+    app.upload_youtube_rows = [{"video_id": name, "title": "tvh 002 5e0341 Match"} for name in ("one", "two")]
+    app.upload_metadata_by_id = {"tvh-002-5e0341": {"metadata": {"title": "Restored title"}}}
+    assert not any(row["metadata"] for row in app._upload_review_rows() if row["youtube_id"])
+    app.upload_matches_path = tmp_path / "video_matches.json"
+    app._save_upload_matches({"two": "tvh-002-5e0341"})
+    rows = app._upload_review_rows()
+    assert not rows[0]["metadata"]
+    assert rows[1]["metadata"]
+    with pytest.raises(ValueError, match="already matched"):
+        app._save_upload_matches({"one": "tvh-002-5e0341"})
+
+
+def test_saved_match_survives_title_change_and_folder_reload(tmp_path):
+    metadata = tmp_path / "youtube.json"
+    metadata.write_text(json.dumps({"upload_id": "tvh-002-5e0341", "title": "Restored title"}))
+    (tmp_path / "manifest.json").write_text(json.dumps({"entries": [{"metadata_path": str(metadata)}]}))
+    app = make_app(ProjectState())
+    app._set_upload_metadata_entries(app._read_upload_queue_entries(tmp_path))
+    app._save_upload_matches({"video": "tvh-002-5e0341"})
+    reloaded = make_app(ProjectState())
+    reloaded._set_upload_metadata_entries(reloaded._read_upload_queue_entries(tmp_path))
+    reloaded.upload_youtube_rows = [{"video_id": "video", "title": "Completely renamed"}]
+    rows = reloaded._upload_review_rows()
+    assert len(rows) == 1
+    assert rows[0]["match_method"] == "saved video ID"
+    assert rows[0]["proposed_title"] == "Restored title"
+
+
+def test_existing_metadata_long_title_drops_event_suffix():
+    app = make_app(ProjectState())
+    core = "Alice (Alisa) vs Bob (Nina) - Winners Quarter-Final"
+    event = "Basement Brawl #7 - A Very Long Tournament Edition Name"
+    app._set_upload_metadata_entries([{"upload_id": "tvh-002-5e0341", "metadata": {"title": core + " - " + event, "event_name": event}}])
+    assert app.upload_metadata_by_id["tvh-002-5e0341"]["metadata"]["title"] == core
+
+
 class DummyVar:
     def __init__(self, value=""):
         self.value = value
@@ -28,6 +81,36 @@ class DummyVar:
 
     def set(self, value):
         self.value = value
+
+
+def test_playlist_suggestion_preserves_manual_choice():
+    app = make_app(ProjectState(event_name="Basement Brawl #7 (CAFÉ EDITION)"))
+    app.upload_metadata_by_id = {}
+    app.upload_playlists = [{"id": "seven", "title": "Basement Brawl #7"}]
+    app.upload_playlist_choices = {"No playlist change": "", "Basement Brawl #7": "seven"}
+    app.upload_playlist_var = DummyVar("No playlist change")
+    app.upload_playlist_hint = DummyVar()
+    app.upload_playlist_manual = False
+    app._suggest_upload_playlist()
+    assert app.upload_playlist_var.get() == "Basement Brawl #7"
+    app.upload_playlist_var.set("No playlist change")
+    app.upload_playlist_manual = True
+    app._suggest_upload_playlist()
+    assert app.upload_playlist_var.get() == "No playlist change"
+
+
+@pytest.mark.parametrize("playlist_id", ["", "seven"])
+def test_submit_worker_applies_selected_playlist_only(monkeypatch, playlist_id):
+    app = make_app(ProjectState())
+    app.log_queue = queue.Queue()
+    calls = []
+    monkeypatch.setattr(app_module.youtube_client, "update_video_metadata", lambda **kwargs: {"id": kwargs["video_id"]})
+    monkeypatch.setattr(app_module.youtube_client, "add_video_to_playlist", lambda video, playlist: calls.append((video, playlist)) or {})
+    app._submit_youtube_changes_worker([{"video_id": "video", "playlist_id": playlist_id, "update": {"title": "Title"}}])
+    kind, results = app.log_queue.get_nowait()
+    assert kind == "youtube_submit_done"
+    assert calls == ([("video", "seven")] if playlist_id else [])
+    assert results[0]["applied_update"]["title"] == "Title"
 
 
 def test_export_jobs_use_next_start_when_end_is_unmarked(tmp_path):
@@ -396,7 +479,7 @@ def test_sample_project_generates_upload_metadata_and_dry_run_payloads(tmp_path)
     app.upload_youtube_rows = [
         {
             "video_id": "yt-{:03d}".format(job.index),
-            "title": "{} raw upload title".format(job.upload_id),
+            "title": "{} raw upload title".format(job.upload_id.replace("-", " ")),
             "description": "",
             "privacy_status": "private",
             "upload_status": "uploaded",
@@ -410,6 +493,7 @@ def test_sample_project_generates_upload_metadata_and_dry_run_payloads(tmp_path)
 
     assert len(review_rows) == 9
     assert all(row["metadata"] and row["youtube"] for row in review_rows)
+    assert all(len(row["proposed_title"]) <= 100 for row in review_rows)
     assert dry_run["dry_run"] is True
     assert dry_run["video_id"] == "yt-001"
     assert dry_run["upload_id"] == first_job.upload_id

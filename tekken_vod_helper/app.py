@@ -59,7 +59,7 @@ TEMP_PROJECT_FILENAME = "tekken-vod-helper-recovery.tvh.json"
 TEMP_PROJECT_SAVE_INTERVAL_MS = 30000
 YOUTUBE_UPLOAD_DIRNAME = "_youtube_uploads"
 YOUTUBE_MANIFEST_FILENAME = "manifest.json"
-YOUTUBE_UPLOAD_ID_PATTERN = re.compile(r"tvh-\d{3}-[0-9a-f]{6}", re.IGNORECASE)
+YOUTUBE_UPLOAD_ID_PATTERN = re.compile(r"(?<![a-z0-9])tvh[-_\s]+(\d{3})[-_\s]+([0-9a-f]{6})(?![a-z0-9])", re.IGNORECASE)
 YOUTUBE_THUMBNAIL_DIRNAME = "tekken-vod-helper-youtube-thumbnails"
 UPLOAD_MANAGER_YOUTUBE_PAGE_SIZE = 25
 
@@ -992,6 +992,7 @@ class TekkenVodHelperApp(AppWindow):
         metadata_actions.grid(row=0, column=1, sticky="w", padx=(14, 0))
         ttk.Label(metadata_actions, text="Metadata").grid(row=0, column=0, sticky="w", padx=(0, 6))
         ttk.Button(metadata_actions, text="Load Metadata Folder...", command=self.choose_upload_metadata_folder).grid(row=0, column=1, sticky="w")
+        ttk.Button(metadata_actions, text="Match Selected Video...", command=self.choose_upload_match).grid(row=0, column=2, sticky="w", padx=(6, 0))
         self.submit_youtube_changes_button = ttk.Button(actions, text="Submit to YouTube...", command=self.submit_all_saved_upload_changes, style="Danger.TButton")
         self.submit_youtube_changes_button.grid(row=0, column=3, sticky="e", padx=(12, 0))
         ttk.Label(actions, textvariable=self.upload_manager_status_var, style="Muted.TLabel", anchor="w").grid(row=1, column=0, columnspan=4, sticky="ew", pady=(6, 0))
@@ -1002,6 +1003,18 @@ class TekkenVodHelperApp(AppWindow):
         self._style_text_widget(self.upload_summary_details_text)
         self.upload_summary_details_text.grid(row=3, column=0, columnspan=4, sticky="ew", pady=(6, 0))
         self.upload_summary_details_text.grid_remove()
+        playlist_actions = ttk.Frame(actions)
+        playlist_actions.grid(row=4, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        ttk.Label(playlist_actions, text="Playlist for submitted videos").pack(side="left")
+        self.upload_playlist_var = tk.StringVar(value="No playlist change")
+        self.upload_playlist_choices = {"No playlist change": ""}
+        self.upload_playlist_manual = False
+        self.upload_playlist_combo = ttk.Combobox(playlist_actions, textvariable=self.upload_playlist_var,
+                                                  values=list(self.upload_playlist_choices), state="readonly", width=55)
+        self.upload_playlist_combo.pack(side="left", padx=8)
+        self.upload_playlist_combo.bind("<<ComboboxSelected>>", lambda _event: setattr(self, "upload_playlist_manual", True))
+        self.upload_playlist_hint = tk.StringVar(value="Load Videos to fetch playlists.")
+        ttk.Label(playlist_actions, textvariable=self.upload_playlist_hint).pack(side="left")
 
         review = ttk.Frame(parent)
         review.grid(row=1, column=0, sticky="nsew", pady=(0, 8))
@@ -3528,6 +3541,32 @@ class TekkenVodHelperApp(AppWindow):
             return
         rows = self._prepare_youtube_rows_for_display(youtube_client.videos_as_rows(videos))
         self.log_queue.put(("youtube_videos", rows))
+        try:
+            self.log_queue.put(("youtube_playlists", youtube_client.list_playlists()))
+        except Exception as exc:
+            self.log_queue.put(("youtube_playlists_error", str(exc)))
+
+    def _set_youtube_playlists(self, playlists: List[Dict[str, str]]) -> None:
+        self.upload_playlists = playlists
+        self.upload_playlist_choices = {"No playlist change": ""}
+        self.upload_playlist_choices.update({"{} [{}]".format(p["title"], p["id"]): p["id"] for p in playlists})
+        self.upload_playlist_combo.configure(values=list(self.upload_playlist_choices))
+        if self.upload_playlist_var.get() not in self.upload_playlist_choices:
+            self.upload_playlist_var.set("No playlist change")
+            self.upload_playlist_manual = False
+        self._suggest_upload_playlist()
+
+    def _suggest_upload_playlist(self) -> None:
+        if "upload_playlist_var" not in self.__dict__ or self.upload_playlist_manual:
+            return
+        events = {str(entry.get("metadata", {}).get("event_name", "") or "").strip()
+                  for entry in self.upload_metadata_by_id.values()}
+        events.discard("")
+        event = next(iter(events)) if len(events) == 1 else "" if events else self.project_state.event_name
+        suggestion = youtube_client.suggest_playlist(event, self.__dict__.get("upload_playlists", []))
+        label = next((label for label, value in self.upload_playlist_choices.items() if value == suggestion), "No playlist change")
+        self.upload_playlist_var.set(label)
+        self.upload_playlist_hint.set("Suggested from event name — review before submitting." if suggestion else "Choose a playlist (optional).")
 
     def _prepare_youtube_rows_for_display(self, rows: List[Dict[str, object]]) -> List[Dict[str, object]]:
         prepared = []
@@ -3565,6 +3604,12 @@ class TekkenVodHelperApp(AppWindow):
         manifest_path = self._upload_manifest_path(selected_path)
         with manifest_path.open("r", encoding="utf-8") as handle:
             manifest = json.load(handle)
+        matches_path = manifest_path.with_name("video_matches.json")
+        matches = json.loads(matches_path.read_text(encoding="utf-8")) if matches_path.exists() else {}
+        if not isinstance(matches, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in matches.items()):
+            raise ValueError("Invalid video_matches.json: expected YouTube video IDs mapped to upload IDs.")
+        self.upload_matches_path = matches_path
+        self.upload_video_matches = matches
         entries = manifest.get("entries", [])
         if not isinstance(entries, list):
             return []
@@ -3603,8 +3648,12 @@ class TekkenVodHelperApp(AppWindow):
                 metadata = {}
             upload_id = str(metadata.get("upload_id") or entry.get("upload_id") or "").strip()
             if upload_id:
+                metadata = dict(metadata)
+                if metadata.get("title"):
+                    metadata["title"] = youtube_client.fit_video_title(str(metadata["title"]), str(metadata.get("event_name", "") or ""))
                 metadata_by_id[upload_id] = {**entry, "metadata": metadata}
         self.upload_metadata_by_id = metadata_by_id
+        self._suggest_upload_playlist()
 
     def _refresh_upload_tree(self, entries: List[Dict[str, object]]) -> None:
         if not hasattr(self, "upload_tree"):
@@ -3671,9 +3720,24 @@ class TekkenVodHelperApp(AppWindow):
     def _upload_review_rows(self) -> List[Dict[str, object]]:
         rows = []
         matched_ids = set()
+        saved_matches = self.__dict__.get("upload_video_matches", {})
+        candidates = {}
+        for video in self.upload_youtube_rows:
+            video_id = str(video.get("video_id", ""))
+            candidates[video_id] = saved_matches.get(video_id) or self._extract_upload_id(str(video.get("title", "") or ""))
+        reserved = set(saved_matches.values())
         for youtube_row in self.upload_youtube_rows:
-            upload_id = self._extract_upload_id(str(youtube_row.get("title", "") or ""))
+            video_id = str(youtube_row.get("video_id", ""))
+            upload_id = candidates[video_id]
+            explicit = video_id in saved_matches
+            if explicit:
+                conflict = sum(value == upload_id for value in saved_matches.values()) > 1
+            else:
+                conflict = bool(upload_id) and (upload_id in reserved or sum(value == upload_id for value in candidates.values()) > 1)
             metadata_entry = self.upload_metadata_by_id.get(upload_id) if upload_id else None
+            if conflict:
+                metadata_entry = None
+            match_method = "saved video ID" if explicit else "upload ID in title"
             if upload_id and metadata_entry:
                 matched_ids.add(upload_id)
             metadata = metadata_entry.get("metadata", {}) if metadata_entry else {}
@@ -3681,7 +3745,10 @@ class TekkenVodHelperApp(AppWindow):
                 metadata = {}
             rows.append(
                 {
-                    "status": self._youtube_review_status(youtube_row, metadata_entry),
+                    "status": self._youtube_review_status(youtube_row, metadata_entry) + (
+                        " ({})".format(match_method) if metadata_entry else " — needs manual match" if upload_id else " — unmatched"
+                    ),
+                    "match_method": match_method if metadata_entry else "",
                     "youtube_id": youtube_row.get("video_id", ""),
                     "upload_id": upload_id,
                     "current_title": youtube_row.get("title", ""),
@@ -3756,7 +3823,79 @@ class TekkenVodHelperApp(AppWindow):
 
     def _extract_upload_id(self, text: str) -> str:
         match = YOUTUBE_UPLOAD_ID_PATTERN.search(text)
-        return match.group(0).lower() if match else ""
+        return "tvh-{}-{}".format(match.group(1), match.group(2).lower()) if match else ""
+
+    def _save_upload_matches(self, pairs: Dict[str, str]) -> None:
+        path = self.__dict__.get("upload_matches_path")
+        if path is None:
+            raise ValueError("Load a metadata folder first.")
+        matches = dict(self.__dict__.get("upload_video_matches", {}))
+        matches.update(pairs)
+        if len(set(matches.values())) != len(matches):
+            raise ValueError("That export is already matched to another YouTube video.")
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(matches, indent=2) + "\n", encoding="utf-8")
+        temporary.replace(path)
+        self.upload_video_matches = matches
+
+    def choose_upload_match(self) -> None:
+        index = self.upload_selected_review_index
+        if index is None or not self.upload_review_rows[index].get("youtube_id"):
+            messagebox.showinfo("Select a video", "Select a YouTube video, then choose Match Selected Video.")
+            return
+        row = self.upload_review_rows[index]
+        if not self.upload_metadata_by_id:
+            messagebox.showinfo("Load metadata", "Load an export metadata folder first.")
+            return
+        dialog = tk.Toplevel(self)
+        dialog.title("Match YouTube video to export")
+        dialog.transient(self)
+        dialog.grab_set()
+        ttk.Label(dialog, text="YouTube: {}\nVideo ID: {}\nChoose the matching local export:".format(
+            row.get("current_title", ""), row["youtube_id"]), wraplength=800).pack(padx=12, pady=12, anchor="w")
+        choices = list(self.upload_metadata_by_id)
+        picker = tk.Listbox(dialog, width=110, height=15, exportselection=False)
+        picker.pack(fill="both", expand=True, padx=12)
+        for upload_id in choices:
+            entry = self.upload_metadata_by_id[upload_id]
+            picker.insert("end", "{} | {}".format(upload_id, entry.get("metadata", {}).get("title", "")))
+
+        def apply_match():
+            selected = picker.curselection()
+            if not selected:
+                return
+            upload_id = choices[selected[0]]
+            if any(other is not row and other.get("youtube_id") and other.get("metadata")
+                   and other.get("upload_id") == upload_id for other in self.upload_review_rows):
+                messagebox.showerror("Already matched", "This export is already matched to another video.", parent=dialog)
+                return
+            if not messagebox.askyesno("Use this match?", "Match {} to {}?\nThis replaces pending edits for this video.".format(
+                    row["youtube_id"], picker.get(selected[0])), parent=dialog):
+                return
+            try:
+                self._save_upload_matches({str(row["youtube_id"]): upload_id})
+            except Exception as exc:
+                self.show_copyable_error("Could not save video match", exc)
+                return
+            entry = self.upload_metadata_by_id[upload_id]
+            # Update only this pair so other saved edits remain intact.
+            for other in self.upload_review_rows:
+                if other is not row and other.get("upload_id") == upload_id:
+                    other.update(metadata={}, metadata_entry=None, proposed_title="", saved_changes=False, status="Matched to " + str(row["youtube_id"]))
+            row.update(upload_id=upload_id, metadata_entry=entry, metadata=dict(entry.get("metadata", {})),
+                       proposed_title=entry.get("metadata", {}).get("title", ""), saved_changes=False,
+                       editor_dirty=False, edited=False, match_method="saved video ID",
+                       status=self._youtube_review_status(row["youtube"], entry) + " (saved video ID)")
+            row.pop("draft_metadata", None)
+            self.upload_thumbnail_cache.pop("row:" + str(row["youtube_id"]), None)
+            self.upload_thumbnail_cache.pop("detail:" + str(row["youtube_id"]), None)
+            for row_index in range(len(self.upload_review_rows)):
+                self._update_upload_review_tree_row(row_index)
+            self._load_upload_review_details(row)
+            self._refresh_upload_pending_summary()
+            dialog.destroy()
+
+        ttk.Button(dialog, text="Use This Match", command=apply_match).pack(pady=12)
 
     def _upload_row_thumbnail(self, row: Dict[str, object]):
         key_source = str(row.get("youtube_id") or row.get("upload_id") or "")
@@ -4084,6 +4223,10 @@ class TekkenVodHelperApp(AppWindow):
 
     def _confirm_and_submit_upload_payloads(self, rows: List[Dict[str, object]]) -> None:
         details = "\n\n".join(self._upload_change_detail_text(row) for row in rows)
+        playlist_var = self.__dict__.get("upload_playlist_var")
+        playlist_label = playlist_var.get() if playlist_var else "No playlist change"
+        playlist_id = self.__dict__.get("upload_playlist_choices", {}).get(playlist_label, "")
+        details += "\n\nPlaylist for all submitted videos: {}".format(playlist_label)
         if not messagebox.askyesno(
             "Submit changes to YouTube?",
             "This will submit metadata changes to YouTube and cannot be undone automatically.\n\nVideos:\n{}".format(details),
@@ -4095,6 +4238,15 @@ class TekkenVodHelperApp(AppWindow):
             "; ".join(str(row.get("proposed_title", "") or row.get("current_title", "") or row.get("youtube_id", "")) for row in rows),
         ))
         payloads = [self._youtube_upload_payload(row) for row in rows]
+        for payload in payloads:
+            payload["playlist_id"] = playlist_id
+        pairs = {str(row["youtube_id"]): str(row["upload_id"]) for row in rows if row.get("upload_id") and row.get("metadata_entry")}
+        if pairs:
+            try:
+                self._save_upload_matches(pairs)
+            except Exception as exc:
+                self.show_copyable_error("Could not save video matches", exc)
+                return
         self.submitting_youtube_changes = True
         self._set_submit_youtube_changes_state("disabled")
         self.upload_manager_status_var.set("Submitting {} YouTube metadata update{}...".format(len(rows), "" if len(rows) == 1 else "s"))
@@ -4130,6 +4282,8 @@ class TekkenVodHelperApp(AppWindow):
                         "applied_update": update,
                     }
                 )
+                if payload.get("playlist_id"):
+                    results[-1]["playlist_result"] = youtube_client.add_video_to_playlist(video_id, str(payload["playlist_id"]))
             self.log_queue.put(("youtube_submit_done", results))
         except Exception as exc:
             error_payload = {"error": str(exc), "submitted_payloads": payloads, "completed_results": results}
@@ -4345,7 +4499,7 @@ class TekkenVodHelperApp(AppWindow):
             parts.append(match.round_name)
         if self.project_state.event_name:
             parts.append(self.project_state.event_name)
-        return " - ".join(parts)
+        return youtube_client.fit_video_title(" - ".join(parts), self.project_state.event_name)
 
     def _upload_description(self, job: ExportJob) -> str:
         return self._description_boilerplate()
@@ -5040,6 +5194,11 @@ class TekkenVodHelperApp(AppWindow):
                 self.upload_manager_status_var.set("Could not load YouTube videos.")
                 self.log("YouTube read-only load error: {}".format(message))
                 self.show_copyable_error("YouTube read-only load failed", message)
+            elif kind == "youtube_playlists":
+                self._set_youtube_playlists(message)
+            elif kind == "youtube_playlists_error":
+                self.upload_playlist_hint.set("Playlist load failed; click Load Videos to retry.")
+                self.log("Could not load playlists: {}".format(message))
             elif kind == "youtube_submit_done":
                 self.submitting_youtube_changes = False
                 self._set_submit_youtube_changes_state("normal")
