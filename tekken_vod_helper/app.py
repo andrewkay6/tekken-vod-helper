@@ -6,18 +6,35 @@ import threading
 import tempfile
 import tkinter as tk
 import ctypes
+import hashlib
+import urllib.request
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Dict, List, Optional, Tuple
 
 from .ffmpeg_tools import FfmpegError, extract_frame, probe_duration, require_tool, slice_clip
-from .models import DEFAULT_OVERLAY_ACCENT_COLOR, DEFAULT_OVERLAY_OPACITY, ExportJob, MatchSegment, OverlayState, ProjectState
+from .models import (
+    DEFAULT_DESCRIPTION_BOILERPLATE,
+    DEFAULT_OVERLAY_ACCENT_COLOR,
+    DEFAULT_OVERLAY_OPACITY,
+    ExportJob,
+    MatchSegment,
+    OverlayState,
+    ProjectState,
+)
 from .obs_client import ObsClient, ObsError
 from .overlay_server import OverlayServer
 from .startgg_client import BracketSet, TournamentSummary, fetch_bracket_sets, fetch_owned_tournaments, normalize_tournament_slug
 from .thumbnails import Image, ImageTk, find_portrait, make_thumbnail
 from .util import parse_timestamp, safe_relative_name, seconds_to_timestamp, slugify, unique_sorted
-from .windows_credentials import CredentialError, delete_startgg_token, read_startgg_token, write_startgg_token
+from .windows_credentials import (
+    CredentialError,
+    delete_startgg_token,
+    read_startgg_token,
+    write_startgg_token,
+    write_youtube_client_credentials,
+)
+from . import youtube_client
 
 try:
     import vlc
@@ -40,6 +57,11 @@ APP_ACCENT = DEFAULT_OVERLAY_ACCENT_COLOR
 APP_ACCENT_HOVER = "#c90f4c"
 TEMP_PROJECT_FILENAME = "tekken-vod-helper-recovery.tvh.json"
 TEMP_PROJECT_SAVE_INTERVAL_MS = 30000
+YOUTUBE_UPLOAD_DIRNAME = "_youtube_uploads"
+YOUTUBE_MANIFEST_FILENAME = "manifest.json"
+YOUTUBE_UPLOAD_ID_PATTERN = re.compile(r"tvh-\d{3}-[0-9a-f]{6}", re.IGNORECASE)
+YOUTUBE_THUMBNAIL_DIRNAME = "tekken-vod-helper-youtube-thumbnails"
+UPLOAD_MANAGER_YOUTUBE_PAGE_SIZE = 25
 
 AppWindow = ctk.CTk if ctk is not None else tk.Tk
 
@@ -97,6 +119,9 @@ class TekkenVodHelperApp(AppWindow):
         self.overlay_apply_after_id: Optional[str] = None
         self.temporary_project_after_id: Optional[str] = None
         self.temporary_project_path = self._temporary_project_path()
+        self.temporary_project_dismissed_path = self._temporary_project_dismissed_path()
+        self.youtube_thumbnail_cache_dir = self._youtube_thumbnail_cache_dir()
+        self.temporary_project_dismissed = False
         self.overlay_auto_apply_enabled = False
         self.output_var = tk.StringVar(value=self.project_state.output_dir)
         self.event_var = tk.StringVar(value=self.project_state.event_name)
@@ -126,6 +151,7 @@ class TekkenVodHelperApp(AppWindow):
         self.startgg_tournament_var = tk.StringVar()
         self.bracket_set_var = tk.StringVar()
         self.startgg_status_var = tk.StringVar(value="Load start.gg events to choose bracket matches.")
+        self.upload_manager_status_var = tk.StringVar(value="Export clips to create a YouTube upload queue.")
         self.startgg_events_button = None
         self.vod_startgg_events_button = None
         self.startgg_picker_window: Optional[tk.Toplevel] = None
@@ -147,6 +173,17 @@ class TekkenVodHelperApp(AppWindow):
         self.menu_items = {}
         self.portrait_photo_cache = {}
         self.app_icon_photos = []
+        self.upload_youtube_rows: List[Dict[str, object]] = []
+        self.upload_metadata_by_id: Dict[str, Dict[str, object]] = {}
+        self.upload_review_rows: List[Dict[str, object]] = []
+        self.upload_thumbnail_cache = {}
+        self.upload_editor_baseline: Dict[str, object] = {}
+        self.upload_selected_review_index: Optional[int] = None
+        self.upload_editor_loading = False
+        self.upload_editor_dirty = False
+        self.upload_summary_details_visible = False
+        self.loading_youtube_videos = False
+        self.submitting_youtube_changes = False
 
         self._apply_app_icon()
         self.protocol("WM_DELETE_WINDOW", self.destroy)
@@ -182,6 +219,7 @@ class TekkenVodHelperApp(AppWindow):
         mode_menu = tk.Menu(menubar, tearoff=False)
         mode_menu.add_command(label="Overlay Control", command=lambda: self.set_workspace_mode("overlay"))
         mode_menu.add_command(label="VOD Editor", command=lambda: self.set_workspace_mode("vod"))
+        mode_menu.add_command(label="Upload Manager", command=lambda: self.set_workspace_mode("upload"))
         menubar.add_cascade(label="Mode", menu=mode_menu)
 
         view_menu = tk.Menu(menubar, tearoff=False)
@@ -299,6 +337,8 @@ class TekkenVodHelperApp(AppWindow):
         style.map("OverlayAction.TButton", background=[("active", "#2a303b"), ("pressed", "#252a34")])
         style.configure("Export.TButton", font=("Segoe UI Semibold", 13), padding=(18, 13), background=APP_ACCENT)
         style.map("Export.TButton", background=[("active", APP_ACCENT_HOVER), ("pressed", "#a90d41")])
+        style.configure("Danger.TButton", font=("Segoe UI Semibold", 11), padding=(14, 9), background="#b42318", foreground="#ffffff")
+        style.map("Danger.TButton", background=[("active", "#d92d20"), ("pressed", "#912018")], foreground=[("active", "#ffffff"), ("pressed", "#ffffff")])
         style.configure("BracketCard.TButton", background=APP_PANEL_ALT, foreground=APP_TEXT, bordercolor=APP_BORDER, padding=(12, 10))
         style.map("BracketCard.TButton", background=[("active", "#2a303b"), ("pressed", "#252a34")])
         style.configure("SelectedBracketCard.TButton", background=APP_ACCENT, foreground="#ffffff", bordercolor=APP_ACCENT, padding=(12, 10))
@@ -403,6 +443,11 @@ class TekkenVodHelperApp(AppWindow):
 
         self._build_video_panel(left)
         self._build_match_panel(match_tab)
+
+        self.upload_workspace = ttk.Frame(self.workspace, style="TFrame")
+        self.upload_workspace.columnconfigure(0, weight=1)
+        self.upload_workspace.rowconfigure(0, weight=1)
+        self._build_upload_manager_panel(self.upload_workspace)
         self.set_workspace_mode(self.current_mode, rebuild_menu=False)
 
     def _ctk_frame(self, parent, **kwargs):
@@ -490,8 +535,17 @@ class TekkenVodHelperApp(AppWindow):
             anchor="w",
         )
         self.mode_buttons["vod"].grid(row=3, column=0, sticky="ew", padx=12, pady=(0, 8))
+        self.mode_buttons["upload"] = self._ctk_button(
+            parent,
+            text="Upload Manager",
+            command=lambda: self.set_workspace_mode("upload"),
+            height=40,
+            corner_radius=8,
+            anchor="w",
+        )
+        self.mode_buttons["upload"].grid(row=4, column=0, sticky="ew", padx=12, pady=(0, 8))
 
-        parent.rowconfigure(4, weight=1)
+        parent.rowconfigure(5, weight=1)
         settings = self._ctk_button(
             parent,
             text="Settings",
@@ -500,7 +554,7 @@ class TekkenVodHelperApp(AppWindow):
             corner_radius=8,
             anchor="w",
         )
-        settings.grid(row=5, column=0, sticky="ew", padx=12, pady=(0, 8))
+        settings.grid(row=6, column=0, sticky="ew", padx=12, pady=(0, 8))
         save = self._ctk_button(
             parent,
             text="Save Project",
@@ -509,7 +563,7 @@ class TekkenVodHelperApp(AppWindow):
             corner_radius=8,
             anchor="w",
         )
-        save.grid(row=6, column=0, sticky="ew", padx=12, pady=(0, 16))
+        save.grid(row=7, column=0, sticky="ew", padx=12, pady=(0, 16))
 
     def _build_header(self, parent) -> None:
         header = self._ctk_frame(parent, fg_color=APP_BG, corner_radius=0)
@@ -533,9 +587,10 @@ class TekkenVodHelperApp(AppWindow):
         caption.grid(row=0, column=1, sticky="e", padx=(16, 0))
 
     def set_workspace_mode(self, mode: str, rebuild_menu: bool = True) -> None:
-        self.current_mode = "vod" if mode == "vod" else "overlay"
+        self.current_mode = mode if mode in ("overlay", "vod", "upload") else "overlay"
         self.overlay_workspace_container.grid_remove()
         self.vod_workspace.grid_remove()
+        self.upload_workspace.grid_remove()
         if self.current_mode == "vod":
             self.unbind_all("<MouseWheel>")
             self.vod_workspace.grid(row=0, column=0, sticky="nsew")
@@ -543,6 +598,13 @@ class TekkenVodHelperApp(AppWindow):
             self.geometry("1280x820")
             self.mode_title_var.set("VOD Editor")
             self.mode_caption_var.set("VOD Editor")
+        elif self.current_mode == "upload":
+            self.unbind_all("<MouseWheel>")
+            self.upload_workspace.grid(row=0, column=0, sticky="nsew")
+            self.title("KWTekken Upload Manager")
+            self.geometry("1280x820")
+            self.mode_title_var.set("Upload Manager")
+            self.mode_caption_var.set("Review YouTube metadata queue")
         else:
             self.overlay_workspace_container.grid(row=0, column=0, sticky="nsew")
             self.title("KWTekken Overlay Control")
@@ -912,6 +974,119 @@ class TekkenVodHelperApp(AppWindow):
             command=self.generate_metadata_only,
         )
         self.metadata_button.grid(row=0, column=1, sticky="ew", padx=(4, 0))
+
+    def _build_upload_manager_panel(self, parent: ttk.Frame) -> None:
+        parent.columnconfigure(0, weight=1)
+        parent.rowconfigure(1, weight=3)
+        parent.rowconfigure(2, weight=2)
+
+        actions = ttk.Frame(parent)
+        actions.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        actions.columnconfigure(2, weight=1)
+        youtube_actions = ttk.Frame(actions)
+        youtube_actions.grid(row=0, column=0, sticky="w")
+        ttk.Label(youtube_actions, text="YouTube").grid(row=0, column=0, sticky="w", padx=(0, 6))
+        self.load_youtube_videos_button = ttk.Button(youtube_actions, text="Load Videos", command=self.load_youtube_videos_readonly)
+        self.load_youtube_videos_button.grid(row=0, column=1, sticky="w")
+        metadata_actions = ttk.Frame(actions)
+        metadata_actions.grid(row=0, column=1, sticky="w", padx=(14, 0))
+        ttk.Label(metadata_actions, text="Metadata").grid(row=0, column=0, sticky="w", padx=(0, 6))
+        ttk.Button(metadata_actions, text="Load Metadata Folder...", command=self.choose_upload_metadata_folder).grid(row=0, column=1, sticky="w")
+        self.submit_youtube_changes_button = ttk.Button(actions, text="Submit to YouTube...", command=self.submit_all_saved_upload_changes, style="Danger.TButton")
+        self.submit_youtube_changes_button.grid(row=0, column=3, sticky="e", padx=(12, 0))
+        ttk.Label(actions, textvariable=self.upload_manager_status_var, style="Muted.TLabel", anchor="w").grid(row=1, column=0, columnspan=4, sticky="ew", pady=(6, 0))
+        self.upload_pending_summary_var = tk.StringVar(value="No locally saved YouTube changes.")
+        ttk.Label(actions, textvariable=self.upload_pending_summary_var, style="Muted.TLabel", anchor="w").grid(row=2, column=0, columnspan=3, sticky="ew", pady=(6, 0))
+        ttk.Button(actions, text="More Details", command=self.toggle_upload_summary_details).grid(row=2, column=3, sticky="e", padx=(6, 0), pady=(6, 0))
+        self.upload_summary_details_text = tk.Text(actions, height=4, wrap="word")
+        self._style_text_widget(self.upload_summary_details_text)
+        self.upload_summary_details_text.grid(row=3, column=0, columnspan=4, sticky="ew", pady=(6, 0))
+        self.upload_summary_details_text.grid_remove()
+
+        review = ttk.Frame(parent)
+        review.grid(row=1, column=0, sticky="nsew", pady=(0, 8))
+        review.columnconfigure(0, weight=0)
+        review.columnconfigure(1, weight=1)
+        review.rowconfigure(1, weight=1)
+
+        preview = ttk.Frame(review)
+        preview.grid(row=0, column=0, rowspan=2, sticky="nsew", padx=(0, 12))
+        preview.columnconfigure(0, weight=1)
+        self.upload_detail_thumbnail = ttk.Label(preview, text="Click to choose thumbnail", anchor="center", relief="solid", cursor="hand2")
+        self.upload_detail_thumbnail.grid(row=0, column=0, sticky="new")
+        self.upload_detail_thumbnail.bind("<Button-1>", lambda _event: self.choose_upload_thumbnail())
+        self.upload_detail_status_var = tk.StringVar(value="Select a video to review.")
+        ttk.Label(preview, textvariable=self.upload_detail_status_var, style="Muted.TLabel", wraplength=240, justify="left").grid(row=1, column=0, sticky="ew", pady=(8, 0))
+
+        proposed_header = ttk.Frame(review)
+        proposed_header.grid(row=0, column=1, sticky="ew")
+        proposed_header.columnconfigure(0, weight=1)
+        ttk.Label(proposed_header, text="Pending Changes").grid(row=0, column=0, sticky="w")
+        self.upload_editor_save_state_var = tk.StringVar(value="Select a video to edit.")
+        ttk.Label(proposed_header, textvariable=self.upload_editor_save_state_var, style="Muted.TLabel").grid(row=0, column=1, sticky="e", padx=(12, 0))
+        ttk.Button(proposed_header, text="Save This Entry", command=self.save_selected_upload_changes_locally).grid(row=0, column=2, sticky="e", padx=(10, 0))
+        ttk.Button(proposed_header, text="Revert This Entry", command=self.revert_selected_upload_changes_to_live).grid(row=0, column=3, sticky="e", padx=(8, 0))
+        proposed_editor = ttk.Frame(review)
+        proposed_editor.grid(row=1, column=1, sticky="nsew")
+        proposed_editor.columnconfigure(1, weight=1)
+        proposed_editor.rowconfigure(5, weight=1)
+        self.upload_proposed_title_var = tk.StringVar()
+        self.upload_proposed_title_count_var = tk.StringVar(value="0/100")
+        self.upload_proposed_tags_var = tk.StringVar()
+        self.upload_proposed_thumbnail_var = tk.StringVar()
+        self.upload_proposed_privacy_var = tk.StringVar(value="private")
+        self.upload_title_label_var = tk.StringVar(value="Title")
+        self.upload_tags_label_var = tk.StringVar(value="Tags")
+        self.upload_privacy_label_var = tk.StringVar(value="Visibility")
+        self.upload_thumbnail_label_var = tk.StringVar(value="Thumbnail")
+        self.upload_description_label_var = tk.StringVar(value="Description")
+        ttk.Label(proposed_editor, textvariable=self.upload_title_label_var).grid(row=0, column=0, sticky="w", pady=(0, 4))
+        title_entry = ttk.Entry(proposed_editor, textvariable=self.upload_proposed_title_var)
+        title_entry.grid(row=0, column=1, sticky="ew", pady=(0, 4))
+        title_entry.bind("<KeyRelease>", lambda _event: self._update_upload_editor_dirty_state())
+        ttk.Label(proposed_editor, textvariable=self.upload_proposed_title_count_var, style="Muted.TLabel").grid(row=0, column=2, sticky="e", padx=(6, 0), pady=(0, 4))
+        ttk.Label(proposed_editor, textvariable=self.upload_tags_label_var).grid(row=1, column=0, sticky="w", pady=4)
+        tags_entry = ttk.Entry(proposed_editor, textvariable=self.upload_proposed_tags_var)
+        tags_entry.grid(row=1, column=1, columnspan=2, sticky="ew", pady=4)
+        tags_entry.bind("<KeyRelease>", lambda _event: self._update_upload_editor_dirty_state())
+        ttk.Label(proposed_editor, textvariable=self.upload_privacy_label_var).grid(row=2, column=0, sticky="w", pady=4)
+        privacy_combo = ttk.Combobox(
+            proposed_editor,
+            textvariable=self.upload_proposed_privacy_var,
+            values=["private", "unlisted", "public"],
+            state="readonly",
+            width=12,
+        )
+        privacy_combo.grid(row=2, column=1, sticky="w", pady=4)
+        privacy_combo.bind("<<ComboboxSelected>>", lambda _event: self._update_upload_editor_dirty_state())
+        ttk.Label(proposed_editor, text="Not made for kids", style="Muted.TLabel").grid(row=2, column=2, sticky="w", padx=(8, 0), pady=4)
+        ttk.Label(proposed_editor, textvariable=self.upload_thumbnail_label_var).grid(row=3, column=0, sticky="w", pady=4)
+        ttk.Button(proposed_editor, text="Choose Thumbnail...", command=self.choose_upload_thumbnail).grid(row=3, column=1, sticky="w", pady=4)
+        ttk.Label(proposed_editor, textvariable=self.upload_description_label_var).grid(row=4, column=0, columnspan=3, sticky="w", pady=(6, 4))
+        self.upload_proposed_description_text = tk.Text(proposed_editor, height=12, wrap="word")
+        self._style_text_widget(self.upload_proposed_description_text)
+        self.upload_proposed_description_text.grid(row=5, column=0, columnspan=3, sticky="nsew")
+        self.upload_proposed_description_text.bind("<KeyRelease>", lambda _event: self._update_upload_editor_dirty_state())
+
+        columns = ("changes", "status", "id", "upload_id", "current_title")
+        self.upload_tree = ttk.Treeview(parent, columns=columns, show="tree headings", selectmode="browse")
+        self.upload_tree.heading("#0", text="Thumb")
+        self.upload_tree.heading("changes", text="State")
+        self.upload_tree.heading("status", text="Status")
+        self.upload_tree.heading("id", text="YouTube ID")
+        self.upload_tree.heading("upload_id", text="Upload ID")
+        self.upload_tree.heading("current_title", text="Current Title")
+        self.upload_tree.column("#0", width=98, stretch=False)
+        self.upload_tree.column("changes", width=90, stretch=False)
+        self.upload_tree.column("status", width=140, stretch=False)
+        self.upload_tree.column("id", width=105, stretch=False)
+        self.upload_tree.column("upload_id", width=110, stretch=False)
+        self.upload_tree.column("current_title", width=420)
+        self.upload_tree.grid(row=2, column=0, sticky="nsew")
+        self.upload_tree.bind("<<TreeviewSelect>>", self.on_upload_selection_changed)
+        upload_scroll = ttk.Scrollbar(parent, orient="vertical", command=self.upload_tree.yview)
+        upload_scroll.grid(row=2, column=1, sticky="ns")
+        self.upload_tree.configure(yscrollcommand=upload_scroll.set)
 
     def _build_log_panel(self, parent: ttk.Frame, row: int = 1, padx: int = 10, pady=(8, 10)) -> None:
         log_frame = ttk.LabelFrame(parent, text="Log", padding=6)
@@ -2294,6 +2469,7 @@ class TekkenVodHelperApp(AppWindow):
         self.project_state.video_path = path
         self.project_state.duration = duration
         self._reset_matches_for_new_video(previous_video, path)
+        self.temporary_project_dismissed = False
         self.current_time = 0.0
         self.scrub.configure(to=max(duration, 1.0))
         self.scrub_var.set(0.0)
@@ -2334,10 +2510,13 @@ class TekkenVodHelperApp(AppWindow):
         notebook.grid(row=0, column=0, sticky="nsew")
         general_tab = ttk.Frame(notebook, padding=10)
         visual_tab = ttk.Frame(notebook, padding=10)
+        youtube_tab = ttk.Frame(notebook, padding=10)
         notebook.add(general_tab, text="General")
         notebook.add(visual_tab, text="Stream Visual Settings")
+        notebook.add(youtube_tab, text="YouTube")
         general_tab.columnconfigure(1, weight=1)
         visual_tab.columnconfigure(1, weight=1)
+        youtube_tab.columnconfigure(0, weight=1)
 
         ttk.Label(general_tab, text="Output override").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=4)
         ttk.Entry(general_tab, textvariable=output_var, width=56).grid(row=0, column=1, sticky="ew", pady=4)
@@ -2373,9 +2552,11 @@ class TekkenVodHelperApp(AppWindow):
         boilerplate_text = tk.Text(general_tab, width=56, height=5, wrap="word")
         self._style_text_widget(boilerplate_text)
         boilerplate_text.grid(row=9, column=1, columnspan=2, sticky="ew", pady=4)
-        boilerplate_text.insert("1.0", self.project_state.description_boilerplate)
+        boilerplate_text.insert("1.0", self._description_boilerplate())
 
         ttk.Checkbutton(general_tab, text="Re-encode for more exact cuts", variable=reencode_var).grid(row=10, column=1, sticky="w", pady=(6, 10))
+        ttk.Label(general_tab, text="Recovery backups").grid(row=11, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Button(general_tab, text="Clear Recovery Backups", command=self.clear_temporary_project_backups).grid(row=11, column=1, sticky="w", pady=4)
 
         ttk.Label(visual_tab, text="Overlay font").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=4)
         ttk.Combobox(
@@ -2393,6 +2574,15 @@ class TekkenVodHelperApp(AppWindow):
         ttk.Label(visual_tab, text="Plate opacity").grid(row=3, column=0, sticky="w", padx=(0, 8), pady=4)
         ttk.Spinbox(visual_tab, textvariable=overlay_opacity_var, from_=0, to=100, increment=5, width=8).grid(row=3, column=1, sticky="w", pady=4)
         ttk.Label(visual_tab, text="0-100%, defaults to 100.").grid(row=4, column=1, sticky="w", pady=(0, 8))
+
+        ttk.Label(
+            youtube_tab,
+            text="OAuth client credentials are stored in Windows Credential Manager.",
+            style="Muted.TLabel",
+            wraplength=520,
+            justify="left",
+        ).grid(row=0, column=0, sticky="w", pady=(0, 10))
+        ttk.Button(youtube_tab, text="Import OAuth JSON...", command=self.import_youtube_oauth_json).grid(row=1, column=0, sticky="w")
 
         buttons = ttk.Frame(body)
         buttons.grid(row=1, column=0, sticky="e", pady=(10, 0))
@@ -2429,6 +2619,7 @@ class TekkenVodHelperApp(AppWindow):
         if not self.project_state.characters:
             self.project_state.characters = self._load_default_characters()
         self.project_path = project_path
+        self.temporary_project_dismissed = False
         self._state_to_controls()
         self._refresh_combo_values()
         self._refresh_tree()
@@ -2462,7 +2653,7 @@ class TekkenVodHelperApp(AppWindow):
         except Exception as exc:
             self.show_copyable_error("Could not save project", exc)
             return
-        self._delete_temporary_project()
+        self._delete_temporary_project(include_dismissed=True)
         self.log("Saved project: {}".format(path))
 
     def _write_project_json(self, path: Path) -> None:
@@ -2475,6 +2666,12 @@ class TekkenVodHelperApp(AppWindow):
     def _temporary_project_path(self) -> Path:
         return Path(tempfile.gettempdir()) / TEMP_PROJECT_FILENAME
 
+    def _temporary_project_dismissed_path(self) -> Path:
+        return self._temporary_project_path().with_name(self._temporary_project_path().name + ".deleted")
+
+    def _youtube_thumbnail_cache_dir(self) -> Path:
+        return Path(tempfile.gettempdir()) / YOUTUBE_THUMBNAIL_DIRNAME
+
     def _schedule_temporary_project_save(self) -> None:
         if self.temporary_project_after_id is not None:
             try:
@@ -2486,10 +2683,12 @@ class TekkenVodHelperApp(AppWindow):
     def _save_temporary_project(self) -> None:
         self.temporary_project_after_id = None
         try:
+            if self.temporary_project_dismissed:
+                return
             self.apply_match_details(show_errors=False)
             self._sync_paths_to_state()
             if not self._project_needs_temporary_copy():
-                self._delete_temporary_project()
+                self._delete_temporary_project(include_dismissed=True)
                 return
             self._write_project_json(self.temporary_project_path)
         except Exception as exc:
@@ -2511,10 +2710,12 @@ class TekkenVodHelperApp(AppWindow):
                 pass
             self.temporary_project_after_id = None
         try:
+            if self.temporary_project_dismissed:
+                return
             self.apply_match_details(show_errors=False)
             self._sync_paths_to_state()
             if not self._project_needs_temporary_copy():
-                self._delete_temporary_project()
+                self._delete_temporary_project(include_dismissed=True)
                 return
             self._write_project_json(self.temporary_project_path)
         except Exception as exc:
@@ -2532,22 +2733,89 @@ class TekkenVodHelperApp(AppWindow):
         except Exception:
             return True
 
-    def _delete_temporary_project(self) -> None:
+    def _delete_temporary_project(self, include_dismissed: bool = False) -> None:
+        paths = [self.temporary_project_path]
+        if include_dismissed:
+            paths.append(self.temporary_project_dismissed_path)
+        for path in paths:
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                self.log("Could not remove recovery copy {}: {}".format(path, exc))
+        if include_dismissed:
+            self.temporary_project_dismissed = False
+
+    def _dismiss_temporary_project(self) -> None:
+        self.temporary_project_dismissed = True
         try:
-            self.temporary_project_path.unlink()
+            if self.temporary_project_dismissed_path.exists():
+                self.temporary_project_dismissed_path.unlink()
+            self.temporary_project_path.replace(self.temporary_project_dismissed_path)
         except FileNotFoundError:
             pass
         except OSError as exc:
-            self.log("Could not remove recovery copy: {}".format(exc))
+            self.log("Could not mark recovery copy deleted: {}".format(exc))
+
+    def clear_temporary_project_backups(self) -> None:
+        removed = 0
+        for path in (self.temporary_project_path, self.temporary_project_dismissed_path):
+            try:
+                path.unlink()
+                removed += 1
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                self.log("Could not remove recovery backup {}: {}".format(path, exc))
+        self.temporary_project_dismissed = False
+        message = "Cleared {} recovery backup{}.".format(removed, "" if removed == 1 else "s")
+        self.log(message)
+        messagebox.showinfo("Recovery backups", message)
 
     def _offer_temporary_project_recovery(self) -> None:
         if not self.temporary_project_path.exists():
             return
-        if messagebox.askyesno(
-            "Recover temporary project?",
-            "A temporary project recovery file was found. Load it now?",
-        ):
+        action = self._temporary_project_recovery_choice()
+        if action == "load":
             self.load_temporary_project()
+        elif action == "delete":
+            self._dismiss_temporary_project()
+            self.log("Marked recovery copy deleted: {}".format(self.temporary_project_dismissed_path))
+
+    def _temporary_project_recovery_choice(self) -> str:
+        result = {"action": "skip"}
+        dialog = tk.Toplevel(self)
+        dialog.title("Recover temporary project?")
+        dialog.transient(self)
+        dialog.grab_set()
+        dialog.resizable(False, False)
+
+        body = ttk.Frame(dialog, padding=12)
+        body.grid(row=0, column=0, sticky="nsew")
+        ttk.Label(
+            body,
+            text="A temporary project recovery file was found.",
+            font=("Segoe UI Semibold", 10),
+        ).grid(row=0, column=0, columnspan=3, sticky="w")
+        ttk.Label(
+            body,
+            text="Load it, delete it so this prompt stops appearing, or skip it for now.",
+            wraplength=420,
+            style="Muted.TLabel",
+        ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(6, 12))
+
+        def choose(action: str) -> None:
+            result["action"] = action
+            dialog.destroy()
+
+        ttk.Button(body, text="Load", command=lambda: choose("load")).grid(row=2, column=0, sticky="ew", padx=(0, 6))
+        ttk.Button(body, text="Delete", command=lambda: choose("delete")).grid(row=2, column=1, sticky="ew", padx=6)
+        ttk.Button(body, text="Skip", command=lambda: choose("skip")).grid(row=2, column=2, sticky="ew", padx=(6, 0))
+        dialog.bind("<Escape>", lambda _event: choose("skip"))
+        dialog.protocol("WM_DELETE_WINDOW", lambda: choose("skip"))
+        dialog.wait_window()
+        return result["action"]
 
     def on_scrub(self, value: str) -> None:
         try:
@@ -2975,6 +3243,7 @@ class TekkenVodHelperApp(AppWindow):
             for job in jobs:
                 folder = output_root / job.folder_name
                 folder.mkdir(parents=True, exist_ok=True)
+                Path(job.clip_path).parent.mkdir(parents=True, exist_ok=True)
                 self._thread_log("Exporting match {}.".format(job.index))
                 slice_clip(
                     self.project_state.video_path,
@@ -2986,6 +3255,7 @@ class TekkenVodHelperApp(AppWindow):
                     logger=self._thread_log,
                 )
                 self._write_export_artifacts(job)
+            self._write_youtube_manifest(jobs, output_root)
             self.log_queue.put(("done", "Export complete."))
         except Exception as exc:
             self.log_queue.put(("error", str(exc)))
@@ -2999,6 +3269,7 @@ class TekkenVodHelperApp(AppWindow):
                 folder.mkdir(parents=True, exist_ok=True)
                 self._thread_log("Generating metadata for match {}.".format(job.index))
                 self._write_export_artifacts(job)
+            self._write_youtube_manifest(jobs, output_root)
             self.log_queue.put(("done", "Metadata generation complete."))
         except Exception as exc:
             self.log_queue.put(("error", str(exc)))
@@ -3024,6 +3295,7 @@ class TekkenVodHelperApp(AppWindow):
         jobs: List[ExportJob] = []
         output_root = Path(output_dir)
         video_stem = safe_relative_name(self.project_state.video_path)
+        upload_root = output_root / YOUTUBE_UPLOAD_DIRNAME
 
         for index, match in enumerate(matches):
             end = self._resolve_match_end(matches, index)
@@ -3045,24 +3317,45 @@ class TekkenVodHelperApp(AppWindow):
 
             folder_name = slugify(label, "match_{:02d}".format(index + 1))
             folder = output_root / folder_name
-            clip_path = str(folder / "{}.mp4".format(video_stem))
+            upload_id = self._youtube_upload_id(match, index + 1, end)
+            upload_label = slugify(self._upload_title(match), "{}_{}".format(video_stem, folder_name))
+            clip_path = str(upload_root / "{}__{}.mp4".format(upload_id, upload_label))
 
             jobs.append(
                 ExportJob(
                     match=match,
                     index=index + 1,
+                    upload_id=upload_id,
                     start=match.start,
                     end=end,
                     folder_name=folder_name,
                     clip_path=clip_path,
                     thumbnail_path=str(folder / "thumbnail.jpg"),
                     metadata_path=str(folder / "match.json"),
+                    youtube_metadata_path=str(folder / "youtube.json"),
                     title_path=str(folder / "title.txt"),
                     description_path=str(folder / "description.txt"),
                 )
             )
 
         return jobs
+
+    def _youtube_upload_id(self, match: MatchSegment, index: int, end: float) -> str:
+        basis = "|".join(
+            [
+                self.project_state.event_name,
+                str(index),
+                "{:.3f}".format(match.start),
+                "{:.3f}".format(end),
+                match.player1,
+                match.player2,
+                match.character1,
+                match.character2,
+                match.round_name,
+            ]
+        )
+        digest = hashlib.sha1(basis.encode("utf-8")).hexdigest()[:6]
+        return "tvh-{:03d}-{}".format(index, digest)
 
     def _resolve_match_end(self, matches: List[MatchSegment], index: int) -> Optional[float]:
         match = matches[index]
@@ -3083,10 +3376,13 @@ class TekkenVodHelperApp(AppWindow):
                 "end": job.end,
                 "end_timestamp": seconds_to_timestamp(job.end),
                 "duration": job.end - job.start,
+                "upload_id": job.upload_id,
                 "clip": Path(job.clip_path).name,
+                "clip_path": job.clip_path,
                 "thumbnail": Path(job.thumbnail_path).name,
                 "title_file": Path(job.title_path).name,
                 "description_file": Path(job.description_path).name,
+                "youtube_metadata_file": Path(job.youtube_metadata_path).name,
                 "event_name": self.project_state.event_name,
             }
         )
@@ -3099,7 +3395,945 @@ class TekkenVodHelperApp(AppWindow):
         description = self._upload_description(job)
         Path(job.title_path).write_text(title + "\n", encoding="utf-8")
         Path(job.description_path).write_text(description + "\n", encoding="utf-8")
+        self._write_youtube_metadata(job, title, description)
         self._thread_log("Upload text written: {}, {}".format(job.title_path, job.description_path))
+
+    def _write_youtube_metadata(self, job: ExportJob, title: str, description: str) -> None:
+        payload = self._youtube_metadata_payload(job, title, description)
+        Path(job.youtube_metadata_path).write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+    def _youtube_metadata_payload(self, job: ExportJob, title: str, description: str) -> Dict[str, object]:
+        return {
+            "upload_id": job.upload_id,
+            "video_file": Path(job.clip_path).name,
+            "video_path": job.clip_path,
+            "match_folder": job.folder_name,
+            "title": title,
+            "description": description,
+            "thumbnail_path": job.thumbnail_path,
+            "event_name": self.project_state.event_name,
+            "match_index": job.index,
+            "start": job.start,
+            "end": job.end,
+            "start_timestamp": seconds_to_timestamp(job.start),
+            "end_timestamp": seconds_to_timestamp(job.end),
+            "tags": ["KW Tekken", "Tekken", "Tekken 8"],
+            "privacy_status": "private",
+            "self_declared_made_for_kids": False,
+        }
+
+    def _write_youtube_manifest(self, jobs: List[ExportJob], output_root: Path) -> None:
+        upload_root = output_root / YOUTUBE_UPLOAD_DIRNAME
+        upload_root.mkdir(parents=True, exist_ok=True)
+        entries = []
+        for job in jobs:
+            entries.append(
+                {
+                    "upload_id": job.upload_id,
+                    "video_file": Path(job.clip_path).name,
+                    "video_path": job.clip_path,
+                    "metadata_path": job.youtube_metadata_path,
+                    "thumbnail_path": job.thumbnail_path,
+                    "title_path": job.title_path,
+                    "description_path": job.description_path,
+                    "match_folder": job.folder_name,
+                }
+            )
+        payload = {
+            "version": 1,
+            "upload_directory": str(upload_root),
+            "entries": entries,
+        }
+        manifest_path = upload_root / YOUTUBE_MANIFEST_FILENAME
+        manifest_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        self._thread_log("YouTube upload manifest written: {}".format(manifest_path))
+
+    def load_upload_queue(self) -> None:
+        try:
+            entries = self._read_upload_queue_entries()
+        except Exception as exc:
+            self.show_copyable_error("Could not load upload queue", exc)
+            return
+        self._set_upload_metadata_entries(entries)
+        self._refresh_upload_review_tree()
+
+    def import_youtube_oauth_json(self) -> None:
+        path = filedialog.askopenfilename(
+            title="Choose Google OAuth client JSON",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+            section = payload.get("installed") or payload.get("web") or payload
+            client_id = str(section.get("client_id", "") or "").strip()
+            client_secret = str(section.get("client_secret", "") or "").strip()
+            if not client_id or not client_secret:
+                raise ValueError("OAuth JSON did not contain client_id and client_secret.")
+            write_youtube_client_credentials(client_id, client_secret)
+        except Exception as exc:
+            self.show_copyable_error("Could not import OAuth JSON", exc)
+            return
+        self.upload_manager_status_var.set("Imported YouTube OAuth client credentials.")
+        self.log("Imported YouTube OAuth client credentials into Windows Credential Manager.")
+
+    def choose_upload_metadata_folder(self) -> None:
+        path = filedialog.askdirectory(title="Choose export folder or _youtube_uploads folder")
+        if not path:
+            return
+        try:
+            entries = self._read_upload_queue_entries(Path(path))
+        except Exception as exc:
+            self.show_copyable_error("Could not load metadata folder", exc)
+            return
+        self._set_upload_metadata_entries(entries)
+        self._refresh_upload_review_tree()
+        self.log("Loaded upload metadata from {}.".format(path))
+
+    def refresh_upload_queue_metadata(self) -> None:
+        self.apply_match_details(show_errors=False)
+        jobs = self._build_export_jobs(self._resolved_output_dir())
+        output_root = Path(self._resolved_output_dir())
+        for job in jobs:
+            folder = output_root / job.folder_name
+            folder.mkdir(parents=True, exist_ok=True)
+            title = self._upload_title(job.match)
+            description = self._upload_description(job)
+            self._write_youtube_metadata(job, title, description)
+            Path(job.title_path).write_text(title + "\n", encoding="utf-8")
+            Path(job.description_path).write_text(description + "\n", encoding="utf-8")
+        self._write_youtube_manifest(jobs, output_root)
+        self.load_upload_queue()
+
+    def load_youtube_videos_readonly(self) -> None:
+        if self.loading_youtube_videos:
+            return
+        self.loading_youtube_videos = True
+        self._set_load_youtube_videos_state("disabled")
+        self.upload_manager_status_var.set("Loading YouTube videos...")
+        thread = threading.Thread(target=self._youtube_videos_worker, daemon=True)
+        thread.start()
+
+    def _set_load_youtube_videos_state(self, state: str) -> None:
+        if hasattr(self, "load_youtube_videos_button"):
+            self.load_youtube_videos_button.configure(state=state)
+
+    def _youtube_videos_worker(self) -> None:
+        try:
+            videos = youtube_client.list_channel_videos(max_results=UPLOAD_MANAGER_YOUTUBE_PAGE_SIZE)
+        except Exception as exc:
+            self.log_queue.put(("youtube_error", str(exc)))
+            return
+        rows = self._prepare_youtube_rows_for_display(youtube_client.videos_as_rows(videos))
+        self.log_queue.put(("youtube_videos", rows))
+
+    def _prepare_youtube_rows_for_display(self, rows: List[Dict[str, object]]) -> List[Dict[str, object]]:
+        prepared = []
+        for row in rows:
+            row_copy = dict(row)
+            local_thumbnail = self._download_youtube_thumbnail(row_copy)
+            if local_thumbnail:
+                row_copy["local_thumbnail_path"] = local_thumbnail
+            prepared.append(row_copy)
+        return prepared
+
+    def _download_youtube_thumbnail(self, row: Dict[str, object]) -> str:
+        video_id = str(row.get("video_id", "") or "").strip()
+        url = str(row.get("thumbnail_url", "") or "").strip()
+        if not video_id or not url:
+            return ""
+        safe_video_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", video_id)
+        path = self.youtube_thumbnail_cache_dir / "{}.jpg".format(safe_video_id)
+        if path.exists():
+            return str(path)
+        try:
+            self.youtube_thumbnail_cache_dir.mkdir(parents=True, exist_ok=True)
+            with urllib.request.urlopen(url, timeout=5) as response:
+                data = response.read()
+            if not data:
+                return ""
+            temporary_path = path.with_name(path.name + ".tmp")
+            temporary_path.write_bytes(data)
+            temporary_path.replace(path)
+            return str(path)
+        except Exception:
+            return ""
+
+    def _read_upload_queue_entries(self, selected_path: Optional[Path] = None) -> List[Dict[str, object]]:
+        manifest_path = self._upload_manifest_path(selected_path)
+        with manifest_path.open("r", encoding="utf-8") as handle:
+            manifest = json.load(handle)
+        entries = manifest.get("entries", [])
+        if not isinstance(entries, list):
+            return []
+        result = []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            metadata_path = Path(str(entry.get("metadata_path", "") or ""))
+            metadata = {}
+            if metadata_path.exists():
+                try:
+                    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+                except json.JSONDecodeError:
+                    metadata = {}
+            result.append({**entry, "metadata": metadata})
+        return result
+
+    def _upload_manifest_path(self, selected_path: Optional[Path] = None) -> Path:
+        if selected_path is None:
+            return Path(self._resolved_output_dir()) / YOUTUBE_UPLOAD_DIRNAME / YOUTUBE_MANIFEST_FILENAME
+        selected_path = Path(selected_path)
+        candidates = [
+            selected_path / YOUTUBE_MANIFEST_FILENAME,
+            selected_path / YOUTUBE_UPLOAD_DIRNAME / YOUTUBE_MANIFEST_FILENAME,
+        ]
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate
+        return candidates[0]
+
+    def _set_upload_metadata_entries(self, entries: List[Dict[str, object]]) -> None:
+        metadata_by_id: Dict[str, Dict[str, object]] = {}
+        for entry in entries:
+            metadata = entry.get("metadata", {})
+            if not isinstance(metadata, dict):
+                metadata = {}
+            upload_id = str(metadata.get("upload_id") or entry.get("upload_id") or "").strip()
+            if upload_id:
+                metadata_by_id[upload_id] = {**entry, "metadata": metadata}
+        self.upload_metadata_by_id = metadata_by_id
+
+    def _refresh_upload_tree(self, entries: List[Dict[str, object]]) -> None:
+        if not hasattr(self, "upload_tree"):
+            return
+        for item in self.upload_tree.get_children():
+            self.upload_tree.delete(item)
+        pending = 0
+        for index, entry in enumerate(entries):
+            metadata = entry.get("metadata", {})
+            if not isinstance(metadata, dict):
+                metadata = {}
+            status = "Updated" if metadata.get("youtube_video_id") and metadata.get("metadata_updated_at") else "Pending metadata"
+            if status != "Updated":
+                pending += 1
+            self.upload_tree.insert(
+                "",
+                "end",
+                iid=str(index),
+                values=(
+                    status,
+                    str(entry.get("upload_id", "") or ""),
+                    str(entry.get("video_file", "") or ""),
+                    str(metadata.get("title", "") or ""),
+                ),
+            )
+        if entries:
+            self.upload_manager_status_var.set("{} queued, {} pending metadata.".format(len(entries), pending))
+        else:
+            self.upload_manager_status_var.set("No queued uploads found. Export clips first.")
+
+    def _refresh_youtube_video_tree(self, rows: List[Dict[str, str]]) -> None:
+        self.upload_youtube_rows = [dict(row) for row in rows]
+        self._refresh_upload_review_tree()
+
+    def _refresh_upload_review_tree(self) -> None:
+        if not hasattr(self, "upload_tree"):
+            return
+        for item in self.upload_tree.get_children():
+            self.upload_tree.delete(item)
+        rows = self._upload_review_rows()
+        self.upload_review_rows = rows
+        self.upload_selected_review_index = None
+        for index, row in enumerate(rows):
+            image = self._upload_row_thumbnail(row)
+            self.upload_tree.insert(
+                "",
+                "end",
+                iid=str(index),
+                text="",
+                image=image,
+                values=self._upload_review_tree_values(row),
+            )
+        pending = sum(1 for row in rows if row.get("metadata") and row.get("youtube"))
+        unmatched = sum(1 for row in rows if row.get("metadata") and not row.get("youtube"))
+        self.upload_manager_status_var.set(
+            "{} YouTube videos, {} metadata matches, {} local unmatched.".format(
+                len(self.upload_youtube_rows),
+                pending,
+                unmatched,
+            )
+        )
+        self._refresh_upload_pending_summary()
+
+    def _upload_review_rows(self) -> List[Dict[str, object]]:
+        rows = []
+        matched_ids = set()
+        for youtube_row in self.upload_youtube_rows:
+            upload_id = self._extract_upload_id(str(youtube_row.get("title", "") or ""))
+            metadata_entry = self.upload_metadata_by_id.get(upload_id) if upload_id else None
+            if upload_id and metadata_entry:
+                matched_ids.add(upload_id)
+            metadata = metadata_entry.get("metadata", {}) if metadata_entry else {}
+            if not isinstance(metadata, dict):
+                metadata = {}
+            rows.append(
+                {
+                    "status": self._youtube_review_status(youtube_row, metadata_entry),
+                    "youtube_id": youtube_row.get("video_id", ""),
+                    "upload_id": upload_id,
+                    "current_title": youtube_row.get("title", ""),
+                    "proposed_title": metadata.get("title", "") if metadata else "",
+                    "youtube": youtube_row,
+                    "metadata_entry": metadata_entry,
+                    "metadata": metadata,
+                }
+            )
+        for upload_id, metadata_entry in self.upload_metadata_by_id.items():
+            if upload_id in matched_ids:
+                continue
+            metadata = metadata_entry.get("metadata", {})
+            if not isinstance(metadata, dict):
+                metadata = {}
+            rows.append(
+                {
+                    "status": "Local metadata only",
+                    "youtube_id": "",
+                    "upload_id": upload_id,
+                    "current_title": "",
+                    "proposed_title": metadata.get("title", ""),
+                    "youtube": None,
+                    "metadata_entry": metadata_entry,
+                    "metadata": metadata,
+                }
+            )
+        return rows
+
+    def _upload_review_tree_values(self, row: Dict[str, object]) -> Tuple[str, str, str, str, str]:
+        has_metadata = bool(row.get("metadata"))
+        saved_changes = bool(row.get("saved_changes"))
+        editor_dirty = bool(row.get("editor_dirty"))
+        edited = bool(row.get("edited"))
+        if editor_dirty:
+            changes = "Unsaved"
+        elif saved_changes:
+            changes = "Saved"
+        elif edited:
+            changes = "Edited"
+        elif has_metadata:
+            changes = "Loaded"
+        elif row.get("youtube"):
+            changes = "Live"
+        else:
+            changes = ""
+        return (
+            changes,
+            str(row.get("status", "") or ""),
+            str(row.get("youtube_id", "") or ""),
+            str(row.get("upload_id", "") or ""),
+            str(row.get("current_title", "") or ""),
+        )
+
+    def _update_upload_review_tree_row(self, index: int) -> None:
+        if not hasattr(self, "upload_tree") or index < 0 or index >= len(self.upload_review_rows):
+            return
+        row = self.upload_review_rows[index]
+        image = self._upload_row_thumbnail(row)
+        try:
+            self.upload_tree.item(str(index), image=image, values=self._upload_review_tree_values(row))
+        except tk.TclError:
+            pass
+
+    def _youtube_review_status(self, youtube_row: Dict[str, object], metadata_entry: Optional[Dict[str, object]]) -> str:
+        base = "{}/{}/{}".format(
+            youtube_row.get("privacy_status", "") or "unknown",
+            youtube_row.get("upload_status", "") or "unknown",
+            youtube_row.get("processing_status", "") or "unknown",
+        )
+        return "{} + matched".format(base) if metadata_entry else base
+
+    def _extract_upload_id(self, text: str) -> str:
+        match = YOUTUBE_UPLOAD_ID_PATTERN.search(text)
+        return match.group(0).lower() if match else ""
+
+    def _upload_row_thumbnail(self, row: Dict[str, object]):
+        key_source = str(row.get("youtube_id") or row.get("upload_id") or "")
+        if not key_source:
+            return ""
+        key = "row:{}".format(key_source)
+        cached = self.upload_thumbnail_cache.get(key)
+        if cached is not None:
+            return cached
+        path = ""
+        metadata = row.get("draft_metadata", {}) or row.get("metadata", {})
+        if isinstance(metadata, dict):
+            path = str(metadata.get("thumbnail_path", "") or "")
+        image = self._thumbnail_photo_from_path(path)
+        if image is None:
+            youtube_row = row.get("youtube", {})
+            if isinstance(youtube_row, dict):
+                image = self._thumbnail_photo_from_path(str(youtube_row.get("local_thumbnail_path", "") or ""))
+        self.upload_thumbnail_cache[key] = image or ""
+        return self.upload_thumbnail_cache[key]
+
+    def _thumbnail_photo_from_path(self, path: str, size=(88, 50)):
+        if not path or Image is None or ImageTk is None:
+            return None
+        try:
+            image = Image.open(path).convert("RGB")
+            image.thumbnail(size)
+            return ImageTk.PhotoImage(image)
+        except Exception:
+            return None
+
+    def on_upload_selection_changed(self, _event=None) -> None:
+        selection = self.upload_tree.selection()
+        if not selection:
+            return
+        try:
+            index = int(selection[0])
+        except ValueError:
+            return
+        if index >= len(self.upload_review_rows):
+            return
+        self.upload_selected_review_index = index
+        self._load_upload_review_details(self.upload_review_rows[index])
+
+    def _load_upload_review_details(self, row: Dict[str, object]) -> None:
+        self._set_upload_metadata_editor(self._upload_editor_metadata_for_row(row))
+        self._set_upload_detail_preview(row)
+        self._set_upload_editor_save_state(row)
+
+    def _set_upload_editor_save_state(self, row: Optional[Dict[str, object]] = None) -> None:
+        if not hasattr(self, "upload_editor_save_state_var"):
+            return
+        if row is None:
+            self.upload_editor_save_state_var.set("Select a video to edit.")
+        elif row.get("editor_dirty"):
+            self.upload_editor_save_state_var.set("Unsaved changes for this entry - click Save Changes Locally.")
+        elif row.get("saved_changes"):
+            self.upload_editor_save_state_var.set("Saved locally - ready to submit.")
+        elif row.get("metadata"):
+            self.upload_editor_save_state_var.set("Loaded metadata - save locally before submitting.")
+        elif row.get("youtube"):
+            self.upload_editor_save_state_var.set("No local changes saved for this entry.")
+        else:
+            self.upload_editor_save_state_var.set("No YouTube video matched.")
+
+    def _upload_editor_metadata_for_row(self, row: Dict[str, object]) -> Dict[str, object]:
+        draft_metadata = row.get("draft_metadata", {})
+        if isinstance(draft_metadata, dict) and draft_metadata:
+            return dict(draft_metadata)
+        metadata = row.get("metadata", {})
+        if isinstance(metadata, dict) and metadata:
+            return dict(metadata)
+        youtube_row = row.get("youtube", {})
+        if isinstance(youtube_row, dict) and youtube_row:
+            tags = youtube_row.get("tags", [])
+            return {
+                "title": str(youtube_row.get("title", "") or ""),
+                "description": str(youtube_row.get("description", "") or ""),
+                "tags": tags if isinstance(tags, list) else [],
+                "thumbnail_path": str(youtube_row.get("local_thumbnail_path", "") or ""),
+                "privacy_status": str(youtube_row.get("privacy_status", "") or "private"),
+                "self_declared_made_for_kids": False,
+            }
+        return {}
+
+    def _set_upload_text(self, widget: tk.Text, text: str) -> None:
+        widget.configure(state="normal")
+        widget.delete("1.0", "end")
+        widget.insert("1.0", text)
+        widget.configure(state="disabled")
+
+    def _set_upload_metadata_editor(self, metadata) -> None:
+        if not hasattr(self, "upload_proposed_title_var"):
+            return
+        if not isinstance(metadata, dict):
+            metadata = {}
+        self.upload_editor_loading = True
+        tags = metadata.get("tags", [])
+        tag_text = ", ".join(str(tag) for tag in tags) if isinstance(tags, list) else str(tags or "")
+        self.upload_proposed_title_var.set(str(metadata.get("title", "") or ""))
+        self.upload_proposed_tags_var.set(tag_text)
+        self.upload_proposed_thumbnail_var.set(str(metadata.get("thumbnail_path", "") or ""))
+        privacy_status = str(metadata.get("privacy_status", "") or "private")
+        self.upload_proposed_privacy_var.set(privacy_status if privacy_status in ("private", "unlisted", "public") else "private")
+        self.upload_proposed_description_text.configure(state="normal")
+        self.upload_proposed_description_text.delete("1.0", "end")
+        self.upload_proposed_description_text.insert("1.0", str(metadata.get("description", "") or ""))
+        self.upload_editor_baseline = self._proposed_metadata_from_editor(metadata)
+        self.upload_editor_loading = False
+        self.upload_editor_dirty = False
+        self._update_upload_editor_dirty_state()
+
+    def _update_upload_editor_dirty_state(self) -> None:
+        if not hasattr(self, "upload_proposed_title_count_var"):
+            return
+        current = self._proposed_metadata_from_editor(self.upload_editor_baseline)
+        baseline = self.upload_editor_baseline or {}
+        title_length = len(str(current.get("title", "") or ""))
+        marker = " *"
+        self.upload_proposed_title_count_var.set("{}/100".format(title_length))
+        self.upload_title_label_var.set("Title{}".format(marker if current.get("title") != baseline.get("title") else ""))
+        self.upload_tags_label_var.set("Tags{}".format(marker if current.get("tags") != baseline.get("tags") else ""))
+        self.upload_privacy_label_var.set("Visibility{}".format(marker if current.get("privacy_status") != baseline.get("privacy_status") else ""))
+        self.upload_thumbnail_label_var.set("Thumbnail{}".format(marker if current.get("thumbnail_path") != baseline.get("thumbnail_path") else ""))
+        self.upload_description_label_var.set("Description{}".format(marker if current.get("description") != baseline.get("description") else ""))
+        dirty = any(
+            current.get(key) != baseline.get(key)
+            for key in ("title", "description", "tags", "thumbnail_path", "privacy_status")
+        )
+        self.upload_editor_dirty = dirty
+        if self.upload_selected_review_index is not None and not self.upload_editor_loading:
+            row = self.upload_review_rows[self.upload_selected_review_index]
+            row["editor_dirty"] = dirty
+            if dirty:
+                row["draft_metadata"] = current
+                row["proposed_title"] = current.get("title", "")
+            else:
+                row.pop("draft_metadata", None)
+                metadata = row.get("metadata", {})
+                if isinstance(metadata, dict):
+                    row["proposed_title"] = metadata.get("title", "")
+            self._update_upload_review_tree_row(self.upload_selected_review_index)
+            self._set_upload_editor_save_state(row)
+
+    def _proposed_metadata_from_editor(self, fallback: Optional[Dict[str, object]] = None) -> Dict[str, object]:
+        metadata = dict(fallback or {})
+        if not hasattr(self, "upload_proposed_title_var"):
+            return metadata
+        tags = [tag.strip() for tag in self.upload_proposed_tags_var.get().split(",") if tag.strip()]
+        metadata.update(
+            {
+                "title": self.upload_proposed_title_var.get().strip(),
+                "description": self.upload_proposed_description_text.get("1.0", "end").strip(),
+                "tags": tags,
+                "thumbnail_path": self.upload_proposed_thumbnail_var.get().strip(),
+                "privacy_status": self.upload_proposed_privacy_var.get() or "private",
+                "self_declared_made_for_kids": False,
+            }
+        )
+        return metadata
+
+    def choose_upload_thumbnail(self) -> None:
+        if not hasattr(self, "upload_proposed_thumbnail_var"):
+            return
+        path = filedialog.askopenfilename(
+            title="Choose thumbnail",
+            filetypes=[("Images", "*.png *.jpg *.jpeg *.webp"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        self.upload_proposed_thumbnail_var.set(path)
+        self._update_upload_editor_dirty_state()
+        selection = self.upload_tree.selection() if hasattr(self, "upload_tree") else ()
+        row = None
+        if selection:
+            try:
+                index = int(selection[0])
+                if index < len(self.upload_review_rows):
+                    row = self.upload_review_rows[index]
+            except ValueError:
+                row = None
+        if row is None:
+            row = {"draft_metadata": self._proposed_metadata_from_editor({})}
+        else:
+            row["draft_metadata"] = self._proposed_metadata_from_editor(row.get("metadata", {}) if isinstance(row.get("metadata", {}), dict) else {})
+        self.upload_thumbnail_cache.pop("detail:{}".format(row.get("youtube_id") or row.get("upload_id") or ""), None)
+        self._set_upload_detail_preview(row)
+
+    def _sync_upload_metadata_from_editor_by_index(self, index: int) -> Optional[Dict[str, object]]:
+        if index < 0 or index >= len(self.upload_review_rows):
+            return None
+        row = self.upload_review_rows[index]
+        if self.upload_selected_review_index != index:
+            return None
+        fallback = row.get("metadata", {})
+        if not isinstance(fallback, dict):
+            fallback = {}
+        if not fallback:
+            fallback = self.upload_editor_baseline or {}
+        metadata = self._proposed_metadata_from_editor(fallback)
+        baseline = self.upload_editor_baseline or {}
+        edited = any(
+            metadata.get(key) != baseline.get(key)
+            for key in ("title", "description", "tags", "thumbnail_path", "privacy_status")
+        )
+        upload_id = str(metadata.get("upload_id") or row.get("upload_id") or "").strip()
+        if upload_id:
+            metadata["upload_id"] = upload_id
+        row["metadata"] = metadata
+        row["edited"] = edited
+        row["editor_dirty"] = False
+        row["saved_changes"] = True
+        row.pop("draft_metadata", None)
+        row["proposed_title"] = metadata.get("title", "")
+        metadata_entry = row.get("metadata_entry")
+        if isinstance(metadata_entry, dict):
+            metadata_entry["metadata"] = metadata
+        if upload_id and isinstance(metadata_entry, dict):
+            self.upload_metadata_by_id[upload_id] = metadata_entry
+        self.upload_editor_baseline = dict(metadata)
+        self.upload_editor_dirty = False
+        self._set_upload_editor_save_state(row)
+        return row
+
+    def _sync_selected_upload_metadata_from_editor(self) -> Optional[Dict[str, object]]:
+        selection = self.upload_tree.selection()
+        if not selection:
+            return None
+        try:
+            index = int(selection[0])
+        except ValueError:
+            return None
+        return self._sync_upload_metadata_from_editor_by_index(index)
+
+    def save_selected_upload_changes_locally(self) -> None:
+        row = self._sync_selected_upload_metadata_from_editor()
+        if row is None:
+            messagebox.showinfo("Select a video", "Select a YouTube video first.")
+            return
+        if not row.get("youtube"):
+            messagebox.showinfo("No YouTube video", "This local metadata row is not matched to a YouTube video yet.")
+            return
+        self._update_upload_review_tree_row(self.upload_selected_review_index or 0)
+        self._refresh_upload_pending_summary()
+        self.log("Saved local YouTube changes for {}.".format(row.get("current_title") or row.get("youtube_id") or "selected video"))
+
+    def revert_selected_upload_changes_to_live(self) -> None:
+        selection = self.upload_tree.selection()
+        if not selection:
+            messagebox.showinfo("Select a video", "Select a YouTube video first.")
+            return
+        try:
+            index = int(selection[0])
+        except ValueError:
+            return
+        if index < 0 or index >= len(self.upload_review_rows):
+            return
+        row = self.upload_review_rows[index]
+        if not row.get("youtube"):
+            messagebox.showinfo("No YouTube video", "This entry is not matched to a YouTube video.")
+            return
+        upload_id = str(row.get("upload_id", "") or "")
+        row["metadata"] = {}
+        row["proposed_title"] = ""
+        row["edited"] = False
+        row["editor_dirty"] = False
+        row["saved_changes"] = False
+        row.pop("draft_metadata", None)
+        metadata_entry = row.get("metadata_entry")
+        if isinstance(metadata_entry, dict):
+            metadata_entry["metadata"] = {}
+        if upload_id:
+            self.upload_metadata_by_id.pop(upload_id, None)
+        self.upload_selected_review_index = index
+        self._set_upload_metadata_editor(self._upload_editor_metadata_for_row(row))
+        self._set_upload_detail_preview(row)
+        self._set_upload_editor_save_state(row)
+        self.upload_thumbnail_cache.pop("row:{}".format(row.get("youtube_id") or row.get("upload_id") or ""), None)
+        self.upload_thumbnail_cache.pop("detail:{}".format(row.get("youtube_id") or row.get("upload_id") or ""), None)
+        self._update_upload_review_tree_row(index)
+        self._refresh_upload_pending_summary()
+        self.log("Reverted local changes for {}.".format(row.get("current_title") or row.get("youtube_id") or "selected video"))
+
+    def _saved_upload_change_rows(self) -> List[Dict[str, object]]:
+        return [
+            row
+            for row in self.upload_review_rows
+            if row.get("saved_changes") and row.get("youtube") and row.get("metadata")
+        ]
+
+    def _refresh_upload_pending_summary(self) -> None:
+        if not hasattr(self, "upload_pending_summary_var"):
+            return
+        rows = self._saved_upload_change_rows()
+        if not rows:
+            summary = "No locally saved YouTube changes."
+            details = ""
+        else:
+            summary = "{} video{} saved locally for YouTube submit.".format(len(rows), "" if len(rows) == 1 else "s")
+            details = "\n\n".join(self._upload_change_detail_text(row) for row in rows)
+        self.upload_pending_summary_var.set(summary)
+        if hasattr(self, "upload_summary_details_text"):
+            self.upload_summary_details_text.configure(state="normal")
+            self.upload_summary_details_text.delete("1.0", "end")
+            self.upload_summary_details_text.insert("1.0", details or "No saved changes.")
+            self.upload_summary_details_text.configure(state="disabled")
+
+    def toggle_upload_summary_details(self) -> None:
+        if not hasattr(self, "upload_summary_details_text"):
+            return
+        self.upload_summary_details_visible = not self.upload_summary_details_visible
+        if self.upload_summary_details_visible:
+            self.upload_summary_details_text.grid()
+        else:
+            self.upload_summary_details_text.grid_remove()
+
+    def submit_all_saved_upload_changes(self) -> None:
+        if self.submitting_youtube_changes:
+            return
+        rows = self._saved_upload_change_rows()
+        if not rows:
+            messagebox.showinfo("No saved changes", "Save changes locally before submitting to YouTube.")
+            return
+        self._confirm_and_submit_upload_payloads(rows)
+
+    def _confirm_and_submit_upload_payloads(self, rows: List[Dict[str, object]]) -> None:
+        details = "\n\n".join(self._upload_change_detail_text(row) for row in rows)
+        if not messagebox.askyesno(
+            "Submit changes to YouTube?",
+            "This will submit metadata changes to YouTube and cannot be undone automatically.\n\nVideos:\n{}".format(details),
+        ):
+            return
+        self.log("YouTube submit confirmed for {} video{}: {}".format(
+            len(rows),
+            "" if len(rows) == 1 else "s",
+            "; ".join(str(row.get("proposed_title", "") or row.get("current_title", "") or row.get("youtube_id", "")) for row in rows),
+        ))
+        payloads = [self._youtube_upload_payload(row) for row in rows]
+        self.submitting_youtube_changes = True
+        self._set_submit_youtube_changes_state("disabled")
+        self.upload_manager_status_var.set("Submitting {} YouTube metadata update{}...".format(len(rows), "" if len(rows) == 1 else "s"))
+        thread = threading.Thread(target=self._submit_youtube_changes_worker, args=(payloads,), daemon=True)
+        thread.start()
+
+    def _submit_youtube_changes_worker(self, payloads: List[Dict[str, object]]) -> None:
+        results = []
+        try:
+            for payload in payloads:
+                update = payload.get("update", {})
+                if not isinstance(update, dict):
+                    update = {}
+                video_id = str(payload.get("video_id", "") or "")
+                if not video_id:
+                    raise youtube_client.YouTubeApiError("Cannot submit a YouTube update without a video ID.")
+                response = youtube_client.update_video_metadata(
+                    video_id=video_id,
+                    title=str(update.get("title", "") or ""),
+                    description=str(update.get("description", "") or ""),
+                    tags=[str(tag) for tag in update.get("tags", [])] if isinstance(update.get("tags"), list) else [],
+                    privacy_status=str(update.get("privacy_status", "") or "private"),
+                    self_declared_made_for_kids=bool(update.get("self_declared_made_for_kids", False)),
+                    thumbnail_path=str(update.get("thumbnail_path", "") or ""),
+                )
+                results.append(
+                    {
+                        "video_id": payload.get("video_id", ""),
+                        "upload_id": payload.get("upload_id", ""),
+                        "title": update.get("title", ""),
+                        "privacy_status": update.get("privacy_status", "private"),
+                        "response": response,
+                        "applied_update": update,
+                    }
+                )
+            self.log_queue.put(("youtube_submit_done", results))
+        except Exception as exc:
+            error_payload = {"error": str(exc), "submitted_payloads": payloads, "completed_results": results}
+            self.log_queue.put(("youtube_submit_error", json.dumps(error_payload, indent=2)))
+
+    def _upload_change_detail_text(self, row: Dict[str, object]) -> str:
+        youtube_row = row.get("youtube", {})
+        metadata = row.get("metadata", {})
+        if not isinstance(youtube_row, dict):
+            youtube_row = {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        header = "{} ({})".format(
+            row.get("current_title", "") or metadata.get("title", "") or "Untitled video",
+            row.get("youtube_id", "") or "no YouTube id",
+        )
+        fields = []
+        comparisons = [
+            ("Title", youtube_row.get("title", ""), metadata.get("title", "")),
+            ("Description", youtube_row.get("description", ""), metadata.get("description", "")),
+            ("Tags", ", ".join(str(tag) for tag in youtube_row.get("tags", []) if str(tag).strip()) if isinstance(youtube_row.get("tags"), list) else "", ", ".join(str(tag) for tag in metadata.get("tags", []) if str(tag).strip()) if isinstance(metadata.get("tags"), list) else ""),
+            ("Visibility", youtube_row.get("privacy_status", ""), metadata.get("privacy_status", "")),
+            ("Thumbnail", "", metadata.get("thumbnail_path", "")),
+            ("Made for kids", "", "No" if metadata.get("self_declared_made_for_kids") is False else str(metadata.get("self_declared_made_for_kids", ""))),
+        ]
+        for label, before, after in comparisons:
+            before_text = str(before or "").strip()
+            after_text = str(after or "").strip()
+            if label == "Description":
+                before_text = "{} chars".format(len(before_text)) if before_text else "empty"
+                after_text = "{} chars".format(len(after_text)) if after_text else "empty"
+            if before_text != after_text or label in ("Thumbnail", "Made for kids"):
+                if before_text:
+                    fields.append("  {}: {} -> {}".format(label, before_text, after_text or "empty"))
+                else:
+                    fields.append("  {}: {}".format(label, after_text or "empty"))
+        return "\n".join([header] + fields)
+
+    def _set_upload_detail_preview(self, row: Dict[str, object]) -> None:
+        image = self._upload_detail_thumbnail(row)
+        if image is not None:
+            self.upload_detail_thumbnail.configure(image=image, text="")
+            self.upload_detail_thumbnail.image = image
+        else:
+            self.upload_detail_thumbnail.configure(image="", text="No thumbnail")
+            self.upload_detail_thumbnail.image = None
+        status_lines = [
+            "Status: {}".format(row.get("status", "") or "Unknown"),
+            "YouTube ID: {}".format(row.get("youtube_id", "") or "Not matched"),
+            "Upload ID: {}".format(row.get("upload_id", "") or "Not found"),
+        ]
+        self.upload_detail_status_var.set("\n".join(status_lines))
+
+    def _upload_detail_thumbnail(self, row: Dict[str, object]):
+        key_source = str(row.get("youtube_id") or row.get("upload_id") or "")
+        key = "detail:{}".format(key_source)
+        if key in self.upload_thumbnail_cache:
+            return self.upload_thumbnail_cache[key] or None
+        metadata = row.get("draft_metadata", {}) or row.get("metadata", {})
+        if isinstance(metadata, dict):
+            image = self._thumbnail_photo_from_path(str(metadata.get("thumbnail_path", "") or ""), size=(320, 180))
+            if image is not None:
+                self.upload_thumbnail_cache[key] = image
+                return image
+        youtube_row = row.get("youtube", {})
+        if isinstance(youtube_row, dict):
+            image = self._thumbnail_photo_from_path(str(youtube_row.get("local_thumbnail_path", "") or ""), size=(320, 180))
+            if image is not None:
+                self.upload_thumbnail_cache[key] = image
+                return image
+        self.upload_thumbnail_cache[key] = ""
+        return None
+
+    def _current_youtube_metadata_text(self, youtube_row) -> str:
+        if not isinstance(youtube_row, dict):
+            return "No YouTube video matched yet."
+        return "\n".join(
+            [
+                "Video ID: {}".format(youtube_row.get("video_id", "")),
+                "Status: {}/{}/{}".format(
+                    youtube_row.get("privacy_status", ""),
+                    youtube_row.get("upload_status", ""),
+                    youtube_row.get("processing_status", ""),
+                ),
+                "Title: {}".format(youtube_row.get("title", "")),
+                "",
+                str(youtube_row.get("description", "") or ""),
+            ]
+        )
+
+    def _proposed_youtube_metadata_text(self, metadata) -> str:
+        if not isinstance(metadata, dict) or not metadata:
+            return "No local metadata matched yet."
+        tags = metadata.get("tags", [])
+        tag_text = ", ".join(str(tag) for tag in tags) if isinstance(tags, list) else str(tags or "")
+        return "\n".join(
+            [
+                "Upload ID: {}".format(metadata.get("upload_id", "")),
+                "Title: {}".format(metadata.get("title", "")),
+                "Thumbnail: {}".format(metadata.get("thumbnail_path", "")),
+                "Tags: {}".format(tag_text),
+                "",
+                str(metadata.get("description", "") or ""),
+            ]
+        )
+
+    def dry_run_selected_upload_update(self) -> None:
+        selection = self.upload_tree.selection()
+        if not selection:
+            messagebox.showinfo("Select a video", "Select a YouTube video with matched local metadata first.")
+            return
+        try:
+            index = int(selection[0])
+        except ValueError:
+            return
+        if index >= len(self.upload_review_rows):
+            return
+        row = self._sync_selected_upload_metadata_from_editor() or self.upload_review_rows[index]
+        payload = self._dry_run_upload_payload(row)
+        self.show_copyable_error("Dry Run YouTube Metadata Update", json.dumps(payload, indent=2))
+
+    def dry_run_all_upload_updates(self) -> None:
+        payloads = [self._dry_run_upload_payload(row) for row in self._saved_upload_change_rows()]
+        self.show_copyable_error("Dry Run YouTube Metadata Updates", json.dumps(payloads, indent=2))
+
+    def _youtube_upload_payload(self, row: Dict[str, object]) -> Dict[str, object]:
+        youtube_row = row.get("youtube")
+        metadata = row.get("metadata")
+        if not isinstance(youtube_row, dict) or not isinstance(metadata, dict) or not metadata:
+            return {"status": "not_ready", "reason": "Select a matched YouTube video and local metadata entry."}
+        return {
+            "video_id": youtube_row.get("video_id", ""),
+            "upload_id": metadata.get("upload_id", ""),
+            "update": {
+                "title": metadata.get("title", ""),
+                "description": metadata.get("description", ""),
+                "tags": metadata.get("tags", []),
+                "thumbnail_path": metadata.get("thumbnail_path", ""),
+                "privacy_status": metadata.get("privacy_status", "private"),
+                "self_declared_made_for_kids": False,
+            },
+            "current": {
+                "title": youtube_row.get("title", ""),
+                "privacy_status": youtube_row.get("privacy_status", ""),
+                "upload_status": youtube_row.get("upload_status", ""),
+                "processing_status": youtube_row.get("processing_status", ""),
+            },
+        }
+
+    def _dry_run_upload_payload(self, row: Dict[str, object]) -> Dict[str, object]:
+        payload = self._youtube_upload_payload(row)
+        payload["dry_run"] = True
+        return payload
+
+    def _set_submit_youtube_changes_state(self, state: str) -> None:
+        if hasattr(self, "submit_youtube_changes_button"):
+            self.submit_youtube_changes_button.configure(state=state)
+
+    def _mark_youtube_submit_results_applied(self, results: List[Dict[str, object]]) -> None:
+        result_by_video_id = {
+            str(result.get("video_id", "") or ""): result
+            for result in results
+            if isinstance(result, dict) and result.get("video_id")
+        }
+        for index, row in enumerate(self.upload_review_rows):
+            video_id = str(row.get("youtube_id", "") or "")
+            result = result_by_video_id.get(video_id)
+            if not result:
+                continue
+            update = result.get("applied_update", {})
+            if not isinstance(update, dict):
+                update = {}
+            youtube_row = row.get("youtube")
+            if isinstance(youtube_row, dict):
+                youtube_row["title"] = str(update.get("title", "") or "")
+                youtube_row["description"] = str(update.get("description", "") or "")
+                youtube_row["tags"] = update.get("tags", []) if isinstance(update.get("tags"), list) else []
+                youtube_row["privacy_status"] = str(update.get("privacy_status", "") or "private")
+                thumbnail_path = str(update.get("thumbnail_path", "") or "")
+                if thumbnail_path:
+                    youtube_row["local_thumbnail_path"] = thumbnail_path
+            row["current_title"] = str(update.get("title", "") or row.get("current_title", "") or "")
+            row["status"] = self._youtube_review_status(youtube_row if isinstance(youtube_row, dict) else {}, None)
+            row["metadata"] = {}
+            row["proposed_title"] = ""
+            row["edited"] = False
+            row["editor_dirty"] = False
+            row["saved_changes"] = False
+            row.pop("draft_metadata", None)
+            metadata_entry = row.get("metadata_entry")
+            if isinstance(metadata_entry, dict):
+                metadata_entry["metadata"] = {}
+            upload_id = str(row.get("upload_id", "") or "")
+            if upload_id:
+                self.upload_metadata_by_id.pop(upload_id, None)
+            self.upload_thumbnail_cache.pop("row:{}".format(row.get("youtube_id") or row.get("upload_id") or ""), None)
+            self.upload_thumbnail_cache.pop("detail:{}".format(row.get("youtube_id") or row.get("upload_id") or ""), None)
+            self._update_upload_review_tree_row(index)
+        if self.upload_selected_review_index is not None and self.upload_selected_review_index < len(self.upload_review_rows):
+            row = self.upload_review_rows[self.upload_selected_review_index]
+            self._set_upload_metadata_editor(self._upload_editor_metadata_for_row(row))
+            self._set_upload_detail_preview(row)
+            self._set_upload_editor_save_state(row)
+        self._refresh_upload_pending_summary()
 
     def _upload_title(self, match: MatchSegment) -> str:
         p1 = match.player1 or "Player 1"
@@ -3114,22 +4348,10 @@ class TekkenVodHelperApp(AppWindow):
         return " - ".join(parts)
 
     def _upload_description(self, job: ExportJob) -> str:
-        match = job.match
-        lines = [self._upload_title(match), ""]
-        if self.project_state.event_name:
-            lines.append("Event: {}".format(self.project_state.event_name))
-        if match.round_name:
-            lines.append("Round: {}".format(match.round_name))
-        lines.append("Players: {} vs {}".format(match.player1 or "Player 1", match.player2 or "Player 2"))
-        if match.character1 or match.character2:
-            lines.append("Characters: {} vs {}".format(match.character1 or "Character", match.character2 or "Character"))
-        lines.append("Clip time: {} - {}".format(seconds_to_timestamp(job.start), seconds_to_timestamp(job.end)))
-        if match.notes:
-            lines.extend(["", match.notes])
-        boilerplate = self.project_state.description_boilerplate.strip()
-        if boilerplate:
-            lines.extend(["", boilerplate])
-        return "\n".join(lines)
+        return self._description_boilerplate()
+
+    def _description_boilerplate(self) -> str:
+        return self.project_state.description_boilerplate.strip() or DEFAULT_DESCRIPTION_BOILERPLATE
 
     def _schedule_preview(self) -> None:
         if self.preview_after_id is not None:
@@ -3729,6 +4951,7 @@ class TekkenVodHelperApp(AppWindow):
         overlay_opacity_var.set("{:.0f}".format(DEFAULT_OVERLAY_OPACITY * 100))
         reencode_var.set(False)
         boilerplate_text.delete("1.0", "end")
+        boilerplate_text.insert("1.0", DEFAULT_DESCRIPTION_BOILERPLATE)
 
     def _save_settings_dialog(
         self,
@@ -3806,6 +5029,31 @@ class TekkenVodHelperApp(AppWindow):
                 self.log("start.gg error: {}".format(message))
                 self.startgg_status_var.set("Could not load bracket sets. Check the tournament and try again.")
                 self.show_copyable_error("start.gg fetch failed", message)
+            elif kind == "youtube_videos":
+                self.loading_youtube_videos = False
+                self._set_load_youtube_videos_state("normal")
+                self._refresh_youtube_video_tree(message)
+                self.log("Loaded {} YouTube videos read-only.".format(len(message)))
+            elif kind == "youtube_error":
+                self.loading_youtube_videos = False
+                self._set_load_youtube_videos_state("normal")
+                self.upload_manager_status_var.set("Could not load YouTube videos.")
+                self.log("YouTube read-only load error: {}".format(message))
+                self.show_copyable_error("YouTube read-only load failed", message)
+            elif kind == "youtube_submit_done":
+                self.submitting_youtube_changes = False
+                self._set_submit_youtube_changes_state("normal")
+                results = message if isinstance(message, list) else []
+                self._mark_youtube_submit_results_applied(results)
+                self.upload_manager_status_var.set("Submitted {} YouTube metadata update{}.".format(len(results), "" if len(results) == 1 else "s"))
+                self.log("Submitted {} YouTube metadata update{}.".format(len(results), "" if len(results) == 1 else "s"))
+                messagebox.showinfo("YouTube submit complete", "Submitted {} metadata update{} to YouTube.".format(len(results), "" if len(results) == 1 else "s"))
+            elif kind == "youtube_submit_error":
+                self.submitting_youtube_changes = False
+                self._set_submit_youtube_changes_state("normal")
+                self.upload_manager_status_var.set("YouTube submit failed.")
+                self.log("YouTube submit error. Opened copyable details.")
+                self.show_copyable_error("YouTube submit failed", self._youtube_submit_error_message(str(message)))
             elif kind == "done":
                 self.log(str(message))
                 self._set_export_state("normal")
@@ -3818,6 +5066,24 @@ class TekkenVodHelperApp(AppWindow):
 
     def _thread_log(self, message: str) -> None:
         self.log_queue.put(("log", message))
+
+    def _youtube_submit_error_message(self, message: str) -> str:
+        scope_markers = (
+            "ACCESS_TOKEN_SCOPE_INSUFFICIENT",
+            "insufficient authentication scopes",
+            "insufficientPermissions",
+            "Insufficient Permission",
+        )
+        if any(marker in message for marker in scope_markers):
+            return (
+                "YouTube rejected the update because the stored OAuth token only has read permissions.\n\n"
+                "Re-authorize YouTube from this repo with:\n"
+                ".\\.venv\\Scripts\\python.exe scripts\\youtube_api.py auth\n\n"
+                "After the browser consent finishes, restart the app or try Submit to YouTube again.\n\n"
+                "Original error:\n"
+                "{}".format(message)
+            )
+        return message
 
     def log(self, message: str) -> None:
         self.log_text.insert("end", message + "\n")

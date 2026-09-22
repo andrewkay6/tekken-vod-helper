@@ -1,0 +1,155 @@
+{
+  "video_path": "sample-source.mkv",
+  "event_name": "Basement Brawl #7 (CAF\u00c9 EDITION)",
+  "description_boilerplate": "",
+  "output_dir": "",
+  "portrait_dir": "",
+  "thumbnail_background_path": "sample-background.jpg",
+  "ffmpeg_path": "",
+  "ffprobe_path": "",
+  "reencode": false,
+  "duration": 8672.581,
+  "players": [
+    "Ag",
+    "CrispyBacon",
+    "Mattiniero",
+    "Buk",
+    "PWDDA | Ariz",
+    "derpingtoast",
+    "Spitfire2929",
+    "andy"
+  ],
+  "characters": [
+    "Alisa",
+    "Azucena",
+    "Claudio",
+    "Dragunov",
+    "Nina",
+    "Reina"
+  ],
+  "player_characters": {
+    "ag": "Claudio",
+    "crispybacon": "Alisa",
+    "mattiniero": "Reina",
+    "buk": "Nina",
+    "pwdda | ariz": "Reina",
+    "derpingtoast": "Nina",
+    "spitfire2929": "Azucena",
+    "andy": "Dragunov"
+  },
+  "matches": [
+    {
+      "start": 219.669,
+      "end": 962.377,
+      "player1": "Ag",
+      "player2": "CrispyBacon",
+      "character1": "Claudio",
+      "character2": "Alisa",
+      "round_name": "Winners Round 1",
+      "notes": ""
+    },
+    {
+      "start": 1129.528,
+      "end": 1357.178,
+      "player1": "Mattiniero",
+      "player2": "Buk",
+      "character1": "Reina",
+      "character2": "Nina",
+      "round_name": "Winners Quarter-Final",
+      "notes": ""
+    },
+    {
+      "start": 1725.915,
+      "end": 2309.716,
+      "player1": "Buk",
+      "player2": "CrispyBacon",
+      "character1": "Nina",
+      "character2": "Alisa",
+      "round_name": "Losers Round 2",
+      "notes": ""
+    },
+    {
+      "start": 2506.716,
+      "end": 2942.378,
+      "player1": "PWDDA | Ariz",
+      "player2": "derpingtoast",
+      "character1": "Reina",
+      "character2": "Nina",
+      "round_name": "Winners Quarter-Final",
+      "notes": ""
+    },
+    {
+      "start": 3132.378,
+      "end": 3660.181,
+      "player1": "Spitfire2929",
+      "player2": "Mattiniero",
+      "character1": "Azucena",
+      "character2": "Reina",
+      "round_name": "Winners Semi-Final",
+      "notes": ""
+    },
+    {
+      "start": 4083.87,
+      "end": 4716.98,
+      "player1": "derpingtoast",
+      "player2": "Spitfire2929",
+      "character1": "Nina",
+      "character2": "Azucena",
+      "round_name": "Winners Final",
+      "notes": ""
+    },
+    {
+      "start": 5032.181,
+      "end": 5724.826,
+      "player1": "andy",
+      "player2": "Mattiniero",
+      "character1": "Dragunov",
+      "character2": "Reina",
+      "round_name": "Losers Semi-Final",
+      "notes": ""
+    },
+    {
+      "start": 5829.826,
+      "end": 6648.895,
+      "player1": "Mattiniero",
+      "player2": "derpingtoast",
+      "character1": "Reina",
+      "character2": "Nina",
+      "round_name": "Losers Final",
+      "notes": ""
+    },
+    {
+      "start": 6764.938,
+      "end": 8614.217,
+      "player1": "Spitfire2929",
+      "player2": "Mattiniero",
+      "character1": "Azucena",
+      "character2": "Reina",
+      "round_name": "Grand Final",
+      "notes": ""
+    }
+  ],
+  "overlay": {
+    "description": "Basement Brawl #7 - Cafe Edition",
+    "subtitle": "Grand Final",
+    "p1name": "Matt",
+    "p1country": "",
+    "p1score": 3,
+    "p1team": "",
+    "p2name": "Spitfire2929",
+    "p2country": "",
+    "p2score": 2,
+    "p2team": "",
+    "font": "Bahnschrift",
+    "accent_color": "#f3135e",
+    "opacity": 1.0
+  },
+  "obs": {
+    "host": "127.0.0.1",
+    "port": 4455,
+    "password": ""
+  },
+  "startgg": {
+    "tournament_slug": "tournament/basement-brawl-7-cafe-edition"
+  }
+}

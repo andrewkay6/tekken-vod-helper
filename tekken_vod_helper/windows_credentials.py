@@ -5,6 +5,9 @@ from typing import Optional
 
 
 TARGET_STARTGG_TOKEN = "TekkenVodHelper:start.gg-token"
+TARGET_YOUTUBE_CLIENT_ID = "TekkenVodHelper:youtube-client-id"
+TARGET_YOUTUBE_CLIENT_SECRET = "TekkenVodHelper:youtube-client-secret"
+TARGET_YOUTUBE_REFRESH_TOKEN = "TekkenVodHelper:youtube-refresh-token"
 
 
 class CredentialError(Exception):
@@ -43,6 +46,31 @@ def write_startgg_token(token: str) -> None:
 
 def delete_startgg_token() -> None:
     delete_credential(TARGET_STARTGG_TOKEN)
+
+
+def read_youtube_client_id() -> str:
+    return read_credential(TARGET_YOUTUBE_CLIENT_ID) or ""
+
+
+def read_youtube_client_secret() -> str:
+    return read_credential(TARGET_YOUTUBE_CLIENT_SECRET) or ""
+
+
+def read_youtube_refresh_token() -> str:
+    return read_credential(TARGET_YOUTUBE_REFRESH_TOKEN) or ""
+
+
+def write_youtube_refresh_token(token: str) -> None:
+    write_credential(TARGET_YOUTUBE_REFRESH_TOKEN, token)
+
+
+def delete_youtube_refresh_token() -> None:
+    delete_credential(TARGET_YOUTUBE_REFRESH_TOKEN)
+
+
+def write_youtube_client_credentials(client_id: str, client_secret: str) -> None:
+    write_credential(TARGET_YOUTUBE_CLIENT_ID, client_id)
+    write_credential(TARGET_YOUTUBE_CLIENT_SECRET, client_secret)
 
 
 def read_credential(target: str) -> Optional[str]:

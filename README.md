@@ -113,6 +113,8 @@ By default, clips export as `.mp4` using FFmpeg stream copy/remux for speed. Ena
 
 Each match folder also includes `title.txt` and `description.txt` for manual YouTube uploads without using the YouTube API.
 
+Exports also create an `_youtube_uploads` folder inside the output directory. All exported `.mp4` files are copied there with stable `tvh-...` IDs in their filenames so the whole folder can be drag-dropped into YouTube Studio at once. Each match folder includes a `youtube.json` file, and `_youtube_uploads/manifest.json` points from each video file to its generated title, description, thumbnail, and match metadata. The **Upload Manager** tab can load this queue for review before a future API metadata sync.
+
 ## YouTube 1440p Upscale
 
 To upscale exported clips to 1440p with NVIDIA NVENC before uploading to YouTube:

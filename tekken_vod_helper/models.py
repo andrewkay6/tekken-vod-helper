@@ -3,6 +3,12 @@ from typing import Any, Dict, List, Optional
 
 DEFAULT_OVERLAY_ACCENT_COLOR = "#f3135e"
 DEFAULT_OVERLAY_OPACITY = 1.0
+DEFAULT_DESCRIPTION_BOILERPLATE = """KW Tekken is the local Tekken community for Kitchener-Waterloo. Find events, VODs, photos, and community links at https://kwtekken.ca
+
+Join us on Discord for brackets, casuals, streams, and the next local: https://discord.gg/mCwGVgjXED
+Watch live on Twitch: https://twitch.tv/kwtekken
+More VODs: https://www.youtube.com/@KWTekken
+Contact: kwtekken@gmail.com"""
 
 
 @dataclass
@@ -140,7 +146,7 @@ class StartggSettings:
 class ProjectState:
     video_path: str = ""
     event_name: str = ""
-    description_boilerplate: str = ""
+    description_boilerplate: str = DEFAULT_DESCRIPTION_BOILERPLATE
     output_dir: str = ""
     portrait_dir: str = ""
     thumbnail_background_path: str = ""
@@ -211,12 +217,14 @@ class ProjectState:
 class ExportJob:
     match: MatchSegment
     index: int
+    upload_id: str
     start: float
     end: float
     folder_name: str
     clip_path: str
     thumbnail_path: str
     metadata_path: str
+    youtube_metadata_path: str
     title_path: str
     description_path: str
 

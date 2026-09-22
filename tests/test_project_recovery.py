@@ -1,5 +1,6 @@
 import json
 
+from tekken_vod_helper import app as app_module
 from tekken_vod_helper.app import TekkenVodHelperApp
 from tekken_vod_helper.models import ProjectState
 
@@ -22,6 +23,8 @@ def make_recovery_app(state, tmp_path):
     app.log_messages = []
     app.log = app.log_messages.append
     app.temporary_project_path = tmp_path / "recovery.tvh.json"
+    app.temporary_project_dismissed_path = tmp_path / "recovery.tvh.json.deleted"
+    app.temporary_project_dismissed = False
     app.temporary_project_after_id = None
     app.apply_match_details = lambda show_errors=False: None
     app._saved_portrait_setting = lambda configured: configured
@@ -84,3 +87,32 @@ def test_temporary_project_on_exit_removes_recovery_when_saved_project_matches(t
     app._save_temporary_project_on_exit()
 
     assert not app.temporary_project_path.exists()
+
+
+def test_recovery_prompt_delete_choice_marks_recovery_deleted(tmp_path):
+    app = make_recovery_app(ProjectState(event_name="Saved Event"), tmp_path)
+    app.temporary_project_path.write_text("stale", encoding="utf-8")
+    app._temporary_project_recovery_choice = lambda: "delete"
+
+    app._offer_temporary_project_recovery()
+
+    assert not app.temporary_project_path.exists()
+    assert app.temporary_project_dismissed_path.read_text(encoding="utf-8") == "stale"
+    assert app.temporary_project_dismissed
+    assert "Marked recovery copy deleted" in app.log_messages[-1]
+
+
+def test_clear_temporary_project_backups_removes_active_and_deleted(tmp_path, monkeypatch):
+    app = make_recovery_app(ProjectState(event_name="Saved Event"), tmp_path)
+    app.temporary_project_path.write_text("active", encoding="utf-8")
+    app.temporary_project_dismissed_path.write_text("deleted", encoding="utf-8")
+    app.temporary_project_dismissed = True
+    messages = []
+    monkeypatch.setattr(app_module.messagebox, "showinfo", lambda title, message: messages.append((title, message)))
+
+    app.clear_temporary_project_backups()
+
+    assert not app.temporary_project_path.exists()
+    assert not app.temporary_project_dismissed_path.exists()
+    assert not app.temporary_project_dismissed
+    assert messages[-1][0] == "Recovery backups"
