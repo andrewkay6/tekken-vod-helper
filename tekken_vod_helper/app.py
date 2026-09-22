@@ -2304,8 +2304,8 @@ class TekkenVodHelperApp(AppWindow):
         self.log("Loaded video: {}".format(path))
 
     def _reset_matches_for_new_video(self, previous_video: str, new_video: str) -> None:
-        if previous_video and previous_video != new_video:
-            self.project_state.matches = []
+        # Keep project timestamps when relinking or replacing the source video.
+        return
 
     def open_settings(self) -> None:
         self._sync_paths_to_state()

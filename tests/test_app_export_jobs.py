@@ -90,7 +90,7 @@ def test_previous_match_for_start_uses_match_before_insert_point():
     assert previous is state.matches[1]
 
 
-def test_new_video_match_reset_is_empty():
+def test_new_video_keeps_existing_match_timestamps():
     state = ProjectState(
         video_path="old.mkv",
         matches=[MatchSegment(start=10.0)],
@@ -99,7 +99,7 @@ def test_new_video_match_reset_is_empty():
 
     app._reset_matches_for_new_video("old.mkv", "new.mkv")
 
-    assert state.matches == []
+    assert [match.start for match in state.matches] == [10.0]
 
 
 def test_start_now_updates_selected_match_without_inserting():
