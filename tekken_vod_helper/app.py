@@ -38,6 +38,8 @@ APP_TEXT = "#f5f7fb"
 APP_MUTED = "#a9b0bd"
 APP_ACCENT = DEFAULT_OVERLAY_ACCENT_COLOR
 APP_ACCENT_HOVER = "#c90f4c"
+TEMP_PROJECT_FILENAME = "tekken-vod-helper-recovery.tvh.json"
+TEMP_PROJECT_SAVE_INTERVAL_MS = 30000
 
 AppWindow = ctk.CTk if ctk is not None else tk.Tk
 
@@ -93,6 +95,8 @@ class TekkenVodHelperApp(AppWindow):
         self.startgg_sets_cache: Dict[str, List[BracketSet]] = {}
         self.overlay_server = OverlayServer(self._overlay_static_dir())
         self.overlay_apply_after_id: Optional[str] = None
+        self.temporary_project_after_id: Optional[str] = None
+        self.temporary_project_path = self._temporary_project_path()
         self.overlay_auto_apply_enabled = False
         self.output_var = tk.StringVar(value=self.project_state.output_dir)
         self.event_var = tk.StringVar(value=self.project_state.event_name)
@@ -156,6 +160,8 @@ class TekkenVodHelperApp(AppWindow):
         self.overlay_auto_apply_enabled = True
         self._refresh_combo_values()
         self._refresh_tree()
+        self._schedule_temporary_project_save()
+        self.after(250, self._offer_temporary_project_recovery)
         self.after(150, self._poll_log_queue)
 
     def _build_menu(self) -> None:
@@ -163,6 +169,7 @@ class TekkenVodHelperApp(AppWindow):
 
         file_menu = tk.Menu(menubar, tearoff=False)
         self._add_menu_command(file_menu, "Load Project...", self.load_project)
+        self._add_menu_command(file_menu, "Load Recovery Copy...", self.load_temporary_project)
         self._add_menu_command(file_menu, "Save Project", self.save_project, accelerator="Ctrl+S")
         self._add_menu_command(file_menu, "Save Project As...", self.save_project_as)
         if self.current_mode == "vod":
@@ -754,27 +761,28 @@ class TekkenVodHelperApp(AppWindow):
 
         mark_frame = ttk.Frame(parent)
         mark_frame.grid(row=2, column=0, sticky="ew", pady=(4, 8))
-        mark_frame.columnconfigure(4, weight=1)
-        mark_frame.columnconfigure(7, weight=1)
+        mark_frame.columnconfigure(5, weight=1)
+        mark_frame.columnconfigure(8, weight=1)
         self.time_label_var = tk.StringVar(value="00:00:00.000 / 00:00:00.000")
         ttk.Label(mark_frame, textvariable=self.time_label_var, width=29).grid(row=0, column=0, columnspan=6, sticky="w", padx=(0, 8))
 
-        ttk.Button(mark_frame, text="Mark Match Start", command=self.mark_match_start).grid(row=1, column=0, sticky="w", padx=(0, 3), pady=(6, 0))
-        ttk.Button(mark_frame, text="Mark Match End", command=self.mark_match_end).grid(row=1, column=1, sticky="w", padx=3, pady=(6, 0))
-        ttk.Button(mark_frame, text="Go To Match", command=self.go_to_selected_match).grid(row=1, column=2, sticky="w", padx=3, pady=(6, 0))
-        ttk.Button(mark_frame, text="Delete Match", command=self.delete_selected_match).grid(row=1, column=3, sticky="w", padx=3, pady=(6, 0))
+        ttk.Button(mark_frame, text="Start Now", command=self.set_selected_start_to_current_time).grid(row=1, column=0, sticky="w", padx=(0, 3), pady=(6, 0))
+        ttk.Button(mark_frame, text="End Now", command=self.set_selected_end_to_current_time).grid(row=1, column=1, sticky="w", padx=3, pady=(6, 0))
+        ttk.Button(mark_frame, text="Insert New Match", command=self.mark_match_start).grid(row=1, column=2, sticky="w", padx=3, pady=(6, 0))
+        ttk.Button(mark_frame, text="Go To Match", command=self.go_to_selected_match).grid(row=1, column=3, sticky="w", padx=3, pady=(6, 0))
+        ttk.Button(mark_frame, text="Delete Match", command=self.delete_selected_match).grid(row=1, column=4, sticky="w", padx=3, pady=(6, 0))
 
         ttk.Label(mark_frame, text="Start").grid(row=2, column=0, sticky="e", padx=(0, 3), pady=(6, 0))
         self.start_var = tk.StringVar(value="00:00:00.000")
         self.start_entry = ttk.Entry(mark_frame, textvariable=self.start_var, width=14)
         self.start_entry.grid(row=2, column=1, sticky="ew", pady=(6, 0))
-        ttk.Button(mark_frame, text="Set", width=5, command=self.set_selected_start).grid(row=2, column=2, sticky="w", padx=(4, 16), pady=(6, 0))
+        ttk.Button(mark_frame, text="Apply", width=6, command=self.set_selected_start).grid(row=2, column=2, sticky="w", padx=(4, 16), pady=(6, 0))
 
         ttk.Label(mark_frame, text="End").grid(row=2, column=3, sticky="e", padx=(0, 3), pady=(6, 0))
         self.end_var = tk.StringVar(value="")
         self.end_entry = ttk.Entry(mark_frame, textvariable=self.end_var, width=14)
         self.end_entry.grid(row=2, column=4, sticky="ew", pady=(6, 0))
-        ttk.Button(mark_frame, text="Set", width=5, command=self.set_selected_end).grid(row=2, column=5, sticky="w", padx=(4, 0), pady=(6, 0))
+        ttk.Button(mark_frame, text="Apply", width=6, command=self.set_selected_end).grid(row=2, column=5, sticky="w", padx=(4, 0), pady=(6, 0))
 
     def _build_match_panel(self, parent: ttk.Frame) -> None:
         parent.columnconfigure(0, weight=1)
@@ -2402,22 +2410,32 @@ class TekkenVodHelperApp(AppWindow):
         )
         if not path:
             return
+        self._load_project_from(Path(path), project_path=Path(path), log_label="Loaded project")
+
+    def load_temporary_project(self) -> None:
+        if not self.temporary_project_path.exists():
+            messagebox.showinfo("No recovery copy", "No temporary project recovery file was found.")
+            return
+        self._load_project_from(self.temporary_project_path, project_path=None, log_label="Loaded recovery copy")
+
+    def _load_project_from(self, path: Path, project_path: Optional[Path], log_label: str) -> bool:
         self.stop_playback()
         try:
-            with open(path, "r", encoding="utf-8") as handle:
+            with path.open("r", encoding="utf-8") as handle:
                 self.project_state = ProjectState.from_dict(json.load(handle))
         except Exception as exc:
             self.show_copyable_error("Could not load project", exc)
-            return
+            return False
         if not self.project_state.characters:
             self.project_state.characters = self._load_default_characters()
-        self.project_path = Path(path)
+        self.project_path = project_path
         self._state_to_controls()
         self._refresh_combo_values()
         self._refresh_tree()
         self._update_video_summary()
         self._schedule_preview()
-        self.log("Loaded project: {}".format(path))
+        self.log("{}: {}".format(log_label, path))
+        return True
 
     def save_project(self) -> None:
         if self.project_path is None:
@@ -2440,12 +2458,96 @@ class TekkenVodHelperApp(AppWindow):
         self.apply_match_details(show_errors=False)
         self._sync_paths_to_state()
         try:
-            with path.open("w", encoding="utf-8") as handle:
-                json.dump(self.project_state.to_dict(), handle, indent=2)
+            self._write_project_json(path)
         except Exception as exc:
             self.show_copyable_error("Could not save project", exc)
             return
+        self._delete_temporary_project()
         self.log("Saved project: {}".format(path))
+
+    def _write_project_json(self, path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path = path.with_name(path.name + ".tmp")
+        with temporary_path.open("w", encoding="utf-8") as handle:
+            json.dump(self.project_state.to_dict(), handle, indent=2)
+        temporary_path.replace(path)
+
+    def _temporary_project_path(self) -> Path:
+        return Path(tempfile.gettempdir()) / TEMP_PROJECT_FILENAME
+
+    def _schedule_temporary_project_save(self) -> None:
+        if self.temporary_project_after_id is not None:
+            try:
+                self.after_cancel(self.temporary_project_after_id)
+            except tk.TclError:
+                pass
+        self.temporary_project_after_id = self.after(TEMP_PROJECT_SAVE_INTERVAL_MS, self._save_temporary_project)
+
+    def _save_temporary_project(self) -> None:
+        self.temporary_project_after_id = None
+        try:
+            self.apply_match_details(show_errors=False)
+            self._sync_paths_to_state()
+            if not self._project_needs_temporary_copy():
+                self._delete_temporary_project()
+                return
+            self._write_project_json(self.temporary_project_path)
+        except Exception as exc:
+            try:
+                self.log("Could not write recovery copy: {}".format(exc))
+            except Exception:
+                pass
+        finally:
+            try:
+                self._schedule_temporary_project_save()
+            except tk.TclError:
+                pass
+
+    def _save_temporary_project_on_exit(self) -> None:
+        if self.temporary_project_after_id is not None:
+            try:
+                self.after_cancel(self.temporary_project_after_id)
+            except tk.TclError:
+                pass
+            self.temporary_project_after_id = None
+        try:
+            self.apply_match_details(show_errors=False)
+            self._sync_paths_to_state()
+            if not self._project_needs_temporary_copy():
+                self._delete_temporary_project()
+                return
+            self._write_project_json(self.temporary_project_path)
+        except Exception as exc:
+            try:
+                self.log("Could not write recovery copy before exit: {}".format(exc))
+            except Exception:
+                pass
+
+    def _project_needs_temporary_copy(self) -> bool:
+        if self.project_path is None:
+            return True
+        try:
+            with self.project_path.open("r", encoding="utf-8") as handle:
+                return json.load(handle) != self.project_state.to_dict()
+        except Exception:
+            return True
+
+    def _delete_temporary_project(self) -> None:
+        try:
+            self.temporary_project_path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            self.log("Could not remove recovery copy: {}".format(exc))
+
+    def _offer_temporary_project_recovery(self) -> None:
+        if not self.temporary_project_path.exists():
+            return
+        if messagebox.askyesno(
+            "Recover temporary project?",
+            "A temporary project recovery file was found. Load it now?",
+        ):
+            self.load_temporary_project()
 
     def on_scrub(self, value: str) -> None:
         try:
@@ -2473,7 +2575,11 @@ class TekkenVodHelperApp(AppWindow):
             return
         if self._playback_is_running():
             self._seek_vlc(self.current_time)
-        elif not self._vlc_available():
+        elif self._vlc_available():
+            self._seek_vlc(self.current_time)
+            if hasattr(self, "video_surface"):
+                self.video_surface.tkraise()
+        else:
             self._schedule_preview()
 
     def toggle_playback(self) -> None:
@@ -2530,6 +2636,18 @@ class TekkenVodHelperApp(AppWindow):
             self._load_vlc_video()
         except Exception as exc:
             self.show_copyable_error("Could not start VLC playback", exc)
+            return False
+        return self.vlc_player is not None
+
+    def _ensure_vlc_player_for_seek(self) -> bool:
+        if vlc is None or not self.project_state.video_path:
+            return False
+        if self.vlc_player is not None and self.vlc_media_path == self.project_state.video_path:
+            return True
+        try:
+            self._load_vlc_video()
+        except Exception as exc:
+            self.log("Could not prepare VLC seek: {}".format(exc))
             return False
         return self.vlc_player is not None
 
@@ -2687,10 +2805,28 @@ class TekkenVodHelperApp(AppWindow):
         matches = self.project_state.sorted_matches()
         if index >= len(matches):
             return
-        self.scrub_var.set(matches[index].start)
-        self.current_time = matches[index].start
-        self._update_time_label()
-        self._schedule_preview()
+        start = matches[index].start
+        self._ensure_vlc_player_for_seek()
+        self.scrub_var.set(start)
+        self._seek_to_time(start)
+
+    def set_selected_start_to_current_time(self) -> None:
+        index = self._selected_tree_index()
+        if index is None:
+            messagebox.showinfo("Select a match first", "Select the match whose start should be updated.")
+            return
+        start = round(self.current_time, 3)
+        self.start_var.set(seconds_to_timestamp(start))
+        self.set_selected_start()
+
+    def set_selected_end_to_current_time(self) -> None:
+        index = self._selected_tree_index()
+        if index is None:
+            messagebox.showinfo("Select a match first", "Select the match whose end should be updated.")
+            return
+        end = round(self.current_time, 3)
+        self.end_var.set(seconds_to_timestamp(end))
+        self.set_selected_end()
 
     def set_selected_start(self) -> None:
         index = self._selected_tree_index()
@@ -3688,6 +3824,7 @@ class TekkenVodHelperApp(AppWindow):
         self.log_text.see("end")
 
     def destroy(self) -> None:
+        self._save_temporary_project_on_exit()
         self.stop_playback()
         self.overlay_server.stop()
         super().destroy()

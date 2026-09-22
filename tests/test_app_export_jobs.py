@@ -8,10 +8,22 @@ from tekken_vod_helper.models import ExportJob, MatchSegment, ProjectState
 def make_app(state):
     app = TekkenVodHelperApp.__new__(TekkenVodHelperApp)
     app.project_state = state
+    app.loading_form = False
     app.log_messages = []
     app.log = app.log_messages.append
     app._thread_log = app.log_messages.append
     return app
+
+
+class DummyVar:
+    def __init__(self, value=""):
+        self.value = value
+
+    def get(self):
+        return self.value
+
+    def set(self, value):
+        self.value = value
 
 
 def test_export_jobs_use_next_start_when_end_is_unmarked(tmp_path):
@@ -88,6 +100,73 @@ def test_new_video_match_reset_is_empty():
     app._reset_matches_for_new_video("old.mkv", "new.mkv")
 
     assert state.matches == []
+
+
+def test_start_now_updates_selected_match_without_inserting():
+    state = ProjectState(
+        video_path="vod.mkv",
+        duration=600.0,
+        matches=[MatchSegment(start=10.0), MatchSegment(start=120.0)],
+    )
+    app = make_app(state)
+    app.current_time = 33.3334
+    app._selected_tree_index = lambda: 0
+    app._refresh_tree = lambda select_start=None: None
+    app.player1_var = DummyVar()
+    app.player2_var = DummyVar()
+    app.character1_var = DummyVar()
+    app.character2_var = DummyVar()
+    app.round_var = DummyVar()
+    app.notes_var = DummyVar()
+    app.start_var = DummyVar()
+    app.end_var = DummyVar()
+
+    app.set_selected_start_to_current_time()
+
+    assert [match.start for match in state.sorted_matches()] == [33.333, 120.0]
+
+
+def test_end_now_updates_selected_match_from_current_time():
+    state = ProjectState(
+        video_path="vod.mkv",
+        duration=600.0,
+        matches=[MatchSegment(start=10.0), MatchSegment(start=120.0)],
+    )
+    app = make_app(state)
+    app.current_time = 88.1254
+    app._selected_tree_index = lambda: 0
+    app._refresh_tree = lambda select_start=None: None
+    app.player1_var = DummyVar()
+    app.player2_var = DummyVar()
+    app.character1_var = DummyVar()
+    app.character2_var = DummyVar()
+    app.round_var = DummyVar()
+    app.notes_var = DummyVar()
+    app.start_var = DummyVar()
+    app.end_var = DummyVar()
+
+    app.set_selected_end_to_current_time()
+
+    assert state.sorted_matches()[0].end == 88.125
+
+
+def test_go_to_selected_match_uses_seek_helper():
+    state = ProjectState(
+        video_path="vod.mkv",
+        duration=600.0,
+        matches=[MatchSegment(start=10.0), MatchSegment(start=120.0)],
+    )
+    app = make_app(state)
+    calls = []
+    app._selected_tree_index = lambda: 1
+    app._ensure_vlc_player_for_seek = lambda: True
+    app._seek_to_time = calls.append
+    app.scrub_var = DummyVar()
+
+    app.go_to_selected_match()
+
+    assert app.scrub_var.get() == 120.0
+    assert calls == [120.0]
 
 
 def test_project_state_round_trips_thumbnail_background():
