@@ -247,13 +247,25 @@ def fit_video_title(title: str, event_name: str = "") -> str:
     if len(title) <= 100:
         return title
     suffix = " - " + event_name.strip()
+    retained_suffix = ""
     if event_name.strip() and title.endswith(suffix):
-        title = title[:-len(suffix)].rstrip()
+        core = title[:-len(suffix)].rstrip()
+        tournament = re.sub(r"\s*\([^()]*\)\s*$", "", event_name.strip()).split(" - ", 1)[0].strip()
+        retained_suffix = " - " + tournament
+        title = core + retained_suffix
+        if len(title) > 100:
+            # The last component before the tournament is the round.
+            core = core.rsplit(" - ", 1)[0]
+            title = core + retained_suffix
     if len(title) <= 100:
         return title
-    # Preserve complete words when unusually long player/round names still exceed the limit.
-    shortened = title[:99].rsplit(" ", 1)[0]
-    return (shortened if shortened else title[:99]).rstrip(" -") + "…"
+    # Retain the tournament even when exceptionally long player names need shortening.
+    budget = 99 - len(retained_suffix)
+    if budget < 1:
+        raise ValueError("Tournament name is too long for a YouTube title. Shorten the event name.")
+    core = title[:-len(retained_suffix)] if retained_suffix else title
+    shortened = core[:budget].rsplit(" ", 1)[0]
+    return (shortened if shortened else core[:budget]).rstrip(" -") + "…" + retained_suffix
 
 
 def videos_as_rows(videos: Iterable[YouTubeVideo]) -> List[Dict[str, str]]:

@@ -64,12 +64,54 @@ def test_saved_match_survives_title_change_and_folder_reload(tmp_path):
     assert rows[0]["proposed_title"] == "Restored title"
 
 
-def test_existing_metadata_long_title_drops_event_suffix():
+def test_existing_metadata_long_title_keeps_tournament_name():
     app = make_app(ProjectState())
     core = "Alice (Alisa) vs Bob (Nina) - Winners Quarter-Final"
     event = "Basement Brawl #7 - A Very Long Tournament Edition Name"
     app._set_upload_metadata_entries([{"upload_id": "tvh-002-5e0341", "metadata": {"title": core + " - " + event, "event_name": event}}])
-    assert app.upload_metadata_by_id["tvh-002-5e0341"]["metadata"]["title"] == core
+    assert app.upload_metadata_by_id["tvh-002-5e0341"]["metadata"]["title"] == core + " - Basement Brawl #7"
+
+
+def test_visibility_defaults_public_once_and_preserves_user_override():
+    app = make_app(ProjectState())
+    row = {"youtube": {"video_id": "video"}, "metadata": {"privacy_status": "private"}}
+    app._default_upload_visibility(row)
+    assert row["metadata"]["privacy_status"] == "public"
+    row["metadata"]["privacy_status"] = "unlisted"
+    app._default_upload_visibility(row)
+    assert row["metadata"]["privacy_status"] == "unlisted"
+
+
+def test_save_all_pending_preserves_drafts_and_skips_unmatched_and_live_rows():
+    app = make_app(ProjectState())
+    app.upload_selected_review_index = None
+    app._update_upload_review_tree_row = lambda index: None
+    app._refresh_upload_pending_summary = lambda: None
+    app.upload_review_rows = [
+        {"youtube": {"video_id": "one"}, "metadata": {"title": "One", "privacy_status": "private"}},
+        {"youtube": {"video_id": "two"}, "metadata": {"title": "Two"}, "draft_metadata": {"title": "Edited", "privacy_status": "unlisted"}},
+        {"youtube": None, "metadata": {"title": "Unmatched"}},
+        {"youtube": {"video_id": "live"}, "metadata": {}},
+    ]
+    app.save_all_pending_upload_changes()
+    rows = app.upload_review_rows
+    assert rows[0]["saved_changes"] and rows[0]["metadata"]["privacy_status"] == "public"
+    assert rows[1]["saved_changes"] and rows[1]["metadata"] == {"title": "Edited", "privacy_status": "unlisted"}
+    assert not rows[2].get("saved_changes") and not rows[3].get("saved_changes")
+
+
+def test_save_all_pending_reads_current_editor():
+    app = make_app(ProjectState())
+    app.upload_selected_review_index = 0
+    app.upload_review_rows = [{"youtube": {"video_id": "one"}, "metadata": {"title": "Old"}}]
+    app.upload_editor_baseline = {"title": "Old"}
+    app._proposed_metadata_from_editor = lambda fallback: {"title": "Latest typed title", "privacy_status": "public"}
+    app._set_upload_editor_save_state = lambda row: None
+    app._update_upload_review_tree_row = lambda index: None
+    app._refresh_upload_pending_summary = lambda: None
+    app.save_all_pending_upload_changes()
+    assert app.upload_review_rows[0]["metadata"]["title"] == "Latest typed title"
+    assert app.upload_review_rows[0]["saved_changes"]
 
 
 class DummyVar:

@@ -41,13 +41,15 @@ def test_playlist_addition_skips_existing_video(monkeypatch, already_present):
             "playlistId": "playlist", "resourceId": {"kind": "youtube#video", "videoId": "video"}}
 
 
-def test_long_title_drops_whole_event_suffix():
+def test_long_title_drops_edition_before_round_and_keeps_tournament():
     core = "Spitfire2929 (Azucena) vs Mattiniero (Reina) - Winners Semi-Final"
     event = "Basement Brawl #7 (CAFÉ EDITION)"
-    title = core + " - " + event
-    # Use a longer edition name to cross the boundary without changing the match.
-    event += " Tournament"
-    assert youtube_client.fit_video_title(core + " - " + event, event) == core
+    event = "Basement Brawl #7 (A Very Long CAFÉ EDITION Subtitle)"
+    assert youtube_client.fit_video_title(core + " - " + event, event) == core + " - Basement Brawl #7"
+    players = "A" * 35 + " vs " + "B" * 35
+    assert youtube_client.fit_video_title(players + " - Winners Final - " + event, event) == players + " - Basement Brawl #7"
+    huge = youtube_client.fit_video_title("A" * 110 + " vs Bob - Winners Final - " + event, event)
+    assert len(huge) <= 100 and huge.endswith("… - Basement Brawl #7")
     assert youtube_client.fit_video_title("a" * 100) == "a" * 100
     assert len(youtube_client.fit_video_title("a" * 101)) == 100
     assert youtube_client.fit_video_title("Alice vs Bob - " + event, event) == "Alice vs Bob - " + event

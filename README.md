@@ -119,7 +119,9 @@ In **Upload Manager**, click **Load Videos** and **Load Metadata Folder...**. Ma
 
 The playlist dropdown applies to all videos in the submitted batch. It suggests a close event-name match when the tournament numbers agree; review the suggestion or choose **No playlist change**. Submission adds videos without duplicating existing playlist entries. Review each matched entry, save its changes locally, and use **Submit to YouTube...** to confirm the updates and playlist choice.
 
-Generated titles over 100 characters drop the entire event suffix, retaining the players, characters, and round. Loading existing metadata uses the same rule. Exceptionally long remaining titles are shortened at a word boundary with an ellipsis.
+Generated titles over 100 characters first drop the edition subtitle (such as `CAFÉ EDITION`), then the round if necessary, keeping the tournament name (such as `Basement Brawl #7`). Loading existing metadata uses the same rule. Exceptionally long matchup text is shortened at a word boundary with an ellipsis while retaining the tournament name.
+
+Selecting a matched video defaults its pending visibility to **Public**. You can override that choice. **Save All Pending Changes** prepares all matched metadata and pending edits for submission, including videos you have not selected individually; untouched matched entries default to Public. Unmatched entries are skipped. Saving locally does not submit changes to YouTube.
 
 ## YouTube 1440p Upscale
 

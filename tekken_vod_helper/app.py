@@ -993,6 +993,7 @@ class TekkenVodHelperApp(AppWindow):
         ttk.Label(metadata_actions, text="Metadata").grid(row=0, column=0, sticky="w", padx=(0, 6))
         ttk.Button(metadata_actions, text="Load Metadata Folder...", command=self.choose_upload_metadata_folder).grid(row=0, column=1, sticky="w")
         ttk.Button(metadata_actions, text="Match Selected Video...", command=self.choose_upload_match).grid(row=0, column=2, sticky="w", padx=(6, 0))
+        ttk.Button(metadata_actions, text="Save All Pending Changes", command=self.save_all_pending_upload_changes).grid(row=1, column=1, columnspan=2, sticky="w", pady=(6, 0))
         self.submit_youtube_changes_button = ttk.Button(actions, text="Submit to YouTube...", command=self.submit_all_saved_upload_changes, style="Danger.TButton")
         self.submit_youtube_changes_button.grid(row=0, column=3, sticky="e", padx=(12, 0))
         ttk.Label(actions, textvariable=self.upload_manager_status_var, style="Muted.TLabel", anchor="w").grid(row=1, column=0, columnspan=4, sticky="ew", pady=(6, 0))
@@ -3884,7 +3885,7 @@ class TekkenVodHelperApp(AppWindow):
                     other.update(metadata={}, metadata_entry=None, proposed_title="", saved_changes=False, status="Matched to " + str(row["youtube_id"]))
             row.update(upload_id=upload_id, metadata_entry=entry, metadata=dict(entry.get("metadata", {})),
                        proposed_title=entry.get("metadata", {}).get("title", ""), saved_changes=False,
-                       editor_dirty=False, edited=False, match_method="saved video ID",
+                       editor_dirty=False, edited=False, visibility_initialized=False, match_method="saved video ID",
                        status=self._youtube_review_status(row["youtube"], entry) + " (saved video ID)")
             row.pop("draft_metadata", None)
             self.upload_thumbnail_cache.pop("row:" + str(row["youtube_id"]), None)
@@ -3941,9 +3942,16 @@ class TekkenVodHelperApp(AppWindow):
         self._load_upload_review_details(self.upload_review_rows[index])
 
     def _load_upload_review_details(self, row: Dict[str, object]) -> None:
+        self._default_upload_visibility(row)
         self._set_upload_metadata_editor(self._upload_editor_metadata_for_row(row))
         self._set_upload_detail_preview(row)
         self._set_upload_editor_save_state(row)
+
+    def _default_upload_visibility(self, row: Dict[str, object]) -> None:
+        if (row.get("youtube") and row.get("metadata") and not row.get("visibility_initialized")
+                and not row.get("draft_metadata") and not row.get("saved_changes")):
+            row["metadata"] = {**row["metadata"], "privacy_status": "public"}
+        row["visibility_initialized"] = True
 
     def _set_upload_editor_save_state(self, row: Optional[Dict[str, object]] = None) -> None:
         if not hasattr(self, "upload_editor_save_state_var"):
@@ -4141,6 +4149,28 @@ class TekkenVodHelperApp(AppWindow):
         self._update_upload_review_tree_row(self.upload_selected_review_index or 0)
         self._refresh_upload_pending_summary()
         self.log("Saved local YouTube changes for {}.".format(row.get("current_title") or row.get("youtube_id") or "selected video"))
+
+    def save_all_pending_upload_changes(self) -> None:
+        saved = 0
+        for index, row in enumerate(self.upload_review_rows):
+            if not row.get("youtube") or not (row.get("metadata") or row.get("draft_metadata") or row.get("editor_dirty")):
+                continue
+            if index == self.upload_selected_review_index:
+                self._sync_upload_metadata_from_editor_by_index(index)
+            else:
+                self._default_upload_visibility(row)
+                metadata = dict(row.get("draft_metadata") or row["metadata"])
+                row.update(metadata=metadata, proposed_title=metadata.get("title", ""), saved_changes=True, editor_dirty=False)
+                row.pop("draft_metadata", None)
+                entry = row.get("metadata_entry")
+                if isinstance(entry, dict):
+                    entry["metadata"] = metadata
+            self._update_upload_review_tree_row(index)
+            saved += 1
+        self._refresh_upload_pending_summary()
+        self.log("Saved pending changes locally for {} YouTube videos.".format(saved))
+        if not saved:
+            messagebox.showinfo("No pending changes", "Load and match metadata to YouTube videos, or edit a video first.")
 
     def revert_selected_upload_changes_to_live(self) -> None:
         selection = self.upload_tree.selection()
