@@ -96,38 +96,25 @@ query TournamentSets($slug: String!) {
 
 
 def fetch_owned_tournaments(token: str, per_page: int = 50) -> List[TournamentSummary]:
+    """Fetch tournaments the token account administers, including upcoming events."""
     if not token.strip():
         raise StartggError("Enter a start.gg token first.")
 
-    user_query = """
-query CurrentUser {
-  currentUser {
-    id
-  }
-}
-"""
-    user_payload = _graphql(token, user_query, {})
-    user_id = user_payload.get("data", {}).get("currentUser", {}).get("id")
-    if not user_id:
-        raise StartggError("Could not read current start.gg user from this token.")
-
     query = """
-query TournamentsByOwner($page: Int!, $perPage: Int!, $ownerId: ID!) {
-  tournaments(query: {
-    perPage: $perPage
-    page: $page
-    sortBy: "startAt desc"
-    filter: {
-      ownerId: $ownerId
-    }
-  }) {
-    pageInfo {
-      totalPages
-    }
-    nodes {
-      name
-      slug
-      startAt
+query AdminTournaments($page: Int!, $perPage: Int!) {
+  currentUser {
+    tournaments(query: {
+      perPage: $perPage
+      page: $page
+      sortBy: "startAt desc"
+      filter: { tournamentView: "admin" }
+    }) {
+      pageInfo { totalPages }
+      nodes {
+        name
+        slug
+        startAt
+      }
     }
   }
 }
@@ -136,8 +123,11 @@ query TournamentsByOwner($page: Int!, $perPage: Int!, $ownerId: ID!) {
     page = 1
     total_pages = 1
     while page <= total_pages:
-        payload = _graphql(token, query, {"ownerId": user_id, "perPage": per_page, "page": page})
-        tournaments = payload.get("data", {}).get("tournaments", {}) or {}
+        payload = _graphql(token, query, {"perPage": per_page, "page": page})
+        user = payload.get("data", {}).get("currentUser")
+        if not user:
+            raise StartggError("Could not read current start.gg user from this token.")
+        tournaments = user.get("tournaments", {}) or {}
         page_info = tournaments.get("pageInfo", {}) or {}
         total_pages = int(page_info.get("totalPages", total_pages) or total_pages)
         nodes = tournaments.get("nodes", []) or []
