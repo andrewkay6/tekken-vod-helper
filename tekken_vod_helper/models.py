@@ -36,17 +36,18 @@ class MatchSegment:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "MatchSegment":
-        raw_end = data.get("end", None)
+        raw_start = data.get("start", data.get("start_time", 0.0))
+        raw_end = data.get("end", data.get("end_time", None))
         end = None if raw_end is None or raw_end == "" else float(raw_end)
 
         return cls(
-            start=float(data.get("start", 0.0)),
+            start=float(raw_start or 0.0),
             end=end,
             player1=str(data.get("player1", "") or ""),
             player2=str(data.get("player2", "") or ""),
-            character1=str(data.get("character1", "") or ""),
-            character2=str(data.get("character2", "") or ""),
-            round_name=str(data.get("round_name", "") or ""),
+            character1=str(data.get("character1", data.get("char1", "")) or ""),
+            character2=str(data.get("character2", data.get("char2", "")) or ""),
+            round_name=str(data.get("round_name", data.get("round", "")) or ""),
             notes=str(data.get("notes", "") or ""),
         )
 
