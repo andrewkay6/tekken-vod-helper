@@ -130,6 +130,47 @@ def test_review_rows_do_not_auto_match_duplicate_metadata_titles():
     assert rows[0]["metadata"] == {}
 
 
+def test_auto_save_upload_matches_persists_all_unique_matches(tmp_path):
+    app = make_app(ProjectState())
+    app.upload_matches_path = tmp_path / "video_matches.json"
+    app.upload_video_matches = {}
+    app.upload_youtube_rows = [
+        {"video_id": "yt-001", "title": "Alice (Jin) vs Bob (King) - Winners Final"},
+        {"video_id": "yt-002", "title": "Carol (Nina) vs Dave (Lee) - Losers Final"},
+    ]
+    app.upload_metadata_by_id = {
+        "tvh-001-aaaaaa": {"metadata": {"title": "Alice (Jin) vs Bob (King) - Winners Final"}},
+        "tvh-002-bbbbbb": {"metadata": {"title": "Carol (Nina) vs Dave (Lee) - Losers Final"}},
+    }
+
+    matched = app._auto_save_upload_matches()
+
+    assert matched == 2
+    assert json.loads(app.upload_matches_path.read_text(encoding="utf-8")) == {
+        "yt-001": "tvh-001-aaaaaa",
+        "yt-002": "tvh-002-bbbbbb",
+    }
+    rows = app._upload_review_rows()
+    assert {row["match_method"] for row in rows if row.get("youtube_id")} == {"saved video ID"}
+
+
+def test_auto_save_upload_matches_does_not_override_existing_mapping(tmp_path):
+    app = make_app(ProjectState())
+    app.upload_matches_path = tmp_path / "video_matches.json"
+    app.upload_video_matches = {"yt-001": "tvh-999-manual"}
+    app.upload_matches_path.write_text(json.dumps(app.upload_video_matches), encoding="utf-8")
+    app.upload_youtube_rows = [{"video_id": "yt-001", "title": "Alice vs Bob"}]
+    app.upload_metadata_by_id = {
+        "tvh-001-aaaaaa": {"metadata": {"title": "Alice vs Bob"}},
+        "tvh-999-manual": {"metadata": {"title": "Manual match"}},
+    }
+
+    matched = app._auto_save_upload_matches()
+
+    assert matched == 0
+    assert json.loads(app.upload_matches_path.read_text(encoding="utf-8")) == {"yt-001": "tvh-999-manual"}
+
+
 def test_existing_metadata_long_title_keeps_tournament_name():
     app = make_app(ProjectState())
     core = "Alice (Alisa) vs Bob (Nina) - Winners Quarter-Final"

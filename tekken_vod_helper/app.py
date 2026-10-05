@@ -3518,8 +3518,15 @@ class TekkenVodHelperApp(AppWindow):
             self.show_copyable_error("Could not load metadata folder", exc)
             return
         self._set_upload_metadata_entries(entries)
+        try:
+            matched = self._auto_save_upload_matches()
+        except Exception as exc:
+            self.show_copyable_error("Could not save automatic video matches", exc)
+            return
         self._refresh_upload_review_tree()
         self.log("Loaded upload metadata from {}.".format(path))
+        if matched:
+            self.log("Auto-matched {} YouTube video{} from metadata.".format(matched, "" if matched == 1 else "s"))
 
     def refresh_upload_queue_metadata(self) -> None:
         self.apply_match_details(show_errors=False)
@@ -3724,7 +3731,14 @@ class TekkenVodHelperApp(AppWindow):
 
     def _refresh_youtube_video_tree(self, rows: List[Dict[str, str]]) -> None:
         self.upload_youtube_rows = [dict(row) for row in rows]
+        try:
+            matched = self._auto_save_upload_matches()
+        except Exception as exc:
+            self.show_copyable_error("Could not save automatic video matches", exc)
+            return
         self._refresh_upload_review_tree()
+        if matched:
+            self.log("Auto-matched {} YouTube video{} from metadata.".format(matched, "" if matched == 1 else "s"))
 
     def _refresh_upload_review_tree(self) -> None:
         if not hasattr(self, "upload_tree"):
@@ -3911,6 +3925,28 @@ class TekkenVodHelperApp(AppWindow):
         temporary.write_text(json.dumps(matches, indent=2) + "\n", encoding="utf-8")
         temporary.replace(path)
         self.upload_video_matches = matches
+
+    def _auto_save_upload_matches(self) -> int:
+        if not self.upload_youtube_rows or not self.upload_metadata_by_id or self.__dict__.get("upload_matches_path") is None:
+            return 0
+        existing = dict(self.__dict__.get("upload_video_matches", {}))
+        used_upload_ids = set(existing.values())
+        pairs: Dict[str, str] = {}
+        for row in self._upload_review_rows():
+            youtube_id = str(row.get("youtube_id", "") or "")
+            upload_id = str(row.get("upload_id", "") or "")
+            if not youtube_id or not upload_id or not row.get("metadata_entry"):
+                continue
+            if existing.get(youtube_id) == upload_id:
+                continue
+            if youtube_id in existing or upload_id in used_upload_ids or upload_id in pairs.values():
+                continue
+            pairs[youtube_id] = upload_id
+            used_upload_ids.add(upload_id)
+        if not pairs:
+            return 0
+        self._save_upload_matches(pairs)
+        return len(pairs)
 
     def choose_upload_match(self) -> None:
         index = self.upload_selected_review_index
