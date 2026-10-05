@@ -319,6 +319,44 @@ def test_go_to_selected_match_uses_seek_helper():
     assert calls == [120.0]
 
 
+def test_go_to_selected_match_end_uses_explicit_end():
+    state = ProjectState(
+        video_path="vod.mkv",
+        duration=600.0,
+        matches=[MatchSegment(start=10.0, end=88.125), MatchSegment(start=120.0)],
+    )
+    app = make_app(state)
+    calls = []
+    app._selected_tree_index = lambda: 0
+    app._ensure_vlc_player_for_seek = lambda: True
+    app._seek_to_time = calls.append
+    app.scrub_var = DummyVar()
+
+    app.go_to_selected_match_end()
+
+    assert app.scrub_var.get() == 88.125
+    assert calls == [88.125]
+
+
+def test_go_to_selected_match_end_uses_next_match_when_end_is_blank():
+    state = ProjectState(
+        video_path="vod.mkv",
+        duration=600.0,
+        matches=[MatchSegment(start=10.0), MatchSegment(start=120.0)],
+    )
+    app = make_app(state)
+    calls = []
+    app._selected_tree_index = lambda: 0
+    app._ensure_vlc_player_for_seek = lambda: True
+    app._seek_to_time = calls.append
+    app.scrub_var = DummyVar()
+
+    app.go_to_selected_match_end()
+
+    assert app.scrub_var.get() == 120.0
+    assert calls == [120.0]
+
+
 def test_project_state_round_trips_thumbnail_background():
     state = ProjectState(thumbnail_background_path="C:/thumbs/bg.jpg")
 

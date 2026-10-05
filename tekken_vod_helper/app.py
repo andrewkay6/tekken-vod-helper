@@ -832,7 +832,8 @@ class TekkenVodHelperApp(AppWindow):
         ttk.Button(mark_frame, text="End Now", command=self.set_selected_end_to_current_time).grid(row=1, column=1, sticky="w", padx=3, pady=(6, 0))
         ttk.Button(mark_frame, text="Insert New Match", command=self.mark_match_start).grid(row=1, column=2, sticky="w", padx=3, pady=(6, 0))
         ttk.Button(mark_frame, text="Go To Match", command=self.go_to_selected_match).grid(row=1, column=3, sticky="w", padx=3, pady=(6, 0))
-        ttk.Button(mark_frame, text="Delete Match", command=self.delete_selected_match).grid(row=1, column=4, sticky="w", padx=3, pady=(6, 0))
+        ttk.Button(mark_frame, text="Go To End", command=self.go_to_selected_match_end).grid(row=1, column=4, sticky="w", padx=3, pady=(6, 0))
+        ttk.Button(mark_frame, text="Delete Match", command=self.delete_selected_match).grid(row=1, column=5, sticky="w", padx=3, pady=(6, 0))
 
         ttk.Label(mark_frame, text="Start").grid(row=2, column=0, sticky="e", padx=(0, 3), pady=(6, 0))
         self.start_var = tk.StringVar(value="00:00:00.000")
@@ -3091,6 +3092,19 @@ class TekkenVodHelperApp(AppWindow):
         self._ensure_vlc_player_for_seek()
         self.scrub_var.set(start)
         self._seek_to_time(start)
+
+    def go_to_selected_match_end(self) -> None:
+        index = self._selected_tree_index()
+        if index is None:
+            return
+        matches = self.project_state.sorted_matches()
+        end = self._display_match_end(matches, index)
+        if end is None:
+            messagebox.showinfo("No end time", "The selected match does not have an end time yet.")
+            return
+        self._ensure_vlc_player_for_seek()
+        self.scrub_var.set(end)
+        self._seek_to_time(end)
 
     def set_selected_start_to_current_time(self) -> None:
         index = self._selected_tree_index()
