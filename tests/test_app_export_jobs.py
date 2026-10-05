@@ -64,6 +64,72 @@ def test_saved_match_survives_title_change_and_folder_reload(tmp_path):
     assert rows[0]["proposed_title"] == "Restored title"
 
 
+def test_metadata_folder_loads_sidecars_after_export_folder_is_moved(tmp_path):
+    export_root = tmp_path / "oct 01_matches"
+    upload_root = export_root / "_youtube_uploads"
+    match_folder = export_root / "01_Pillaibro_vs_gandhi_Dragunov_vs_Lee"
+    upload_root.mkdir(parents=True)
+    match_folder.mkdir()
+    metadata = match_folder / "youtube.json"
+    metadata.write_text(json.dumps({"upload_id": "tvh-001-388e6a", "title": "Restored title"}))
+    old_metadata_path = "C:/Users/KWTekken/Videos/oct 01_matches/01_Pillaibro_vs_gandhi_Dragunov_vs_Lee/youtube.json"
+    (upload_root / "manifest.json").write_text(
+        json.dumps(
+            {
+                "entries": [
+                    {
+                        "upload_id": "tvh-001-388e6a",
+                        "metadata_path": old_metadata_path,
+                        "match_folder": "01_Pillaibro_vs_gandhi_Dragunov_vs_Lee",
+                    }
+                ]
+            }
+        )
+    )
+    app = make_app(ProjectState())
+
+    app._set_upload_metadata_entries(app._read_upload_queue_entries(upload_root))
+
+    assert app.upload_metadata_by_id["tvh-001-388e6a"]["metadata"]["title"] == "Restored title"
+
+
+def test_review_rows_auto_match_unique_metadata_title_without_upload_id():
+    app = make_app(ProjectState())
+    app.upload_youtube_rows = [
+        {
+            "video_id": "video",
+            "title": "Pillaibro (Dragunov) vs gandhi (Lee) - Winners Round 1 - Basement Brawl #8 (CAFÉ EDITION)",
+        }
+    ]
+    app.upload_metadata_by_id = {
+        "tvh-001-388e6a": {
+            "metadata": {
+                "title": "Pillaibro (Dragunov) vs gandhi (Lee) - Winners Round 1 - Basement Brawl #8 (CAFÉ EDITION)"
+            }
+        }
+    }
+
+    rows = app._upload_review_rows()
+
+    assert rows[0]["upload_id"] == "tvh-001-388e6a"
+    assert rows[0]["proposed_title"].startswith("Pillaibro")
+    assert rows[0]["match_method"] == "metadata title"
+
+
+def test_review_rows_do_not_auto_match_duplicate_metadata_titles():
+    app = make_app(ProjectState())
+    app.upload_youtube_rows = [{"video_id": "video", "title": "Grand Final"}]
+    app.upload_metadata_by_id = {
+        "tvh-008-9df3e9": {"metadata": {"title": "Grand Final"}},
+        "tvh-009-1fee5a": {"metadata": {"title": "Grand Final"}},
+    }
+
+    rows = app._upload_review_rows()
+
+    assert rows[0]["upload_id"] == ""
+    assert rows[0]["metadata"] == {}
+
+
 def test_existing_metadata_long_title_keeps_tournament_name():
     app = make_app(ProjectState())
     core = "Alice (Alisa) vs Bob (Nina) - Winners Quarter-Final"

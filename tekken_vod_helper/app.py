@@ -7,6 +7,7 @@ import tempfile
 import tkinter as tk
 import ctypes
 import hashlib
+import unicodedata
 import urllib.request
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -3633,6 +3634,7 @@ class TekkenVodHelperApp(AppWindow):
             if not isinstance(entry, dict):
                 continue
             metadata_path = Path(str(entry.get("metadata_path", "") or ""))
+            metadata_path = self._resolve_relocated_upload_sidecar(manifest_path, entry, metadata_path, "youtube.json")
             metadata = {}
             if metadata_path.exists():
                 try:
@@ -3641,6 +3643,27 @@ class TekkenVodHelperApp(AppWindow):
                     metadata = {}
             result.append({**entry, "metadata": metadata})
         return result
+
+    def _resolve_relocated_upload_sidecar(
+        self,
+        manifest_path: Path,
+        entry: Dict[str, object],
+        configured_path: Path,
+        fallback_name: str,
+    ) -> Path:
+        if configured_path.exists():
+            return configured_path
+        export_root = manifest_path.parent.parent if manifest_path.parent.name == YOUTUBE_UPLOAD_DIRNAME else manifest_path.parent
+        match_folder = str(entry.get("match_folder", "") or "").strip()
+        candidates = []
+        if match_folder:
+            candidates.append(export_root / match_folder / fallback_name)
+        if configured_path.name:
+            candidates.append(export_root / configured_path.name)
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate
+        return configured_path
 
     def _upload_manifest_path(self, selected_path: Optional[Path] = None) -> Path:
         if selected_path is None:
@@ -3736,10 +3759,22 @@ class TekkenVodHelperApp(AppWindow):
         rows = []
         matched_ids = set()
         saved_matches = self.__dict__.get("upload_video_matches", {})
+        metadata_title_matches = self._upload_metadata_ids_by_title()
         candidates = {}
+        match_methods = {}
         for video in self.upload_youtube_rows:
             video_id = str(video.get("video_id", ""))
-            candidates[video_id] = saved_matches.get(video_id) or self._extract_upload_id(str(video.get("title", "") or ""))
+            title = str(video.get("title", "") or "")
+            saved_upload_id = saved_matches.get(video_id)
+            title_upload_id = self._extract_upload_id(title)
+            metadata_title_id = metadata_title_matches.get(self._upload_title_match_key(title), "")
+            candidates[video_id] = saved_upload_id or title_upload_id or metadata_title_id
+            if saved_upload_id:
+                match_methods[video_id] = "saved video ID"
+            elif title_upload_id:
+                match_methods[video_id] = "upload ID in title"
+            elif metadata_title_id:
+                match_methods[video_id] = "metadata title"
         reserved = set(saved_matches.values())
         for youtube_row in self.upload_youtube_rows:
             video_id = str(youtube_row.get("video_id", ""))
@@ -3752,7 +3787,7 @@ class TekkenVodHelperApp(AppWindow):
             metadata_entry = self.upload_metadata_by_id.get(upload_id) if upload_id else None
             if conflict:
                 metadata_entry = None
-            match_method = "saved video ID" if explicit else "upload ID in title"
+            match_method = match_methods.get(video_id, "upload ID in title")
             if upload_id and metadata_entry:
                 matched_ids.add(upload_id)
             metadata = metadata_entry.get("metadata", {}) if metadata_entry else {}
@@ -3839,6 +3874,30 @@ class TekkenVodHelperApp(AppWindow):
     def _extract_upload_id(self, text: str) -> str:
         match = YOUTUBE_UPLOAD_ID_PATTERN.search(text)
         return "tvh-{}-{}".format(match.group(1), match.group(2).lower()) if match else ""
+
+    def _upload_metadata_ids_by_title(self) -> Dict[str, str]:
+        by_title: Dict[str, str] = {}
+        duplicates = set()
+        for upload_id, entry in self.upload_metadata_by_id.items():
+            metadata = entry.get("metadata", {})
+            if not isinstance(metadata, dict):
+                metadata = {}
+            key = self._upload_title_match_key(str(metadata.get("title") or entry.get("video_file") or ""))
+            if not key:
+                continue
+            if key in by_title:
+                duplicates.add(key)
+            else:
+                by_title[key] = upload_id
+        for key in duplicates:
+            by_title.pop(key, None)
+        return by_title
+
+    def _upload_title_match_key(self, title: str) -> str:
+        if self._extract_upload_id(title):
+            title = YOUTUBE_UPLOAD_ID_PATTERN.sub("", title)
+        normalized = unicodedata.normalize("NFKD", title).encode("ascii", "ignore").decode("ascii")
+        return re.sub(r"[^a-z0-9]+", "", normalized.lower())
 
     def _save_upload_matches(self, pairs: Dict[str, str]) -> None:
         path = self.__dict__.get("upload_matches_path")
