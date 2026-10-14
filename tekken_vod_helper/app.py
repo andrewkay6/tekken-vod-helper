@@ -9,8 +9,9 @@ import ctypes
 import hashlib
 import unicodedata
 import urllib.request
+from collections import Counter
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 from typing import Dict, List, Optional, Tuple
 
 from .ffmpeg_tools import FfmpegError, extract_frame, probe_duration, require_tool, slice_clip
@@ -25,9 +26,10 @@ from .models import (
 )
 from .obs_client import ObsClient, ObsError
 from .overlay_server import OverlayServer
-from .startgg_client import BracketSet, TournamentSummary, fetch_bracket_sets, fetch_owned_tournaments, normalize_tournament_slug
+from .startgg_client import BracketSet, TournamentSummary, fetch_bracket_sets, fetch_owned_tournaments, fetch_top8_standings, normalize_tournament_slug
 from .thumbnails import Image, ImageTk, find_portrait, make_thumbnail
-from .util import parse_timestamp, safe_relative_name, seconds_to_timestamp, slugify, unique_sorted
+from .top8_graphics import Top8Player, make_top8_graphic
+from .util import normalize_key, parse_timestamp, safe_relative_name, seconds_to_timestamp, slugify, unique_sorted
 from .windows_credentials import (
     CredentialError,
     delete_startgg_token,
@@ -393,6 +395,8 @@ class TekkenVodHelperApp(AppWindow):
             self.export_button.configure(state=state)
         if hasattr(self, "metadata_button"):
             self.metadata_button.configure(state=state)
+        if hasattr(self, "top8_button"):
+            self.top8_button.configure(state=state)
 
     def _invoke_menu_command(self, command):
         command()
@@ -976,6 +980,12 @@ class TekkenVodHelperApp(AppWindow):
             command=self.generate_metadata_only,
         )
         self.metadata_button.grid(row=0, column=1, sticky="ew", padx=(4, 0))
+        self.top8_button = ttk.Button(
+            export_buttons,
+            text="Generate Top 8 Graphic",
+            command=self.generate_top8_graphic,
+        )
+        self.top8_button.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
 
     def _build_upload_manager_panel(self, parent: ttk.Frame) -> None:
         parent.columnconfigure(0, weight=1)
@@ -995,6 +1005,7 @@ class TekkenVodHelperApp(AppWindow):
         ttk.Label(metadata_actions, text="Metadata").grid(row=0, column=0, sticky="w", padx=(0, 6))
         ttk.Button(metadata_actions, text="Load Metadata Folder...", command=self.choose_upload_metadata_folder).grid(row=0, column=1, sticky="w")
         ttk.Button(metadata_actions, text="Match Selected Video...", command=self.choose_upload_match).grid(row=0, column=2, sticky="w", padx=(6, 0))
+        ttk.Button(metadata_actions, text="Match All Metadata", command=self.match_all_upload_metadata).grid(row=0, column=3, sticky="w", padx=(6, 0))
         ttk.Button(metadata_actions, text="Save All Pending Changes", command=self.save_all_pending_upload_changes).grid(row=1, column=1, columnspan=2, sticky="w", pady=(6, 0))
         self.submit_youtube_changes_button = ttk.Button(actions, text="Submit to YouTube...", command=self.submit_all_saved_upload_changes, style="Danger.TButton")
         self.submit_youtube_changes_button.grid(row=0, column=3, sticky="e", padx=(12, 0))
@@ -3265,6 +3276,154 @@ class TekkenVodHelperApp(AppWindow):
         self.export_thread.start()
         self.log("Started metadata-only generation for {} clips.".format(len(jobs)))
 
+    def generate_top8_graphic(self) -> None:
+        if self.export_thread and self.export_thread.is_alive():
+            messagebox.showinfo("Export running", "The current export is still running.")
+            return
+        self.apply_match_details(show_errors=False)
+        self._sync_paths_to_state()
+        if Image is None:
+            self.show_copyable_error("Pillow required", "Install Pillow with: pip install -r requirements.txt")
+            return
+
+        players = self._top8_players_for_graphic()
+        if not players:
+            self.show_copyable_error("No Top 8 data", "Add a start.gg tournament slug/token or project players before generating a Top 8 graphic.")
+            return
+
+        if not self._fill_missing_top8_characters(players):
+            return
+        footer_left = simpledialog.askstring("Top 8 footer", "Bottom-left quip:", initialvalue="", parent=self)
+        if footer_left is None:
+            return
+
+        output_root = Path(self._resolved_output_dir())
+        try:
+            output_root.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            self.show_copyable_error("Could not create output folder", exc)
+            return
+
+        event_slug = slugify(self.project_state.event_name or "top8", "top8")
+        output_path = output_root / "{}_top8.png".format(event_slug)
+        try:
+            make_top8_graphic(
+                players,
+                str(output_path),
+                event_name=self.project_state.event_name,
+                portrait_dir=self._resolved_portrait_dir(),
+                background_path=self.project_state.thumbnail_background_path,
+                bracket_url=self._top8_bracket_url(),
+                footer_left=footer_left,
+                logger=self.log,
+            )
+        except Exception as exc:
+            self.show_copyable_error("Could not generate Top 8 graphic", exc)
+            return
+        self._refresh_combo_values()
+        messagebox.showinfo("Top 8 graphic generated", "Saved Top 8 graphic:\n{}".format(output_path))
+
+    def _top8_players_for_graphic(self) -> List[Top8Player]:
+        token = self._current_startgg_token()
+        slug = normalize_tournament_slug(self.startgg_slug_var.get())
+        if token and slug:
+            try:
+                standings = fetch_top8_standings(token, slug)
+            except Exception as exc:
+                self.log("Could not fetch start.gg Top 8 standings: {}".format(exc))
+            else:
+                if standings:
+                    self.log("Loaded Top 8 standings from start.gg.")
+                    return [
+                        Top8Player(
+                            placement=entry.placement,
+                            name=entry.entrant_name,
+                            character=self._best_known_character_for_player(entry.entrant_name),
+                            social=entry.social,
+                        )
+                        for entry in standings
+                    ]
+
+        self.log("Using project player data for Top 8 graphic.")
+        return self._top8_players_from_project()
+
+    def _top8_players_from_project(self) -> List[Top8Player]:
+        ordered: List[str] = []
+        for player in self.project_state.players:
+            if player.strip():
+                ordered.append(player.strip())
+        counts: Counter[str] = Counter()
+        original_names: Dict[str, str] = {}
+        for match in self.project_state.matches:
+            for player in (match.player1, match.player2):
+                clean = player.strip()
+                key = self._player_character_key(clean)
+                if key:
+                    counts[key] += 1
+                    original_names.setdefault(key, clean)
+        for key, _count in counts.most_common():
+            if original_names[key] not in ordered:
+                ordered.append(original_names[key])
+        seen = set()
+        unique_players = []
+        for player in ordered:
+            key = self._player_character_key(player)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            unique_players.append(player)
+        return [
+            Top8Player(placement=index + 1, name=player, character=self._best_known_character_for_player(player))
+            for index, player in enumerate(unique_players[:8])
+        ]
+
+    def _fill_missing_top8_characters(self, players: List[Top8Player]) -> bool:
+        for player in players:
+            if player.character.strip():
+                continue
+            prompt = "Character for #{} {}:".format(player.placement, player.name)
+            value = simpledialog.askstring("Top 8 character", prompt, parent=self)
+            if value is None:
+                return False
+            character = value.strip()
+            if not character:
+                continue
+            player.character = character
+            self._remember_player_character(player.name, character)
+            self.project_state.characters = unique_sorted(self.project_state.characters + [character])
+        return True
+
+    def _best_known_character_for_player(self, player: str) -> str:
+        remembered = self._remembered_player_character(player)
+        if remembered:
+            return remembered
+        player_key = normalize_key(player)
+        for key, character in self.project_state.player_characters.items():
+            if normalize_key(key) == player_key:
+                return character
+        counts: Counter[str] = Counter()
+        for match in self.project_state.matches:
+            if self._names_match(player, match.player1) and match.character1.strip():
+                counts[match.character1.strip()] += 1
+            if self._names_match(player, match.player2) and match.character2.strip():
+                counts[match.character2.strip()] += 1
+        if counts:
+            return counts.most_common(1)[0][0]
+        return ""
+
+    def _names_match(self, left: str, right: str) -> bool:
+        left_key = normalize_key(left)
+        right_key = normalize_key(right)
+        if not left_key or not right_key:
+            return False
+        return left_key == right_key or left_key in right_key or right_key in left_key
+
+    def _top8_bracket_url(self) -> str:
+        slug = normalize_tournament_slug(self.startgg_slug_var.get())
+        if not slug:
+            return ""
+        return "start.gg/{}".format(slug)
+
     def _export_worker(self, jobs: List[ExportJob], output_dir: str) -> None:
         try:
             output_root = Path(output_dir)
@@ -3449,6 +3608,8 @@ class TekkenVodHelperApp(AppWindow):
             "tags": ["KW Tekken", "Tekken", "Tekken 8"],
             "privacy_status": "private",
             "self_declared_made_for_kids": False,
+            "embeddable": True,
+            "license": "youtube",
         }
 
     def _write_youtube_manifest(self, jobs: List[ExportJob], output_root: Path) -> None:
@@ -3648,6 +3809,12 @@ class TekkenVodHelperApp(AppWindow):
                     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
                 except json.JSONDecodeError:
                     metadata = {}
+            if isinstance(metadata, dict):
+                thumbnail_path = Path(str(metadata.get("thumbnail_path", "") or entry.get("thumbnail_path", "") or ""))
+                thumbnail_path = self._resolve_relocated_upload_sidecar(manifest_path, entry, thumbnail_path, "thumbnail.jpg")
+                if thumbnail_path.exists():
+                    metadata = dict(metadata)
+                    metadata["thumbnail_path"] = str(thumbnail_path)
             result.append({**entry, "metadata": metadata})
         return result
 
@@ -3947,6 +4114,29 @@ class TekkenVodHelperApp(AppWindow):
             return 0
         self._save_upload_matches(pairs)
         return len(pairs)
+
+    def match_all_upload_metadata(self) -> None:
+        if not self.upload_youtube_rows:
+            messagebox.showinfo("Load videos", "Load YouTube videos first.")
+            return
+        if not self.upload_metadata_by_id:
+            messagebox.showinfo("Load metadata", "Load an export metadata folder first.")
+            return
+        if self.__dict__.get("upload_matches_path") is None:
+            messagebox.showinfo("Load metadata", "Load an export metadata folder first.")
+            return
+        try:
+            matched = self._auto_save_upload_matches()
+        except Exception as exc:
+            self.show_copyable_error("Could not save automatic video matches", exc)
+            return
+        self._refresh_upload_review_tree()
+        if matched:
+            message = "Matched {} YouTube video{} from metadata.".format(matched, "" if matched == 1 else "s")
+        else:
+            message = "No new unambiguous metadata matches were found."
+        self.upload_manager_status_var.set(message)
+        self.log(message)
 
     def choose_upload_match(self) -> None:
         index = self.upload_selected_review_index
@@ -4361,15 +4551,10 @@ class TekkenVodHelperApp(AppWindow):
         self._confirm_and_submit_upload_payloads(rows)
 
     def _confirm_and_submit_upload_payloads(self, rows: List[Dict[str, object]]) -> None:
-        details = "\n\n".join(self._upload_change_detail_text(row) for row in rows)
         playlist_var = self.__dict__.get("upload_playlist_var")
         playlist_label = playlist_var.get() if playlist_var else "No playlist change"
         playlist_id = self.__dict__.get("upload_playlist_choices", {}).get(playlist_label, "")
-        details += "\n\nPlaylist for all submitted videos: {}".format(playlist_label)
-        if not messagebox.askyesno(
-            "Submit changes to YouTube?",
-            "This will submit metadata changes to YouTube and cannot be undone automatically.\n\nVideos:\n{}".format(details),
-        ):
+        if not self._confirm_youtube_metadata_submit(rows, playlist_label):
             return
         self.log("YouTube submit confirmed for {} video{}: {}".format(
             len(rows),
@@ -4392,6 +4577,59 @@ class TekkenVodHelperApp(AppWindow):
         thread = threading.Thread(target=self._submit_youtube_changes_worker, args=(payloads,), daemon=True)
         thread.start()
 
+    def _upload_submit_confirmation_text(self, rows: List[Dict[str, object]], playlist_label: str) -> str:
+        details = "\n\n".join(self._upload_change_detail_text(row) for row in rows)
+        return (
+            "This will submit metadata changes to YouTube and cannot be undone automatically.\n\n"
+            "Videos:\n{}\n\nPlaylist for all submitted videos: {}".format(details, playlist_label)
+        )
+
+    def _confirm_youtube_metadata_submit(self, rows: List[Dict[str, object]], playlist_label: str) -> bool:
+        dialog = tk.Toplevel(self)
+        dialog.title("Submit changes to YouTube?")
+        dialog.transient(self)
+        dialog.grab_set()
+        dialog.geometry("920x620")
+        dialog.minsize(640, 420)
+        dialog.columnconfigure(0, weight=1)
+        dialog.rowconfigure(0, weight=1)
+
+        body = ttk.Frame(dialog, padding=10)
+        body.grid(row=0, column=0, sticky="nsew")
+        body.columnconfigure(0, weight=1)
+        body.rowconfigure(1, weight=1)
+
+        ttk.Label(
+            body,
+            text="Review the changes below before submitting them to YouTube.",
+            anchor="w",
+        ).grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+
+        details_text = tk.Text(body, height=20, width=100, wrap="word")
+        self._style_text_widget(details_text)
+        details_text.grid(row=1, column=0, sticky="nsew")
+        details_text.insert("1.0", self._upload_submit_confirmation_text(rows, playlist_label))
+        details_text.configure(state="disabled")
+        scroll = ttk.Scrollbar(body, orient="vertical", command=details_text.yview)
+        scroll.grid(row=1, column=1, sticky="ns")
+        details_text.configure(yscrollcommand=scroll.set)
+
+        confirmed = {"value": False}
+
+        def confirm() -> None:
+            confirmed["value"] = True
+            dialog.destroy()
+
+        buttons = ttk.Frame(body)
+        buttons.grid(row=2, column=0, columnspan=2, sticky="e", pady=(10, 0))
+        ttk.Button(buttons, text="Cancel", command=dialog.destroy).grid(row=0, column=0, padx=(0, 6))
+        ttk.Button(buttons, text="Submit to YouTube", command=confirm, style="Danger.TButton").grid(row=0, column=1)
+
+        dialog.bind("<Escape>", lambda _event: dialog.destroy())
+        details_text.focus_set()
+        dialog.wait_window()
+        return confirmed["value"]
+
     def _submit_youtube_changes_worker(self, payloads: List[Dict[str, object]]) -> None:
         results = []
         try:
@@ -4409,6 +4647,8 @@ class TekkenVodHelperApp(AppWindow):
                     tags=[str(tag) for tag in update.get("tags", [])] if isinstance(update.get("tags"), list) else [],
                     privacy_status=str(update.get("privacy_status", "") or "private"),
                     self_declared_made_for_kids=bool(update.get("self_declared_made_for_kids", False)),
+                    embeddable=bool(update.get("embeddable", True)),
+                    license=str(update.get("license", "") or "youtube"),
                     thumbnail_path=str(update.get("thumbnail_path", "") or ""),
                 )
                 results.append(
@@ -4447,6 +4687,8 @@ class TekkenVodHelperApp(AppWindow):
             ("Visibility", youtube_row.get("privacy_status", ""), metadata.get("privacy_status", "")),
             ("Thumbnail", "", metadata.get("thumbnail_path", "")),
             ("Made for kids", "", "No" if metadata.get("self_declared_made_for_kids") is False else str(metadata.get("self_declared_made_for_kids", ""))),
+            ("Embeddable", "", "Yes" if metadata.get("embeddable", True) is True else "No"),
+            ("License", "", str(metadata.get("license", "") or "youtube")),
         ]
         for label, before, after in comparisons:
             before_text = str(before or "").strip()
@@ -4454,7 +4696,7 @@ class TekkenVodHelperApp(AppWindow):
             if label == "Description":
                 before_text = "{} chars".format(len(before_text)) if before_text else "empty"
                 after_text = "{} chars".format(len(after_text)) if after_text else "empty"
-            if before_text != after_text or label in ("Thumbnail", "Made for kids"):
+            if before_text != after_text or label in ("Thumbnail", "Made for kids", "Embeddable", "License"):
                 if before_text:
                     fields.append("  {}: {} -> {}".format(label, before_text, after_text or "empty"))
                 else:
@@ -4563,6 +4805,8 @@ class TekkenVodHelperApp(AppWindow):
                 "thumbnail_path": metadata.get("thumbnail_path", ""),
                 "privacy_status": metadata.get("privacy_status", "private"),
                 "self_declared_made_for_kids": False,
+                "embeddable": bool(metadata.get("embeddable", True)),
+                "license": str(metadata.get("license", "") or "youtube"),
             },
             "current": {
                 "title": youtube_row.get("title", ""),

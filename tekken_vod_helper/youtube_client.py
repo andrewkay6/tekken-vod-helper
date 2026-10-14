@@ -150,6 +150,8 @@ def update_video_metadata(
     tags: Optional[List[str]] = None,
     privacy_status: str = "private",
     self_declared_made_for_kids: bool = False,
+    embeddable: bool = True,
+    license: str = "youtube",
     thumbnail_path: str = "",
     access_token: Optional[str] = None,
 ) -> Dict[str, Any]:
@@ -165,6 +167,8 @@ def update_video_metadata(
         "status": {
             "privacyStatus": privacy_status,
             "selfDeclaredMadeForKids": bool(self_declared_made_for_kids),
+            "embeddable": bool(embeddable),
+            "license": license or "youtube",
         },
     }
     response = _api_put_json("/videos", token, {"part": "snippet,status"}, payload)

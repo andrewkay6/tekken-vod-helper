@@ -3,7 +3,7 @@ from tekken_vod_helper.models import MatchSegment, OverlayState, ProjectState
 from tekken_vod_helper import startgg_client
 from tekken_vod_helper import ffmpeg_tools
 from tekken_vod_helper.overlay_server import OverlayServer
-from tekken_vod_helper.startgg_client import BracketSet, TournamentSummary, parse_tournament_sets, normalize_tournament_slug
+from tekken_vod_helper.startgg_client import BracketSet, TournamentSummary, parse_top8_standings, parse_tournament_sets, normalize_tournament_slug
 
 
 def make_app(state):
@@ -693,5 +693,52 @@ def test_startgg_owned_tournaments_reads_all_pages(monkeypatch):
         "tournament/recent-1",
         "tournament/recent-2",
         "tournament/older",
+    ]
+
+
+def test_startgg_parse_top8_standings_uses_largest_event():
+    standings = parse_top8_standings(
+        {
+            "events": [
+                {
+                    "name": "Side Event",
+                    "standings": {
+                        "nodes": [
+                            {"placement": 1, "entrant": {"name": "Side Winner"}},
+                        ]
+                    },
+                },
+                {
+                    "name": "Tekken 8 Singles",
+                    "standings": {
+                        "nodes": [
+                            {"placement": 2, "entrant": {"name": "Bob [preview_1]"}},
+                            {
+                                "placement": 1,
+                                "entrant": {
+                                    "name": "Alice",
+                                    "participants": [
+                                        {
+                                            "player": {
+                                                "user": {
+                                                    "authorizations": [
+                                                        {"type": "TWITTER", "externalUsername": "alice_tk"},
+                                                    ]
+                                                }
+                                            }
+                                        }
+                                    ],
+                                },
+                            },
+                        ]
+                    },
+                },
+            ]
+        }
+    )
+
+    assert [(entry.placement, entry.entrant_name, entry.event_name, entry.social) for entry in standings] == [
+        (1, "Alice", "Tekken 8 Singles", "alice_tk"),
+        (2, "Bob", "Tekken 8 Singles", ""),
     ]
 from pathlib import Path

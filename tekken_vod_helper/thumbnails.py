@@ -138,6 +138,9 @@ def _paste_portrait(overlay, portrait_path: Optional[Path], box: Tuple[int, int,
 
 def _font(size: int, bold: bool):
     names = ["arialbd.ttf", "Arial Bold.ttf"] if bold else ["arial.ttf", "Arial.ttf"]
+    windows_fonts = Path("C:/Windows/Fonts")
+    if windows_fonts.exists():
+        names = [str(windows_fonts / ("arialbd.ttf" if bold else "arial.ttf"))] + names
     for name in names:
         try:
             return ImageFont.truetype(name, size=size)

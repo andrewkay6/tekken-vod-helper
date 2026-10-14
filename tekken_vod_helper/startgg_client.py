@@ -43,6 +43,14 @@ class TournamentSummary:
         return "{} ({})".format(self.name, self.slug)
 
 
+@dataclass
+class StandingEntry:
+    placement: int
+    entrant_name: str
+    event_name: str = ""
+    social: str = ""
+
+
 def normalize_tournament_slug(value: str) -> str:
     value = value.strip()
     match = re.search(r"start\.gg/(?:tournament/)?([^/?#]+)", value)
@@ -154,6 +162,76 @@ query TournamentsByOwner($page: Int!, $perPage: Int!, $ownerId: ID!) {
     return results
 
 
+def fetch_top8_standings(token: str, tournament_slug: str) -> List[StandingEntry]:
+    if not token.strip():
+        raise StartggError("Enter a start.gg token first.")
+    slug = normalize_tournament_slug(tournament_slug)
+    if not slug:
+        raise StartggError("Enter a start.gg tournament slug or URL first.")
+
+    query = """
+query TournamentTop8($slug: String!) {
+  tournament(slug: $slug) {
+    events {
+      name
+      standings(query: {page: 1, perPage: 8}) {
+        nodes {
+          placement
+          entrant {
+            id
+            name
+            participants {
+              gamerTag
+              player {
+                gamerTag
+                user {
+                  authorizations {
+                    type
+                    externalUsername
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+"""
+    try:
+        payload = _graphql(token, query, {"slug": slug})
+    except StartggError as exc:
+        if "Cannot query field" not in str(exc) and "authorizations" not in str(exc):
+            raise
+        payload = _graphql(token, _top8_standings_query_without_socials(), {"slug": slug})
+    tournament = payload.get("data", {}).get("tournament")
+    if not tournament:
+        raise StartggError("No tournament found for {}.".format(slug))
+    return parse_top8_standings(tournament)
+
+
+def _top8_standings_query_without_socials() -> str:
+    return """
+query TournamentTop8($slug: String!) {
+  tournament(slug: $slug) {
+    events {
+      name
+      standings(query: {page: 1, perPage: 8}) {
+        nodes {
+          placement
+          entrant {
+            id
+            name
+          }
+        }
+      }
+    }
+  }
+}
+"""
+
+
 def parse_tournament_sets(tournament: Dict[str, Any]) -> List[BracketSet]:
     results: List[BracketSet] = []
     for event in tournament.get("events", []) or []:
@@ -183,6 +261,36 @@ def parse_tournament_sets(tournament: Dict[str, Any]) -> List[BracketSet]:
     return results
 
 
+def parse_top8_standings(tournament: Dict[str, Any]) -> List[StandingEntry]:
+    events = tournament.get("events", []) or []
+    best: List[StandingEntry] = []
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        event_name = str(event.get("name", "") or "")
+        nodes = event.get("standings", {}).get("nodes", []) or []
+        entries: List[StandingEntry] = []
+        for node in nodes:
+            if not isinstance(node, dict):
+                continue
+            entrant = node.get("entrant") if isinstance(node.get("entrant"), dict) else {}
+            name = _clean_entrant_name(str(entrant.get("name", "") or ""))
+            placement = int(node.get("placement", 0) or 0)
+            if placement > 0 and name:
+                entries.append(
+                    StandingEntry(
+                        placement=placement,
+                        entrant_name=name,
+                        event_name=event_name,
+                        social=_entrant_social(entrant),
+                    )
+                )
+        entries.sort(key=lambda item: item.placement)
+        if len(entries) >= len(best):
+            best = entries
+    return best[:8]
+
+
 def _slot_name(slot: Dict[str, Any]) -> str:
     entrant = slot.get("entrant") if isinstance(slot, dict) else None
     if not isinstance(entrant, dict):
@@ -193,6 +301,28 @@ def _slot_name(slot: Dict[str, Any]) -> str:
 def _clean_entrant_name(name: str) -> str:
     cleaned = re.sub(r"\s*\[preview_[^\]]+\]", "", name)
     return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def _entrant_social(entrant: Dict[str, Any]) -> str:
+    participants = entrant.get("participants", []) if isinstance(entrant, dict) else []
+    for participant in participants or []:
+        if not isinstance(participant, dict):
+            continue
+        player = participant.get("player") if isinstance(participant.get("player"), dict) else {}
+        user = player.get("user") if isinstance(player.get("user"), dict) else {}
+        for authorization in user.get("authorizations", []) or []:
+            if not isinstance(authorization, dict):
+                continue
+            username = str(authorization.get("externalUsername", "") or "").strip()
+            kind = str(authorization.get("type", "") or "").casefold()
+            if username and kind in {"twitter", "x", "twitch", "instagram"}:
+                return username
+        for authorization in user.get("authorizations", []) or []:
+            if isinstance(authorization, dict):
+                username = str(authorization.get("externalUsername", "") or "").strip()
+                if username:
+                    return username
+    return ""
 
 
 def _slot_parent_set_ids(slots: List[Dict[str, Any]]) -> List[str]:

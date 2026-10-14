@@ -157,6 +157,8 @@ def test_update_video_metadata_sends_status_and_thumbnail(monkeypatch):
         tags=["Tekken 8", "KWTekken"],
         privacy_status="unlisted",
         self_declared_made_for_kids=False,
+        embeddable=True,
+        license="youtube",
         thumbnail_path="C:/tmp/thumb.jpg",
     )
 
@@ -175,4 +177,6 @@ def test_update_video_metadata_sends_status_and_thumbnail(monkeypatch):
     assert payload["status"] == {
         "privacyStatus": "unlisted",
         "selfDeclaredMadeForKids": False,
+        "embeddable": True,
+        "license": "youtube",
     }

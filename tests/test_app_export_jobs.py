@@ -8,6 +8,7 @@ import pytest
 from tekken_vod_helper import app as app_module
 from tekken_vod_helper.app import TekkenVodHelperApp
 from tekken_vod_helper.models import DEFAULT_DESCRIPTION_BOILERPLATE, ExportJob, MatchSegment, ProjectState
+from tekken_vod_helper.top8_graphics import Top8Player, make_top8_graphic
 
 
 def make_app(state):
@@ -18,6 +19,58 @@ def make_app(state):
     app.log = app.log_messages.append
     app._thread_log = app.log_messages.append
     return app
+
+
+def test_top8_graphic_renders_png(tmp_path):
+    if app_module.Image is None:
+        pytest.skip("Pillow is not installed")
+    portrait_dir = tmp_path / "portraits"
+    portrait_dir.mkdir()
+    portrait = app_module.Image.new("RGBA", (240, 320), (220, 32, 48, 255))
+    portrait.save(portrait_dir / "Jin.png")
+    output = tmp_path / "top8.png"
+
+    make_top8_graphic(
+        [Top8Player(placement=1, name="Alice", character="Jin")],
+        str(output),
+        event_name="Basement Brawl #8",
+        portrait_dir=str(portrait_dir),
+    )
+
+    image = app_module.Image.open(output)
+    assert image.size == (1280, 720)
+
+
+def test_top8_players_infer_characters_from_matches():
+    state = ProjectState(
+        players=["Alice", "Bob"],
+        matches=[
+            MatchSegment(start=0, player1="Alice", player2="Bob", character1="Jin", character2="King"),
+            MatchSegment(start=10, player1="Alice", player2="Carol", character1="Jin", character2="Jun"),
+        ],
+    )
+    app = make_app(state)
+
+    players = app._top8_players_from_project()
+
+    assert [(player.placement, player.name, player.character) for player in players[:3]] == [
+        (1, "Alice", "Jin"),
+        (2, "Bob", "King"),
+        (3, "Carol", "Jun"),
+    ]
+
+
+def test_top8_missing_character_prompt_remembers_value(monkeypatch):
+    state = ProjectState(characters=["Jin"])
+    app = make_app(state)
+    monkeypatch.setattr(app_module.simpledialog, "askstring", lambda *_args, **_kwargs: "Jun")
+
+    players = [Top8Player(placement=1, name="Alice")]
+
+    assert app._fill_missing_top8_characters(players)
+    assert players[0].character == "Jun"
+    assert state.player_characters == {"alice": "Jun"}
+    assert "Jun" in state.characters
 
 
 @pytest.mark.parametrize("title", [
@@ -70,8 +123,18 @@ def test_metadata_folder_loads_sidecars_after_export_folder_is_moved(tmp_path):
     match_folder = export_root / "01_Pillaibro_vs_gandhi_Dragunov_vs_Lee"
     upload_root.mkdir(parents=True)
     match_folder.mkdir()
+    thumbnail = match_folder / "thumbnail.jpg"
+    thumbnail.write_bytes(b"jpeg-ish")
     metadata = match_folder / "youtube.json"
-    metadata.write_text(json.dumps({"upload_id": "tvh-001-388e6a", "title": "Restored title"}))
+    metadata.write_text(
+        json.dumps(
+            {
+                "upload_id": "tvh-001-388e6a",
+                "title": "Restored title",
+                "thumbnail_path": "C:/Users/KWTekken/Videos/oct 01_matches/01_Pillaibro_vs_gandhi_Dragunov_vs_Lee/thumbnail.jpg",
+            }
+        )
+    )
     old_metadata_path = "C:/Users/KWTekken/Videos/oct 01_matches/01_Pillaibro_vs_gandhi_Dragunov_vs_Lee/youtube.json"
     (upload_root / "manifest.json").write_text(
         json.dumps(
@@ -90,7 +153,9 @@ def test_metadata_folder_loads_sidecars_after_export_folder_is_moved(tmp_path):
 
     app._set_upload_metadata_entries(app._read_upload_queue_entries(upload_root))
 
-    assert app.upload_metadata_by_id["tvh-001-388e6a"]["metadata"]["title"] == "Restored title"
+    loaded = app.upload_metadata_by_id["tvh-001-388e6a"]["metadata"]
+    assert loaded["title"] == "Restored title"
+    assert loaded["thumbnail_path"] == str(thumbnail)
 
 
 def test_review_rows_auto_match_unique_metadata_title_without_upload_id():
@@ -169,6 +234,24 @@ def test_auto_save_upload_matches_does_not_override_existing_mapping(tmp_path):
 
     assert matched == 0
     assert json.loads(app.upload_matches_path.read_text(encoding="utf-8")) == {"yt-001": "tvh-999-manual"}
+
+
+def test_match_all_upload_metadata_saves_and_refreshes_rows(tmp_path):
+    app = make_app(ProjectState())
+    app.upload_matches_path = tmp_path / "video_matches.json"
+    app.upload_video_matches = {}
+    app.upload_youtube_rows = [{"video_id": "yt-001", "title": "Alice vs Bob"}]
+    app.upload_metadata_by_id = {"tvh-001-aaaaaa": {"metadata": {"title": "Alice vs Bob"}}}
+    app.upload_manager_status_var = DummyVar()
+    refreshed = []
+    app._refresh_upload_review_tree = lambda: refreshed.append(True)
+
+    app.match_all_upload_metadata()
+
+    assert json.loads(app.upload_matches_path.read_text(encoding="utf-8")) == {"yt-001": "tvh-001-aaaaaa"}
+    assert refreshed == [True]
+    assert app.upload_manager_status_var.get() == "Matched 1 YouTube video from metadata."
+    assert "Matched 1 YouTube video from metadata." in app.log_messages
 
 
 def test_existing_metadata_long_title_keeps_tournament_name():
@@ -657,6 +740,8 @@ def test_sample_project_generates_upload_metadata_and_dry_run_payloads(tmp_path)
     assert first_metadata["end_timestamp"] == "00:16:02.377"
     assert first_metadata["privacy_status"] == "private"
     assert first_metadata["self_declared_made_for_kids"] is False
+    assert first_metadata["embeddable"] is True
+    assert first_metadata["license"] == "youtube"
     assert DEFAULT_DESCRIPTION_BOILERPLATE in first_metadata["description"]
     assert first_match["clip"] == Path(first_job.clip_path).name
     assert first_match["duration"] == pytest.approx(742.708)
@@ -689,6 +774,8 @@ def test_sample_project_generates_upload_metadata_and_dry_run_payloads(tmp_path)
     assert dry_run["update"]["thumbnail_path"] == first_job.thumbnail_path
     assert dry_run["update"]["privacy_status"] == "private"
     assert dry_run["update"]["self_declared_made_for_kids"] is False
+    assert dry_run["update"]["embeddable"] is True
+    assert dry_run["update"]["license"] == "youtube"
 
 
 def test_upload_detail_selection_does_not_fetch_remote_thumbnail(monkeypatch):
@@ -760,6 +847,8 @@ def test_upload_change_detail_text_groups_fields_by_video():
             "privacy_status": "public",
             "thumbnail_path": "C:/thumb.jpg",
             "self_declared_made_for_kids": False,
+            "embeddable": True,
+            "license": "youtube",
         },
     }
 
@@ -770,3 +859,30 @@ def test_upload_change_detail_text_groups_fields_by_video():
     assert "  Visibility: private -> public" in details
     assert "  Thumbnail: C:/thumb.jpg" in details
     assert "  Made for kids: No" in details
+    assert "  Embeddable: Yes" in details
+    assert "  License: youtube" in details
+
+
+def test_upload_submit_confirmation_text_includes_all_rows_and_playlist():
+    app = make_app(ProjectState())
+    rows = [
+        {
+            "youtube_id": "yt-001",
+            "current_title": "Old title 1",
+            "youtube": {"title": "Old title 1"},
+            "metadata": {"title": "New title 1"},
+        },
+        {
+            "youtube_id": "yt-002",
+            "current_title": "Old title 2",
+            "youtube": {"title": "Old title 2"},
+            "metadata": {"title": "New title 2"},
+        },
+    ]
+
+    text = app._upload_submit_confirmation_text(rows, "Basement Brawl #8")
+
+    assert "cannot be undone automatically" in text
+    assert "Old title 1 (yt-001)" in text
+    assert "Old title 2 (yt-002)" in text
+    assert "Playlist for all submitted videos: Basement Brawl #8" in text
