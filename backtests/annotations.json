@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "purpose": "Evaluator-only dataset caveats; never supplied to autonomous detection.",
+  "events": {
+    "BB7": {
+      "source_id": "W_rDl7ZWvuQ",
+      "historical_project": "projects/sep19.tvh.json",
+      "caveats": [
+        {
+          "type": "possible_false_start",
+          "status": "unlocated",
+          "origin": "User recollection, 2026-10-19",
+          "description": "One attempt did not finish properly and was not an actual bracket match. Probably closer to the middle than the end; a larger than average gap may help locate it.",
+          "label_guided_candidates": [
+            {
+              "start": 3660.181,
+              "end": 4083.87,
+              "gap_seconds": 423.689
+            },
+            {
+              "start": 4716.98,
+              "end": 5032.181,
+              "gap_seconds": 315.201
+            }
+          ],
+          "verification": "Still unlocated. H.264 HLS sampling succeeded in both candidate gaps at 20-second intervals. A separate local Qwen contact-sheet diagnostic observed setup/downtime and no active gameplay in those sampled frames; this does not rule out brief missed play or establish bracket validity.",
+          "handling": "Inspect long inter-set gaps and long saved cuts as label-guided diagnostics. A gap is not proof. Do not remove historical labels or exclude a prediction until the attempt is identified and verified. Keep raw historical agreement metrics.",
+          "verification_history": [
+            "Unverified: public-media extraction returned HTTP 403, then a fresh-URL attempt stalled and was stopped. No bracket-status conclusion was made."
+          ],
+          "diagnostic_artifact": "build/work/boundary-evaluation/bb7-false-start-diagnostic-v5/diagnostic.json",
+          "followup_diagnostics": {
+            "sample_intervals_seconds": [
+              2,
+              1
+            ],
+            "artifact": "build/work/boundary-evaluation/bb7-false-start-continuation-v7/diagnostic.json",
+            "conclusion": "Still unlocated. A model claim of black frames at 5075-5079s was contradicted by pixel checks on overlapping samples (gameplay-region mean luminance about103-106/255). The one-second continuation diagnostic reported a normal round continuation. Contact-sheet model descriptions are not authoritative labels; no exclusion was added."
+          }
+        }
+      ]
+    }
+  }
+}

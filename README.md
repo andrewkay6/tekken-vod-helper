@@ -64,6 +64,10 @@ pip install -r requirements.txt
 
 ## Run
 
+The recovered local match detector and streamed, Qwen-driven historical backtests
+share the same pipeline: see [boundary detection and backtesting](docs/boundary-workflow.md).
+Its runtime context follows [the recovered cutting policy](docs/cutting-policy.md).
+
 ```powershell
 python -m tekken_vod_helper
 ```

@@ -1,0 +1,172 @@
+{
+  "date": "2026-10-19",
+  "claim": "Integration tested; autonomous boundary accuracy failed acceptance at 5-second cut tolerance.",
+  "classification_policy_snapshot": "docs/boundary-history/cutting-policy-baseline-v1.md",
+  "annotation_policy": "Original labels retained. Unlocated BB7 false start has no scoring exclusion.",
+  "runs": [
+    {
+      "source_id": "yt:W_rDl7ZWvuQ",
+      "split": "calibration",
+      "evaluated_seconds": 1200,
+      "historical_project": "backtests/projects/sep19.tvh.json",
+      "truth_sha256": "39820d4869f8b3b276cebc5c1ff6ec8caad841260ebb1e175149ae64532ff9f5",
+      "classification_policy_hash": "e28b3ee31ecb4ea6",
+      "model": "qwen3.8-27b",
+      "model_calls": 20,
+      "local_qwen_tokens": 111560,
+      "eligible_references": 1,
+      "score": {
+        "predicted_count": 0,
+        "reference_count": 9,
+        "excluded_references": [
+          {
+            "index": 1,
+            "reason": "ends after range (1357.178>1200.0)"
+          },
+          {
+            "index": 2,
+            "reason": "ends after range (2309.716>1200.0)"
+          },
+          {
+            "index": 3,
+            "reason": "ends after range (2942.378>1200.0)"
+          },
+          {
+            "index": 4,
+            "reason": "ends after range (3660.181>1200.0)"
+          },
+          {
+            "index": 5,
+            "reason": "ends after range (4716.98>1200.0)"
+          },
+          {
+            "index": 6,
+            "reason": "ends after range (5724.826>1200.0)"
+          },
+          {
+            "index": 7,
+            "reason": "ends after range (6648.895>1200.0)"
+          },
+          {
+            "index": 8,
+            "reason": "ends after range (8614.217>1200.0)"
+          }
+        ],
+        "matches": [],
+        "unmatched_predictions": [],
+        "unmatched_references": [
+          0
+        ],
+        "true_positives": 0,
+        "false_positives": 0,
+        "false_negatives": 1,
+        "precision": null,
+        "recall": 0.0,
+        "start_mae": null,
+        "end_mae": null,
+        "within_tolerance_start": 0,
+        "within_tolerance_end": 0,
+        "within_tolerance_both": 0
+      },
+      "unresolved_truth_ends": [],
+      "refinement_status": "aborted_remote_media_failures",
+      "baseline_report": "build\\work\\boundary-evaluation\\bb7-agentic-20m-v1\\coarse-only-recovery\\backtest-report.json",
+      "guarded_replay": {
+        "report": "build\\work\\boundary-evaluation\\bb7-agentic-20m-v1\\proposal-v2-replay\\backtest-report.json",
+        "additional_model_calls": 0,
+        "true_positives": 0,
+        "false_positives": 0,
+        "false_negatives": 1
+      }
+    },
+    {
+      "source_id": "yt:58_t7LLUWPg",
+      "split": "heldout",
+      "evaluated_seconds": 1800,
+      "historical_project": "backtests/projects/BB5.tvh.json",
+      "truth_sha256": "e8fede7f562bdf76c2a5f1f73a518971a4876555587c8f3543c0e6c56817053b",
+      "classification_policy_hash": "e28b3ee31ecb4ea6",
+      "model": "qwen3.8-27b",
+      "model_calls": 39,
+      "local_qwen_tokens": 214085,
+      "eligible_references": 2,
+      "score": {
+        "predicted_count": 1,
+        "reference_count": 11,
+        "excluded_references": [
+          {
+            "index": 2,
+            "reason": "ends after range (2665.562>1800.0)"
+          },
+          {
+            "index": 3,
+            "reason": "ends after range (2882.796>1800.0)"
+          },
+          {
+            "index": 4,
+            "reason": "ends after range (3326.456>1800.0)"
+          },
+          {
+            "index": 5,
+            "reason": "ends after range (4045.191>1800.0)"
+          },
+          {
+            "index": 6,
+            "reason": "ends after range (4796.841>1800.0)"
+          },
+          {
+            "index": 7,
+            "reason": "ends after range (5916.16>1800.0)"
+          },
+          {
+            "index": 8,
+            "reason": "ends after range (6852.879>1800.0)"
+          },
+          {
+            "index": 9,
+            "reason": "ends after range (7366.091>1800.0)"
+          },
+          {
+            "index": 10,
+            "reason": "starts after evaluated range (unobserved end)"
+          }
+        ],
+        "matches": [
+          {
+            "prediction_index": 0,
+            "reference_index": 1,
+            "iou": 0.7463402957551687,
+            "start_error": -44.577,
+            "end_error": -98.48199999999997
+          }
+        ],
+        "unmatched_predictions": [],
+        "unmatched_references": [
+          0
+        ],
+        "true_positives": 1,
+        "false_positives": 0,
+        "false_negatives": 1,
+        "precision": 1.0,
+        "recall": 0.5,
+        "start_mae": 44.577,
+        "end_mae": 98.48199999999997,
+        "within_tolerance_start": 0,
+        "within_tolerance_end": 0,
+        "within_tolerance_both": 0
+      },
+      "unresolved_truth_ends": [
+        10
+      ],
+      "refinement_status": "partial_failure_reporting_unavailable",
+      "baseline_report": "build\\work\\boundary-evaluation\\bb5-heldout-30m-v1\\backtest-report.json",
+      "guarded_replay": {
+        "report": "build\\work\\boundary-evaluation\\bb5-heldout-30m-v1\\proposal-v2-replay\\backtest-report.json",
+        "additional_model_calls": 0,
+        "true_positives": 1,
+        "false_positives": 0,
+        "false_negatives": 1
+      }
+    }
+  ]
+}
