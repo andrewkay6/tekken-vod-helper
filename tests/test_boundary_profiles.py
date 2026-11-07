@@ -6,6 +6,7 @@ import unittest
 from unittest.mock import patch
 from pathlib import Path
 
+from tekken_vod_helper import boundary_reasoning
 from tekken_vod_helper.boundary_workflow import detect
 from tekken_vod_helper.boundary_cli import build_parser
 from tekken_vod_helper.boundary_media import VisionClient
@@ -66,12 +67,12 @@ class BoundaryProfilesTest(unittest.TestCase):
             def __init__(self, **kwargs):
                 adj_calls["init"] = kwargs
                 self.calls = 0
-            def propose(self, samples, policy_text):
+            def propose_windowed(self, samples, policy_text):
                 adj_calls["propose"] = (len(samples), policy_text)
                 self.calls += 1
                 return [
                     {"start": 0.0, "end": 10.0, "player1": "", "player2": "", "character1": "", "character2": ""}
-                ], [], {"algorithm": "temporal-mock", "policy_hash": "mock"}
+                ], [], {"algorithm": "temporal-mock", "policy_hash": "mock", "model_calls": self.calls}
         return MockAdjudicator, adj_calls
 
     def test_recognition_options_forwarded_to_visionclient(self):
@@ -98,13 +99,30 @@ class BoundaryProfilesTest(unittest.TestCase):
              patch("tekken_vod_helper.boundary_reasoning.TemporalAdjudicator", new=MockAdj), \
              patch("tekken_vod_helper.boundary_workflow._POLICY", Path(self.policy)):
             res = detect(
-                "yt:fake", self.out, interval=2, fine_step=1, max_frames=100, max_requests=100, cache_fine=True, max_cache_frames=50, temporal=True
+                "yt:fake", self.out, interval=2, fine_step=1, max_frames=100, max_requests=100,
+                cache_fine=True, max_cache_frames=50, temporal=True, adjudication_requests=1
             )
         self.assertEqual(res["vision_model_calls"], 2)
         self.assertEqual(res["adjudication_model_calls"], 1)
         self.assertEqual(res["model_calls"], 3)
         self.assertEqual(captured["init"]["max_requests"], 99)
         self.assertEqual(adj_calls["init"]["max_requests"], 1)
+
+    def test_adjudication_allowance_is_reserved_from_the_request_budget(self):
+        """The temporal allowance is taken out of --max-requests instead of assumed free."""
+        src = {"source": "yt:fake", "uri": "unused", "duration": 20.0}
+        MockVision, captured = self._mock_vision()
+        MockAdj, adj_calls = self._mock_adjudicator()
+        with patch("tekken_vod_helper.boundary_workflow.resolve_source", return_value=src), \
+             patch("tekken_vod_helper.boundary_workflow.sample_frames", side_effect=self._mock_sample(interval=1.0)), \
+             patch("tekken_vod_helper.boundary_workflow.VisionClient", new=MockVision), \
+             patch("tekken_vod_helper.boundary_reasoning.TemporalAdjudicator", new=MockAdj), \
+             patch("tekken_vod_helper.boundary_workflow._POLICY", Path(self.policy)):
+            detect("yt:fake", self.out, interval=2, fine_step=1, max_frames=100, max_requests=100,
+                   cache_fine=True, max_cache_frames=50, temporal=True)
+        default = boundary_reasoning.DEFAULT_ADJUDICATION_REQUESTS
+        self.assertEqual(captured["init"]["max_requests"], 100 - default)
+        self.assertEqual(adj_calls["init"]["max_requests"], default)
 
     def test_temporal_rejected_when_max_requests_less_than_two(self):
         src = {"source": "yt:fake", "uri": "unused", "duration": 20.0}

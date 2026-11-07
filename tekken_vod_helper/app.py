@@ -11,9 +11,11 @@ import unicodedata
 import urllib.request
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from .ffmpeg_tools import FfmpegError, extract_frame, probe_duration, require_tool, slice_clip
+from . import boundary_review
+from . import boundary_review_flow
 from .models import (
     DEFAULT_DESCRIPTION_BOILERPLATE,
     DEFAULT_OVERLAY_ACCENT_COLOR,
@@ -100,6 +102,13 @@ class TekkenVodHelperApp(AppWindow):
         self.selected_index: Optional[int] = None
         self.preview_after_id: Optional[str] = None
         self.playback_after_id: Optional[str] = None
+        # Where a boundary clip is allowed to play to. Playback of saved evidence is a window, not the
+        # whole tape, and the reviewer should not have to watch for the stop.
+        self.review_stop_at: Optional[float] = None
+        self.review_seek_target: Optional[float] = None
+        self.review_seek_tries = 0
+        self._review_panel_object: Optional[boundary_review_flow.ReviewPanel] = None
+        self._review_shown: Optional[str] = None
         self.preview_photo = None
         self.vlc_instance = None
         self.vlc_player = None
@@ -439,11 +448,16 @@ class TekkenVodHelperApp(AppWindow):
 
         notebook = ttk.Notebook(right)
         notebook.grid(row=0, column=0, sticky="nsew")
+        self.workspace_notebook = notebook
         match_tab = ttk.Frame(notebook)
         notebook.add(match_tab, text="Matches")
+        review_tab = ttk.Frame(notebook)
+        notebook.add(review_tab, text="Boundary review")
+        self.review_tab = review_tab      # so a driver can address this tab alone, not every hidden frame
 
         self._build_video_panel(left)
         self._build_match_panel(match_tab)
+        self._build_review_panel(review_tab)
 
         self.upload_workspace = ttk.Frame(self.workspace, style="TFrame")
         self.upload_workspace.columnconfigure(0, weight=1)
@@ -976,6 +990,449 @@ class TekkenVodHelperApp(AppWindow):
             command=self.generate_metadata_only,
         )
         self.metadata_button.grid(row=0, column=1, sticky="ew", padx=(4, 0))
+
+    # -------------------------------------------------------------------------- boundary review
+
+    def _review_panel(self) -> boundary_review_flow.ReviewPanel:
+        """The controller behind the tab, rebuilt whenever a different project is loaded.
+
+        Every choice here is a call into :class:`boundary_review_flow.ReviewPanel`; the widgets only draw
+        what it reports and hand a button's action string back. That split is deliberate: this box cannot
+        import tkinter, so a control that lived only inside a callback would ship unverified. The flow is
+        tested against real projects, and what is left below is layout.
+        """
+        panel = self.__dict__.get("_review_panel_object")
+        if panel is None or panel.flow.state is not self.project_state:
+            panel = boundary_review_flow.ReviewPanel(self.project_state)
+            self.__dict__["_review_panel_object"] = panel
+        return panel
+
+    def _wrap_label(self, label: ttk.Label) -> ttk.Label:
+        """Keep a label's text inside whatever width Tk actually gave it.
+
+        ``wraplength`` is a pixel guess, and this panel is a scrolling frame inside a resizable notebook, so
+        every guess is wrong for somebody: at the recorded window size the source path wanted 1336 px and was
+        given 334, and the coverage line -- the two-account numbers that exist to stop a bad figure being
+        quoted -- was cut off too. Re-deriving the wrap from the label's own allocation makes truncation
+        impossible instead of unlikely, and the driver asserts it.
+        """
+        def resize(event) -> None:
+            wanted = max(80, int(event.width) - 2)
+            if int(event.width) > 1 and int(str(label.cget("wraplength")) or 0) != wanted:
+                label.configure(wraplength=wanted)
+
+        label.bind("<Configure>", resize)
+        return label
+
+    def _build_review_panel(self, parent: ttk.Frame) -> None:
+        """The review tab, built inside its own scrolling body.
+
+        Weighted rows alone were not enough: at a 900 px window the question card asked for more than the
+        notebook page had, Tk gave the queue and the hold list zero height, and a zero-height window is not
+        mapped at all -- the reviewer saw a panel with no list and no way to tell it was there. So the parts
+        keep their natural size and the tab scrolls, which costs a scrollbar and buys the guarantee that
+        every control is on screen.
+        """
+        parent.columnconfigure(0, weight=1)
+        parent.rowconfigure(0, weight=1)
+        canvas = tk.Canvas(parent, borderwidth=0, highlightthickness=0, background=APP_BG)
+        bar = ttk.Scrollbar(parent, orient="vertical", command=canvas.yview)
+        body = ttk.Frame(canvas)
+        window_id = canvas.create_window((0, 0), window=body, anchor="nw")
+        canvas.configure(yscrollcommand=bar.set)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        bar.grid(row=0, column=1, sticky="ns")
+
+        def rescroll(_event=None) -> None:
+            canvas.configure(scrollregion=canvas.bbox("all") or (0, 0, 0, 0))
+
+        def resize(event) -> None:
+            canvas.itemconfigure(window_id, width=event.width)
+            rescroll()
+
+        body.bind("<Configure>", rescroll)
+        canvas.bind("<Configure>", resize)
+        # The pointer has to work where the reviewer is looking, not only over bare canvas.
+        for widget in (canvas, body):
+            widget.bind("<Button-4>", lambda _e: canvas.yview_scroll(-1, "units"))
+            widget.bind("<Button-5>", lambda _e: canvas.yview_scroll(1, "units"))
+            widget.bind("<MouseWheel>", lambda e: canvas.yview_scroll(
+                -1 * int(e.delta / 120) if e.delta else 0, "units"))
+        self.review_scroll_canvas = canvas
+
+        body.columnconfigure(0, weight=1)
+
+        source = ttk.Frame(body)
+        source.grid(row=0, column=0, sticky="ew", pady=(8, 6))
+        source.columnconfigure(1, weight=1)
+        self.review_source_var = tk.StringVar(value="No video chosen")
+        ttk.Label(source, text="Source").grid(row=0, column=0, sticky="w", padx=(0, 6))
+        self._wrap_label(ttk.Label(source, textvariable=self.review_source_var, style="Muted.TLabel",
+                                   anchor="w", justify="left")).grid(row=0, column=1, sticky="ew")
+        ttk.Button(source, text="Choose video...", width=16,
+                   command=self._review_choose_source).grid(row=0, column=2, padx=(6, 0))
+
+        views = ttk.Frame(body)
+        views.grid(row=1, column=0, sticky="ew")
+        self.review_summary_var = tk.StringVar(value="")
+        self.review_message_var = tk.StringVar(value="")
+        for column, name in enumerate(("open", "deferred", "answered")):
+            ttk.Button(views, text=name.title(), width=10,
+                       command=lambda view=name: self._review_press("view:" + view)).grid(
+                row=0, column=column, padx=(0, 4))
+        self._wrap_label(ttk.Label(views, textvariable=self.review_summary_var, style="Muted.TLabel",
+                                       justify="left")).grid(row=0, column=3, sticky="w", padx=(10, 0))
+
+        tree_frame = ttk.Frame(body)
+        tree_frame.grid(row=2, column=0, sticky="nsew", pady=(6, 4))
+        tree_frame.columnconfigure(0, weight=1)
+        tree_frame.rowconfigure(0, weight=1)
+        columns = ("kind", "state", "start", "end", "why")
+        self.review_tree = ttk.Treeview(tree_frame, columns=columns, show="headings",
+                                        selectmode="browse", height=8)
+        for column, heading, width in (("kind", "Question", 92), ("state", "State", 74),
+                                       ("start", "Start", 82), ("end", "End", 82),
+                                       ("why", "Why it is asked", 330)):
+            self.review_tree.heading(column, text=heading)
+            self.review_tree.column(column, width=width, stretch=(column == "why"), anchor="w")
+        self.review_tree.grid(row=0, column=0, sticky="nsew")
+        review_scroll = ttk.Scrollbar(tree_frame, orient="vertical", command=self.review_tree.yview)
+        review_scroll.grid(row=0, column=1, sticky="ns")
+        self.review_tree.configure(yscrollcommand=review_scroll.set)
+        self.review_tree.bind("<<TreeviewSelect>>", self._review_selected)
+
+        card = ttk.LabelFrame(body, text="Question", padding=8)
+        card.grid(row=3, column=0, sticky="nsew", pady=(4, 4))
+        card.columnconfigure(0, weight=1)
+        self.review_ask_var = tk.StringVar(value="")
+        ask_label = ttk.Label(card, textvariable=self.review_ask_var)
+        ask_label.configure(font=("Segoe UI Semibold", 14))
+        ask_label.grid(row=0, column=0, sticky="w")
+        # A wraplength is a pixel guess, and at the recorded window size the "why" sentence ran off the end
+        # of the card: the reviewer saw "the round clock already reads 58 at the candidate insta" and no
+        # reason. A read-only Text wraps to whatever width it is given, so nothing can be cut off.
+        self.review_explain = tk.Text(card, height=4, state="disabled", wrap="word")
+        self._style_text_widget(self.review_explain)
+        self.review_explain.grid(row=1, column=0, sticky="nsew", pady=(2, 2))
+        self.review_note_var = tk.StringVar(value="")
+        note_row = ttk.Frame(card)
+        note_row.grid(row=3, column=0, sticky="ew", pady=(6, 0))
+        note_row.columnconfigure(1, weight=1)
+        ttk.Label(note_row, text="Reason (needed to accept a partial)").grid(row=0, column=0,
+                                                                             padx=(0, 6))
+        self.review_note_entry = ttk.Entry(note_row, textvariable=self.review_note_var)
+        self.review_note_entry.grid(row=0, column=1, sticky="ew")
+        self.review_answer_frame = ttk.Frame(card)
+        self.review_answer_frame.grid(row=4, column=0, sticky="ew", pady=(8, 0))
+        for column in range(2):
+            self.review_answer_frame.columnconfigure(column, weight=1, uniform="review-actions")
+        self.review_nudge_frame = ttk.Frame(card)
+        self.review_nudge_frame.grid(row=5, column=0, sticky="ew", pady=(4, 0))
+        for column in range(6):
+            self.review_nudge_frame.columnconfigure(column, weight=1)
+        self.review_evidence = tk.Text(card, height=5, state="disabled", wrap="word")
+        self._style_text_widget(self.review_evidence)
+        self.review_evidence.grid(row=5, column=0, sticky="nsew", pady=(8, 0))
+
+        held_frame = ttk.Frame(body)
+        held_frame.grid(row=4, column=0, sticky="nsew")
+        held_frame.columnconfigure(0, weight=1)
+        held_frame.rowconfigure(2, weight=1)
+        self._wrap_label(ttk.Label(held_frame, justify="left",
+                                   text="Footage no export would write: clips on hold, and stretches of "
+                                        "the recording no candidate covers")).grid(row=0, column=0,
+                                                                                   sticky="ew")
+        self.review_coverage_var = tk.StringVar(value="")
+        self._wrap_label(ttk.Label(held_frame, textvariable=self.review_coverage_var,
+                                       style="Muted.TLabel", justify="left")).grid(row=1, column=0,
+                                                                                   sticky="ew",
+                                                                                   pady=(0, 2))
+        columns = ("kind", "edge", "from", "to", "seconds", "evidence", "why")
+        self.review_unresolved_tree = ttk.Treeview(held_frame, columns=columns, show="headings",
+                                                   height=5, selectmode="browse")
+        for column, heading, width in (("kind", "What", 76), ("edge", "Where it is", 92),
+                                       ("from", "From", 86), ("to", "To", 86),
+                                       ("seconds", "Seconds", 66),
+                                       ("evidence", "Play seen here?", 96),
+                                       ("why", "Why it is on this list", 300)):
+            self.review_unresolved_tree.heading(column, text=heading)
+            self.review_unresolved_tree.column(column, width=width,
+                                               stretch=(column == "why"), anchor="w")
+        self.review_unresolved_tree.grid(row=2, column=0, sticky="nsew")
+        held_scroll = ttk.Scrollbar(held_frame, orient="vertical",
+                                    command=self.review_unresolved_tree.yview)
+        held_scroll.grid(row=2, column=1, sticky="ns")
+        self.review_unresolved_tree.configure(yscrollcommand=held_scroll.set)
+        ttk.Button(held_frame, text="Play the selected footage",
+                   command=self._review_play_unresolved).grid(row=3, column=0, sticky="w", pady=(4, 2))
+        self.review_held = self.review_unresolved_tree      # the driver's room-check name for this part
+
+        self._wrap_label(ttk.Label(body, textvariable=self.review_message_var, style="Muted.TLabel",
+                                       justify="left")).grid(row=5, column=0, sticky="ew", pady=(2, 8))
+        self._review_refresh()
+
+    def _review_refresh(self) -> None:
+        view = self._review_panel().state_view()
+        self._review_refreshing = True
+        try:
+            source = view["source"]
+            self.review_source_var.set(source["video_path"] if source["has_source"] else
+                                       "No video chosen - the queue and its saved evidence still work, "
+                                       "but nothing can be played")
+            summary = view["summary"]
+            self.review_summary_var.set(
+                "{open} open - {deferred} unsure - {answered} answered - {held} held - "
+                "{exportable} exportable - {unplaced_seconds:.1f}s unplaced - no inference".format(
+                    **summary))
+            self.review_message_var.set(view["message"])
+            self.review_tree.delete(*self.review_tree.get_children())
+            for row in view["rows"]:
+                self.review_tree.insert(
+                    "", "end", iid=row["fingerprint"],
+                    values=(row["kind"], row["state"], seconds_to_timestamp(row["start"] or 0.0),
+                            seconds_to_timestamp(row["end"] or 0.0) if row["end"] else "-",
+                            row["why"]))
+            # Remember which row this render is standing on *before* the selection event can reach the
+            # callback: rebuilding the tree fires <<TreeviewSelect>>, and a callback that re-renders is an
+            # infinite loop that only shows up once anything actually drives the widgets.
+            self._review_shown = None if view["question"] is None else view["question"]["fingerprint"]
+            if view["question"] is not None:
+                self.review_tree.selection_set(view["question"]["fingerprint"])
+            question = view["question"]
+            for frame in (self.review_answer_frame, self.review_nudge_frame):
+                for child in frame.winfo_children():
+                    child.destroy()
+            if question is None:
+                self.review_ask_var.set("Nothing left in this view.")
+                self._set_review_text(self.review_explain, "")
+                self._set_review_text(self.review_evidence, "")
+            else:
+                self.review_ask_var.set(question["ask"])
+                self._set_review_text(self.review_explain, self._review_explain_text(question))
+                for position, button in enumerate(question["controls"]):
+                    # Two to a row: the labels are sentences ("Set opening to current time"), and a fourth
+                    # column with no room left is a button Tk never maps -- present in the tree, invisible
+                    # to the reviewer. The driver asserts every control is on screen so this cannot regress.
+                    ttk.Button(self.review_answer_frame, text=button["label"], width=30,
+                               state=("normal" if button.get("enabled", True) else "disabled"),
+                               command=lambda action=button["action"]: self._review_press(action)
+                               ).grid(row=position // 2, column=position % 2,
+                                      padx=(0, 4), pady=2, sticky="ew")
+                for column, button in enumerate(question["nudge_buttons"]):
+                    ttk.Button(self.review_nudge_frame, text=button["label"], width=8,
+                               command=lambda action=button["action"]: self._review_press(action)
+                               ).grid(row=0, column=column, padx=(0, 3))
+                self._set_review_text(self.review_evidence, self._review_evidence_text(question))
+            self._review_fill_unresolved(view)
+        finally:
+            self._review_refreshing = False
+
+    def _set_review_text(self, widget: tk.Text, text: str) -> None:
+        widget.configure(state="normal")
+        widget.delete("1.0", "end")
+        widget.insert("1.0", text)
+        widget.configure(state="disabled")
+
+    def _review_evidence_text(self, question: Dict[str, object]) -> str:
+        """Signals first, what they are taken to mean second, and never a number nobody named."""
+        evidence = question["evidence"]
+        consequence = question["consequence"]
+        lines = ["Signals: conclusion %s; winner confirmation %s; game wins %s; concluded by %s"
+                 % (evidence.get("conclusion_signals"), evidence.get("winner_confirmations"),
+                    evidence.get("game_wins"), evidence.get("concluded_by"))]
+        if evidence.get("start_clock_at_boundary") is not None:
+            lines.append("Round clock read at the opening: %s (60 does not prove a first round, and a "
+                         "non-fighting frame does not prove a set ended)"
+                         % evidence["start_clock_at_boundary"])
+        clip = evidence.get("clip") or {}
+        if clip.get("basis"):
+            lines.append("This clip's end is taken from: %s" % clip["basis"])
+        if clip.get("excluded_gameplay"):
+            lines.append("The clip loses: %s" % json.dumps(clip["excluded_gameplay"]))
+        if clip.get("included_past_recorded_end"):
+            lines.append("The clip also claims: %s" % json.dumps(clip["included_past_recorded_end"]))
+        lines.append("Export now: %s" % ("held - %s" % "; ".join(consequence.get("reasons") or ["?"])
+                                         if consequence.get("held") else
+                                         "%.3f to %s" % (question["segment"]["start"],
+                                                         clip.get("end"))))
+        decision = question.get("decision")
+        if decision:
+            lines.append("On the record: %s (%s)%s" % (decision.get("answer"), decision.get("status"),
+                                                       " - " + decision.get("invalidated_reason", "")
+                                                       if decision.get("invalidated_reason") else ""))
+        return "\n".join(lines)
+
+    def _review_explain_text(self, question: Dict[str, object]) -> str:
+        """Why this is being asked, in one block that cannot be cut off by a window edge."""
+        boundary = question["boundary"]
+        late = boundary.get("late_by_at_least_seconds")
+        earliest = boundary.get("earliest_supported_opening")
+        lines = [question["why"]]
+        lines.append("Boundary: %s (%s). Playback window %.3f-%.3f, no new analysis."
+                     % ("%.3f" % boundary["at"] if boundary["at"] is not None else "unknown",
+                        question["state"], question["context"]["play_from"],
+                        question["context"]["play_to"]))
+        if late:
+            lines.append("Saved clock evidence says the round was already running: this opening is at "
+                         "least %.1f s late, which means the clip starts on play in progress. Move it to "
+                         "the current time, nudge it, or accept the partial with a reason." % late)
+        if earliest is not None:
+            lines.append("Earliest opening the saved rows name: %.3f." % earliest)
+        return "\n".join(lines)
+
+    def _review_fill_unresolved(self, view: Dict[str, object]) -> None:
+        """The footage an export would not write, listed in tape order and selectable."""
+        tree = self.review_unresolved_tree
+        tree.delete(*tree.get_children())
+        for row in view["unresolved"]:
+            tree.insert("", "end",
+                        iid="%s|%s|%s" % (row["kind"], row["from"], row["to"]),
+                        values=(row["kind"].upper(), row.get("edge") or "-",
+                                seconds_to_timestamp(row["from"] or 0.0),
+                                seconds_to_timestamp(row["to"] or 0.0) if row["to"] is not None else "-",
+                                ("%.1f" % row["seconds"]) if row.get("seconds") is not None else "-",
+                                {True: "play seen", False: "no play seen",
+                                 None: "unknown"}[row.get("gameplay_seen_in_saved_evidence")],
+                                row["why"]))
+        coverage = (view.get("coverage") or {})
+        self.review_coverage_var.set(
+            "Candidates cover {c:.1f} s; exports would write {j:.1f} s; uncovered by exports {u:.1f} s in "
+            "{n} stretch(es) (tape is {d:.1f} s).".format(
+                c=coverage.get("candidates_seconds") or 0.0,
+                j=coverage.get("jobs_seconds") or 0.0,
+                u=coverage.get("uncovered_seconds") or 0.0,
+                n=coverage.get("uncovered_intervals") or 0,
+                d=coverage.get("duration") or 0.0))
+
+    def _review_play_unresolved(self) -> None:
+        """Watch a stretch of tape that no clip claims -- where a missed match would actually be."""
+        chosen = self.review_unresolved_tree.selection()
+        if not chosen:
+            self.log("Select a row in the uncovered-footage list first: each one is a stretch of this "
+                     "recording that no export would write.")
+            return
+        kind, start, end = chosen[0].split("|")
+        self._review_press("play-interval:%s_%s" % (start, end if end != "None" else start))
+
+    def _review_selected(self, _event=None) -> str:
+        """Follow a reviewer's click, and only a click.
+
+        Redrawing the queue selects a row too, so the callback compares against the row the last render
+        already stood on and returns otherwise. Without that test a refresh re-enters itself forever --
+        the first recursion this box ever caught, and it took actually driving the widgets to see it.
+        """
+        selection = self.review_tree.selection()
+        chosen = selection[0] if selection else None
+        if getattr(self, "_review_refreshing", False) or chosen == self.__dict__.get("_review_shown"):
+            return ""
+        if chosen:
+            self._review_press("select:" + chosen)
+        return ""
+
+    def _review_press(self, action: str) -> None:
+        if action == "bracket:pick":
+            self._review_choose_bracket()
+            return
+        panel = self._review_panel()
+        panel.set_current_time(self.current_time)
+        note = self.review_note_var.get().strip() if hasattr(self, "review_note_var") else ""
+        message = panel.press(action, note=note)
+        structural = action.startswith(("answer:", "nudge:", "end:", "start:", "orientation:",
+                                   "undo", "undo-last"))
+        if action.startswith("play") and panel.playback:
+            self._review_play(panel.playback)
+            panel.playback = None
+        if message:
+            self.log(message)
+        self._review_refresh()
+        if structural:
+            self._refresh_tree()
+            if hasattr(self, "video_surface"):
+                self._load_selected_form()
+
+    def _review_choose_bracket(self) -> None:
+        """Point the existing start.gg picker at the row the review tab is standing on.
+
+        The picker already handles loading a bracket, filtering it to this event and remembering the last
+        set; what it did not know was which row a reviewer was mid-question about, so the match list is
+        moved to that row first and the normal apply path records the pairing with its provenance.
+        """
+        start = self._review_target_start()
+        if start is not None:
+            matches = self.project_state.sorted_matches()
+            position = next((i for i, match in enumerate(matches) if match.start == start), None)
+            if position is not None:
+                self.match_tree.selection_set(str(position))
+                self.selected_index = position
+                self._load_selected_form()
+        self.open_startgg_bracket_picker("vod")
+
+    def _review_play(self, window: Dict[str, object]) -> None:
+        """Play the short window around the boundary in the recording that is already open.
+
+        Nothing is rendered or analysed here: it is a seek in the player the app already has, and a pause
+        at the far edge. The re-seek matters -- VLC accepts a ``set_time`` issued before it has parsed the
+        media and then ignores it, which on the real 23 GB BB9 file meant "play this boundary" started the
+        tape at 0:00.5. A boundary clip that opens on the wrong second of the recording is worse than no
+        clip, so the target is re-issued until it actually lands.
+        """
+        if not self.project_state.video_path:
+            self.log("No video chosen for this project, so the boundary cannot be played. Choose the "
+                     "recording above; the queue itself needs no video and costs no inference.")
+            return
+        start = float(window["from"])
+        self.review_stop_at = float(window["to"])
+        self.review_seek_target = start
+        self.review_seek_tries = 0
+        self._ensure_vlc_player_for_seek()
+        self.scrub_var.set(start)
+        self._seek_to_time(start)
+        self.start_playback()
+        self._review_reseek()
+        self.log("Playing %.3f-%.3f around the boundary." % (start, self.review_stop_at))
+
+    def _review_reseek(self) -> None:
+        target = self.__dict__.get("review_seek_target")
+        if target is None:
+            return
+        player = self.vlc_player
+        if player is not None and abs(player.get_time() / 1000.0 - target) <= 1.0:
+            self.review_seek_target = None       # the boundary is on screen; nothing more to do
+            return
+        self.review_seek_tries = int(self.__dict__.get("review_seek_tries") or 0) + 1
+        if self.review_seek_tries >= 12:
+            self.review_seek_target = None
+            self.log("Could not reach %.3f in this recording after 12 attempts, so the clip is playing "
+                     "from wherever VLC got to - do not treat this pass as the boundary window." % target)
+            return
+        if player is not None:
+            self._seek_vlc(target)
+        self.after(300, self._review_reseek)
+
+    def _review_choose_source(self) -> None:
+        """Point the project at its recording without leaving the review tab."""
+        path = filedialog.askopenfilename(
+            title="Choose the recording this review is about",
+            filetypes=[("Video files", "*.mkv *.mp4 *.mov *.avi *.ts"), ("All files", "*.*")])
+        if not path:
+            return
+        self.project_state.video_path = path
+        try:
+            self.project_state.duration = probe_duration(path) or self.project_state.duration
+        except FfmpegError as exc:
+            self.show_copyable_error("ffprobe required", exc)
+        self.stop_playback()
+        self._update_video_summary()
+        self._review_refresh()
+        self.log("Review source set to {}".format(path))
+
+    def _review_target_start(self) -> Optional[float]:
+        """The row the review tab is pointing at, so the bracket picker can target it."""
+        panel = self.__dict__.get("_review_panel_object")
+        if panel is None or not panel.selected:
+            return None
+        item = panel.flow.item(panel.selected, view="all")
+        return None if item is None else item["segment"]["start"]
 
     def _build_upload_manager_panel(self, parent: ttk.Frame) -> None:
         parent.columnconfigure(0, weight=1)
@@ -2387,10 +2844,18 @@ class TekkenVodHelperApp(AppWindow):
         if not self.overlay_description_var.get().strip():
             self.overlay_description_var.set(self.event_var.get().strip() or bracket_set.event_name)
         self.overlay_subtitle_var.set(bracket_set.round_name)
+        # Same rule as the match panel: if this player's character is already on the overlay it was put
+        # there deliberately, and a remembered default must not silently replace it mid-broadcast.
+        overlay_slots = [{"player": self.overlay_p1_var.get(),
+                          "character": self.overlay_character1_var.get()},
+                         {"player": self.overlay_p2_var.get(),
+                          "character": self.overlay_character2_var.get()}]
         self.overlay_p1_var.set(bracket_set.player1)
         self.overlay_p2_var.set(bracket_set.player2)
-        self.overlay_character1_var.set(self._remembered_player_character(bracket_set.player1))
-        self.overlay_character2_var.set(self._remembered_player_character(bracket_set.player2))
+        self.overlay_character1_var.set(self._character_for_player(bracket_set.player1,
+                                                                   slots=overlay_slots))
+        self.overlay_character2_var.set(self._character_for_player(bracket_set.player2,
+                                                                    slots=overlay_slots))
         self.reset_overlay_scores()
         self.project_state.players = unique_sorted(self.project_state.players + [bracket_set.player1, bracket_set.player2])
         self.project_state.characters = unique_sorted(
@@ -2406,10 +2871,25 @@ class TekkenVodHelperApp(AppWindow):
         if bracket_set is None:
             messagebox.showinfo("Select a set", "Load and select a start.gg set first.")
             return
+        # What is already on screen and on the selected segment counts as observation: it is what the
+        # recording or the reviewer put there, and a remembered default may not erase it.
+        index = self._selected_tree_index()
+        segment = self.project_state.matches[index] if index is not None else None
+        slots = [{"player": self.player1_var.get(), "character": self.character1_var.get()},
+                 {"player": self.player2_var.get(), "character": self.character2_var.get()}]
+        if segment is not None:
+            slots.append({"player": segment.player1, "character": segment.character1})
+            slots.append({"player": segment.player2, "character": segment.character2})
+        observed = {side: self._character_for_player(getattr(bracket_set, side), segment=segment,
+                                                     slots=slots)
+                    for side in ("player1", "player2")}
+        replaced = [side for side in observed
+                    if observed[side]
+                    and observed[side] != self._remembered_player_character(getattr(bracket_set, side))]
         self.player1_var.set(bracket_set.player1)
         self.player2_var.set(bracket_set.player2)
-        self.character1_var.set(self._remembered_player_character(bracket_set.player1))
-        self.character2_var.set(self._remembered_player_character(bracket_set.player2))
+        self.character1_var.set(observed["player1"])
+        self.character2_var.set(observed["player2"])
         self.round_var.set(bracket_set.round_name)
         if not self.event_var.get().strip():
             self.event_var.set(bracket_set.event_name)
@@ -2418,8 +2898,25 @@ class TekkenVodHelperApp(AppWindow):
         self._remember_player_character(bracket_set.player1, self.character1_var.get())
         self._remember_player_character(bracket_set.player2, self.character2_var.get())
         self._refresh_combo_values()
-        if self._selected_tree_index() is not None:
-            self.apply_match_details()
+        if replaced:
+            # Say which way the call went: a familiar name paired with an unfamiliar character needs to
+            # read as evidence from the tape, not as a stale default that nobody checked.
+            self.log("Kept the observed character over the remembered default for {}".format(
+                ", ".join(sorted({getattr(bracket_set, side) for side in replaced}))))
+        if index is not None:
+            self.apply_match_details(source="start.gg")
+            matches = self.project_state.sorted_matches()
+            if matches[index].recovery:
+                # A bracket match says *who* is playing. It never says where the footage begins, and it
+                # does not bind a character to a side: the listing is unordered, so the orientation stays
+                # an open question the reviewer has to answer.
+                try:
+                    self._review_panel().flow.assign_bracket_set(
+                        matches[index].start, [bracket_set.player1, bracket_set.player2],
+                        label=bracket_set.label)
+                    self._review_refresh()
+                except boundary_review.InvalidAnswer as exc:
+                    self.show_copyable_error("Could not record the bracket match", exc)
             self.log("Applied start.gg set to selected match: {}".format(bracket_set.label))
         else:
             self.log("Loaded start.gg set into match fields: {}".format(bracket_set.label))
@@ -2636,10 +3133,13 @@ class TekkenVodHelperApp(AppWindow):
             self.project_state.characters = self._load_default_characters()
         self.project_path = project_path
         self.temporary_project_dismissed = False
+        self.__dict__["_review_panel_object"] = None       # the old panel points at the old project
+        self.__dict__.pop("_clip_reports", None)
         self._state_to_controls()
         self._refresh_combo_values()
         self._refresh_tree()
         self._update_video_summary()
+        self._review_refresh()
         self._schedule_preview()
         self.log("{}: {}".format(log_label, path))
         return True
@@ -2987,6 +3487,14 @@ class TekkenVodHelperApp(AppWindow):
             self._schedule_playback_tick()
             return
         self.current_time = min(current_ms / 1000.0, max(self.project_state.duration, 0.0))
+        stop_at = self.__dict__.get("review_stop_at")
+        if stop_at is not None and self.current_time >= stop_at - 0.05:
+            # A boundary clip is a window, and a reviewer watching the next set's opening is not watching
+            # the boundary they were asked about. Pause at the edge; the operator decides what to play next.
+            self.review_stop_at = None
+            self.pause_playback()
+            self.log("Paused at the end of the boundary window.")
+            return
         self.updating_playback_time = True
         try:
             self.scrub_var.set(self.current_time)
@@ -3063,6 +3571,10 @@ class TekkenVodHelperApp(AppWindow):
             self.show_copyable_error("Invalid end time", "Match end must be after the match start.")
             return
 
+        if self._apply_human_end(match, end):
+            self._refresh_tree(select_start=match.start)
+            return
+
         match.end = end
         self.project_state.matches = matches
         self._refresh_tree(select_start=match.start)
@@ -3125,6 +3637,42 @@ class TekkenVodHelperApp(AppWindow):
         self.end_var.set(seconds_to_timestamp(end))
         self.set_selected_end()
 
+    def _apply_human_start(self, match: MatchSegment, start: float) -> bool:
+        """Route a typed opening through the journal when the row carries machine evidence.
+
+        Returns False for a hand-made row, where the flat field *is* the operator's decision and the
+        app's long-standing behaviour is the right one.
+        """
+        if not match.recovery:
+            return False
+        try:
+            self._review_panel().flow.move_start(
+                self._review_panel().flow.start_fingerprint(match.start), start)
+        except boundary_review.InvalidAnswer as exc:
+            self.show_copyable_error("Opening refused", exc)
+            return True
+        self.log("Recorded a human opening of {} for the row at {}.".format(
+            seconds_to_timestamp(start), seconds_to_timestamp(match.start)))
+        return True
+
+    def _apply_human_end(self, match: MatchSegment, end: Optional[float]) -> bool:
+        """The same for an ending: writing ``match.end`` alone never outranked ``recovery.clip_end_at``.
+
+        That is why an end typed over a recovered clip used to be ignored at export. ``None`` withdraws
+        the human end and lets the padded conclusion govern again.
+        """
+        if not match.recovery:
+            return False
+        try:
+            self._review_panel().flow.set_human_end(match.start, end)
+        except boundary_review.InvalidAnswer as exc:
+            self.show_copyable_error("End refused", exc)
+            return True
+        self.log("Recorded a human end of {} for the row at {}.".format(
+            seconds_to_timestamp(end) if end is not None else "none",
+            seconds_to_timestamp(match.start)))
+        return True
+
     def set_selected_start(self) -> None:
         index = self._selected_tree_index()
         if index is None:
@@ -3137,11 +3685,16 @@ class TekkenVodHelperApp(AppWindow):
             return
         start = min(max(start, 0.0), max(self.project_state.duration, 0.0))
         matches = self.project_state.sorted_matches()
-        matches[index].start = round(start, 3)
+        match = matches[index]
+        start = round(start, 3)
+        if self._apply_human_start(match, start):
+            self._refresh_tree(select_start=start)
+            return
+        match.start = start
         self.project_state.matches = matches
         self._refresh_tree(select_start=start)
         self.log("Updated selected match start to {}".format(seconds_to_timestamp(start)))
-    
+
     def set_selected_end(self) -> None:
         index = self._selected_tree_index()
         if index is None:
@@ -3169,6 +3722,10 @@ class TekkenVodHelperApp(AppWindow):
             self.show_copyable_error("Invalid end time", "Match end must be after the match start.")
             return
 
+        if self._apply_human_end(match, round(end, 3) if end is not None else None):
+            self._refresh_tree(select_start=match.start)
+            return
+
         match.end = round(end, 3) if end is not None else None
         self.project_state.matches = matches
         self._refresh_tree(select_start=match.start)
@@ -3186,7 +3743,8 @@ class TekkenVodHelperApp(AppWindow):
         self.selected_index = current_index
         self._load_selected_form()
 
-    def apply_match_details(self, show_errors: bool = True, index: Optional[int] = None, refresh: bool = True) -> None:
+    def apply_match_details(self, show_errors: bool = True, index: Optional[int] = None, refresh: bool = True,
+                            source: str = "human") -> None:
         if self.loading_form:
             return
         if index is None:
@@ -3197,12 +3755,25 @@ class TekkenVodHelperApp(AppWindow):
         if index >= len(matches):
             return
         match = matches[index]
+        before = {field: getattr(match, field) for field in ("player1", "player2", "character1",
+                                                             "character2", "round_name", "notes")}
         match.player1 = self.player1_var.get().strip()
         match.player2 = self.player2_var.get().strip()
         match.character1 = self.character1_var.get().strip()
         match.character2 = self.character2_var.get().strip()
         match.round_name = self.round_var.get().strip()
         match.notes = self.notes_var.get().strip()
+        if match.recovery:
+            # On a recovered row a typed field is a statement against the machine's evidence, and the next
+            # import has to be able to tell it apart from a value the pipeline wrote. Without this the
+            # name survives only until someone re-imports.
+            for field, value in ((field, getattr(match, field)) for field in before):
+                if value == before[field]:
+                    continue
+                try:
+                    self._review_panel().flow.set_field(match.start, field, value, source=source)
+                except boundary_review.InvalidAnswer as exc:
+                    self.show_copyable_error("Could not record the edit", exc)
         self.project_state.players = unique_sorted(self.project_state.players + [match.player1, match.player2])
         self.project_state.characters = unique_sorted(self.project_state.characters + [match.character1, match.character2])
         self._remember_player_character(match.player1, match.character1)
@@ -3213,6 +3784,27 @@ class TekkenVodHelperApp(AppWindow):
             self._refresh_tree(select_start=match.start)
         if show_errors:
             self.log("Applied details for match {}.".format(index + 1))
+
+    def _confirm_held_clips(self) -> bool:
+        """Show what will not be exported and make that a decision, not an absence.
+
+        An export that silently writes nine of ten folders is worse than one that stops to ask, because
+        the missing clip looks like it was never flagged. The list is also written next to the manifest so
+        the hold survives the session that made it.
+        """
+        plan = self.__dict__.get("_last_export_plan") or self._export_plan()
+        if not plan["held"] and not plan["unplaced_play"]:
+            return True
+        report = self._held_clip_report(plan)
+        self.log(report)
+        if not plan["exportable"]:
+            self.show_copyable_error("Nothing to export", "Every clip is held:\n\n" + report)
+            return False
+        return messagebox.askyesno(
+            "Held clips will not be exported",
+            "{} of {} clips are held and will not be exported:\n\n{}\n\nExport the {} ready clip(s) and "
+            "leave these for review?".format(len(plan["held"]), len(plan["clips"]), report,
+                                             len(plan["exportable"])))
 
     def export_clips(self) -> None:
         if self.export_thread and self.export_thread.is_alive():
@@ -3234,6 +3826,9 @@ class TekkenVodHelperApp(AppWindow):
         output_dir = self._resolved_output_dir()
 
         jobs = self._build_export_jobs(output_dir)
+        if not self._confirm_held_clips():
+            self.log("Export left where the review left it: nothing was cut.")
+            return
         if not jobs:
             self.show_copyable_error("No clips", "No valid match ranges are available to export.")
             return
@@ -3257,6 +3852,9 @@ class TekkenVodHelperApp(AppWindow):
             return
         output_dir = self._resolved_output_dir()
         jobs = self._build_export_jobs(output_dir)
+        if not self._confirm_held_clips():
+            self.log("Metadata left where the review left it: nothing was written.")
+            return
         if not jobs:
             self.show_copyable_error("No clips", "No valid match ranges are available to generate metadata.")
             return
@@ -3319,21 +3917,47 @@ class TekkenVodHelperApp(AppWindow):
         self._write_match_metadata(job)
         self._write_upload_sidecars(job)
 
+    def _export_plan(self) -> Dict[str, object]:
+        """The clip list an export would write, taken from the same plan the review tab shows.
+
+        The app used to resolve each end itself and skip a row when the answer was missing, which meant a
+        clip the pipeline called unresolved could still be written -- or quietly never written at all. Both
+        halves now read one plan, so the hold the operator saw is the hold the exporter obeys.
+        """
+        plan = boundary_review.export_plan(self._review_panel().flow.project())
+        reports = self.__dict__.setdefault("_clip_reports", {})
+        for clip in plan["clips"]:
+            reports[clip["index"]] = clip
+        return plan
+
+    def _held_clip_report(self, plan: Dict[str, object]) -> str:
+        lines = ["Clip {} at {} is held: {}".format(clip["index"] + 1,
+                                                    seconds_to_timestamp(clip["start"] or 0.0),
+                                                    "; ".join(clip["reasons"]) or "unresolved boundary")
+                 for clip in plan["held"]]
+        for row in plan["unplaced_play"]:
+            lines.append("Uncovered footage %.3f-%.3f (%.1f s) that no clip claims"
+                         % (row["from"], row["to"], row["seconds"]))
+        return "\n".join(lines)
+
     def _build_export_jobs(self, output_dir: str) -> List[ExportJob]:
         matches = self.project_state.sorted_matches()
         jobs: List[ExportJob] = []
         output_root = Path(output_dir)
         video_stem = safe_relative_name(self.project_state.video_path)
         upload_root = output_root / YOUTUBE_UPLOAD_DIRNAME
+        plan = self._export_plan()
+        self.__dict__["_last_export_plan"] = plan
 
-        for index, match in enumerate(matches):
-            end = self._resolve_match_end(matches, index)
-            if end is None:
-                self.log("Skipping match {}: no end time or following boundary is available.".format(index + 1))
+        for clip in plan["clips"]:
+            index = int(clip["index"])
+            match = matches[index]
+            end = clip["end"]
+            if clip["held"]:
+                # Reported by _confirm_held_clips and written into the manifest: never silent, never cut.
                 continue
-
-            if end <= match.start:
-                self.log("Skipping match {}: end is not after start.".format(index + 1))
+            if end is None or end <= match.start:
+                self.log("Skipping match {}: the plan gives no end after the start.".format(index + 1))
                 continue
 
             label = "{}_{}_vs_{}".format(
@@ -3386,15 +4010,46 @@ class TekkenVodHelperApp(AppWindow):
         digest = hashlib.sha1(basis.encode("utf-8")).hexdigest()[:6]
         return "tvh-{:03d}-{}".format(index, digest)
 
-    def _resolve_match_end(self, matches: List[MatchSegment], index: int) -> Optional[float]:
+    def _display_match_end(self, matches: List[MatchSegment], index: int) -> Optional[float]:
+        """The number to show in the End field: the clip's end, not the set's recorded end.
+
+        A recovered row carries both, and the reviewer edits the first. Showing ``match.end`` there is how
+        a manual end looked ignored even before the export ignored it.
+        """
+        if index >= len(matches):
+            return None
         match = matches[index]
-        if match.end is not None:
-            return min(match.end, self.project_state.duration) if self.project_state.duration > 0.0 else match.end
-        if index + 1 < len(matches):
-            return matches[index + 1].start
-        if self.project_state.duration > match.start:
-            return self.project_state.duration
-        return None
+        if not match.recovery:
+            return match.end if match.end is not None else self._resolve_match_end(matches, index,
+                                                                                    announce=False)
+        return self._resolve_match_end(matches, index, announce=False)
+
+    def _resolve_match_end(self, matches: List[MatchSegment], index: int,
+                           announce: bool = True) -> Optional[float]:
+        """Where this clip stops, or ``None`` when the review says it must not stop anywhere yet.
+
+        One rule lives in :func:`boundary_review.export_plan`; this keeps the shape the older callers
+        want and records the full report per index so the export dialog can explain itself. Two things it
+        used to do differently, both wrong: a recovered row with no end fell back to the end of the
+        *recording*, and a clip its own evidence called blocking was returned anyway. A recovered row is
+        now held until a person gives it an end. A hand-marked row keeps the app's long-standing
+        conventions -- close at the next mark, and at the tape end when there is none -- because that
+        unfinished mark is the operator's, not a claim about a boundary.
+        """
+        plan = boundary_review.export_plan({
+            "duration": self.project_state.duration or None,
+            "matches": [match.to_dict() for match in matches]})
+        reports = self.__dict__.setdefault("_clip_reports", {})
+        for clip in plan["clips"]:
+            reports[clip["index"]] = clip
+        clip = plan["clips"][index]
+        if clip["held"]:
+            if announce:
+                self.log("Match {} is held: {}".format(index + 1,
+                                                       "; ".join(clip["reasons"])
+                                                       or "unresolved boundary"))
+            return None
+        return clip["end"]
 
     def _write_match_metadata(self, job: ExportJob) -> None:
         payload = job.match.to_dict()
@@ -3473,6 +4128,15 @@ class TekkenVodHelperApp(AppWindow):
             "upload_directory": str(upload_root),
             "entries": entries,
         }
+        plan = self.__dict__.get("_last_export_plan") or {}
+        if plan:
+            # The holds travel with the export. A manifest that lists only what was cut reads as if the
+            # other clips never existed, which is how a held boundary turns into a missing match.
+            payload["held"] = [{"match_index": clip["index"] + 1, "start": clip["start"],
+                                "end": clip["end"], "reasons": clip["reasons"],
+                                "review_kind": clip["review_kind"]} for clip in plan.get("held", [])]
+            payload["unplaced_play"] = plan.get("unplaced_play", [])
+            payload["review_counts"] = plan.get("counts", {})
         manifest_path = upload_root / YOUTUBE_MANIFEST_FILENAME
         manifest_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
         self._thread_log("YouTube upload manifest written: {}".format(manifest_path))
@@ -4800,12 +5464,38 @@ class TekkenVodHelperApp(AppWindow):
         combo.bind("<FocusOut>", lambda _event: self._apply_remembered_player_character(player_var, character_var))
 
     def _apply_remembered_player_character(self, player_var: tk.StringVar, character_var: tk.StringVar) -> None:
+        """Fill an empty character box from memory; never overwrite evidence, and never move it.
+
+        This handler fires on ``<FocusOut>`` of the player-name combo, so it runs every time the operator
+        tabs through a name field. Two failures lived here. It used to push the remembered character in
+        unconditionally, replacing whatever the tape or a reviewer had put there. Making that merely
+        preserve-the-box would have been the other half of the bug: when the name changes from Bob to Alice,
+        the character still showing is Bob's, and keeping it attributes Bob's fighter to Alice.
+
+        So each box remembers which player its current value belongs to. A value owned by this player is
+        evidence and stays. A value owned by a different player is replaced by what is known about this one
+        -- possibly nothing, which stays nothing -- and the swap is logged rather than silent.
+        """
         if self.loading_form:
             return
-        remembered = self._remembered_player_character(player_var.get())
-        if not remembered:
+        owners = self.__dict__.setdefault("_slot_character_owner", {})
+        slot = owners.get(id(character_var)) or {}
+        player, current = player_var.get(), character_var.get()
+        if slot.get("player") == player and (current or "") == (slot.get("character") or ""):
+            return                      # this value already belongs to this player: leave it alone
+        if current and (not slot.get("player") or slot.get("player") == player):
+            # Somebody put it here for this player, whether by typing or by an earlier fill.
+            owners[id(character_var)] = {"player": player, "character": current}
             return
-        character_var.set(remembered)
+        resolved, source = self.project_state.character_and_source_for_player(player)
+        if current and slot.get("player") and slot["player"] != player and current != resolved:
+            self.log("Cleared {}'s character for {}; it belonged to {}".format(
+                current, player or "(no name)", slot["player"]))
+        if resolved != current:
+            character_var.set(resolved)
+        owners[id(character_var)] = {"player": player, "character": resolved, "source": source}
+        if not resolved:
+            return
         if character_var is self.overlay_character1_var or character_var is self.overlay_character2_var:
             self._schedule_overlay_apply()
         else:
@@ -4833,7 +5523,20 @@ class TekkenVodHelperApp(AppWindow):
         self.project_state.player_characters[player_key] = clean_character
 
     def _remembered_player_character(self, player: str) -> str:
-        return self.project_state.player_characters.get(self._player_character_key(player), "")
+        return self.project_state.remembered_character(player)
+
+    def _character_for_player(self, player: str, segment: Optional[MatchSegment] = None,
+                              slots: Sequence[Dict[str, str]] = ()) -> str:
+        """Observed first, remembered second, empty if neither -- see ProjectState.character_for_player.
+
+        Kept as a thin delegate so the Tkinter layer has one place to read from and the rule itself is
+        testable without a display.
+        """
+        observed = [(slot.get("player", ""), slot.get("character", "")) for slot in slots]
+        if segment is not None:
+            observed.extend([(segment.player1, segment.character1),
+                             (segment.player2, segment.character2)])
+        return self.project_state.character_for_player(player, observed=observed)
 
     def _player_character_key(self, player: str) -> str:
         return re.sub(r"\s+", " ", player).strip().casefold()

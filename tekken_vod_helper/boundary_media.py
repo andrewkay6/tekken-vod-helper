@@ -7,12 +7,25 @@ import math
 import os
 import re
 import shutil
+import socket
 import subprocess
 import tempfile
+import urllib.error
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from . import local_model
 from .ffmpeg_tools import FfmpegError, probe_duration, require_tool
+
+
+class TransportUncertain(ValueError):
+    """The request left and no answer arrived, so server-side work may still be running.
+
+    Distinct from a malformed reply, which is safe to ask again. Retrying this one queues a second job
+    behind a first nobody is waiting for, and on a single-purpose inference box that is the more
+    expensive mistake of the two.
+    """
+
 
 ALLOWED_STATES = frozenset([
     "stage_select", "character_select", "controller_prompt", "controller_assignment", "vs_screen",
@@ -21,6 +34,10 @@ ALLOWED_STATES = frozenset([
 ])
 _FMT = "bestvideo[height<=360][vcodec^=avc1][protocol=m3u8_native]/bestvideo[height<=360][vcodec^=avc1]/bestvideo[height<=360][ext=mp4]/worstvideo"
 _POLICY = Path(__file__).resolve().parents[1] / "docs" / "cutting-policy.md"
+
+# Request revision marker. A v1 batch hashed the cutting policy but never put its text in the
+# request, so v1 fingerprints cannot be presented as results of the policy-aware classifier.
+PROMPT_VERSION = "vision-qwen-v2"
 
 
 def _validate_duration(d: float) -> None:
@@ -161,7 +178,7 @@ def sample_frames(
         seek_options = ["-ss", "{:.3f}".format(start)] if start > 0 else []
         cmd = [ffmpeg, "-y", "-v", "info"] + input_options + seek_options + [
                "-i", uri, "-t", "{:.3f}".format(span), "-vf", vf,
-               "-frames:v", str(expected), "-vsync", "vfr", "-q:v", "2", "-f", "image2",
+               "-frames:v", str(expected), "-fps_mode", "vfr", "-q:v", "2", "-f", "image2",
                str(stage / "frame-%04d.jpg")]
         try:
             r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -188,6 +205,11 @@ def sample_frames(
             shutil.move(str(fpath), str(dest))
             frames.append({"id": len(frames) + 1, "timestamp": round(pts + start, 6), "path": str(dest)})
         manifest = {"source": source_id, "start": start, "end": end,
+                    # `start`/`end` above are the span this call asked the encoder for, so they describe the
+                    # cache. The file's own length is separate metadata and is recorded separately: a reader
+                    # that inferred "the recording begins at start" from a partial sample was wrong, and the
+                    # boundary layer refuses to make that inference at all without this field.
+                    "source_duration": float(duration),
                     "interval": interval, "frames": frames}
         _write_atomic(out_dir / "sample-manifest.json", json.dumps(manifest, indent=2))
         return frames
@@ -196,17 +218,102 @@ def sample_frames(
             shutil.rmtree(str(stage), ignore_errors=True)
 
 
+USAGE_FIELDS = ("prompt", "completion", "reasoning")
+_USAGE_KEYS = {"prompt": "prompt_tokens", "completion": "completion_tokens",
+               "reasoning": "reasoning_tokens"}
+
+
+def _record_usage(entry):
+    """The usage a single response actually reported, field by field.
+
+    ``usage_reported`` used to default to true, so a record with an empty or missing usage block counted as
+    reported and its absent numbers were summed as zero -- a total that read as complete coverage of a
+    field nobody measured. A legacy caller may still pass no flag at all, so presence is decided by the
+    content of the block, not by a default.
+    """
+    tokens = (entry or {}).get("tokens") or {}
+    details = tokens.get("completion_tokens_details") or {}
+    present = {}
+    for name in USAGE_FIELDS:
+        key = _USAGE_KEYS[name]
+        value = details.get(key) if name == "reasoning" else tokens.get(key)
+        present[name] = value is not None
+    reported = (entry or {}).get("usage_reported")
+    if reported is None:
+        reported = any(present.values())
+    return {"reported": bool(reported), "present": present,
+            "values": {n: ((details.get(_USAGE_KEYS[n]) if n == "reasoning"
+                            else tokens.get(_USAGE_KEYS[n])) or 0) for n in USAGE_FIELDS}}
+
+
+def _total(rows):
+    """A sum plus, per field, how many records it is actually a sum of.
+
+    ``complete`` is true only when every record reported every field; otherwise the numbers are a subtotal
+    and are labelled with what is missing, so an absent reading can never look like a measured zero.
+    """
+    parsed = [_record_usage(r) for r in rows]
+    with_usage = [p for p in parsed if p["reported"]]
+    fields = {}
+    for name in USAGE_FIELDS:
+        missing = sum(1 for p in parsed if not p["present"][name])
+        fields[name] = {"value": sum(p["values"][name] for p in with_usage),
+                        "records_reported": len(with_usage) - sum(
+                            1 for p in with_usage if not p["present"][name]),
+                        "records_missing": missing,
+                        "complete": missing == 0 and bool(parsed)}
+    return {"records": len(rows), "records_with_usage": len(with_usage),
+            "records_without_usage": len(parsed) - len(with_usage),
+            **{name: fields[name]["value"] for name in USAGE_FIELDS},
+            "fields": fields,
+            "complete": bool(parsed) and all(f["complete"] for f in fields.values()),
+            "subtotal": bool(parsed) and not all(f["complete"] for f in fields.values())}
+
+
+def summarize_usage(records, label=""):
+    """Split measured usage into what was accepted and what was billed, without merging the two.
+
+    A retried malformed reply is compute: it belongs in the all-attempt total and must not appear in the
+    accepted-reply total. A record whose response carried no usage block, or carried one without a given
+    field, makes that field a **subtotal** rather than a complete total.
+    """
+    records = list(records or [])
+    accepted = [r for r in records if r.get("accepted", True)]
+    rejected = [r for r in records if not r.get("accepted", True)]
+    out = {"attempts_with_a_response": len(records), "accepted_replies": len(accepted),
+           "rejected_replies_retried": len(rejected),
+           "all_attempts": _total(records), "accepted_only": _total(accepted),
+           "rejected_only": _total(rejected)}
+    if label:
+        out["label"] = label
+    return out
+
+
 class VisionClient:
-    def __init__(self, endpoint: str = "http://127.0.0.1:8010", model: str = "qwen3.8-27b",
+    # Stamped into every provenance record and prompt fingerprint, and folded into the fingerprint
+    # itself so a batch can never be replayed as evidence for a prompt it did not use -- the reason v1
+    # batches had to be refused as policy-aware. ``None`` means "whatever the module says", so editing
+    # PROMPT_VERSION still invalidates every existing fingerprint. A client that asks a different
+    # question overrides this on the subclass.
+    prompt_version = None
+    # Completion budget and reasoning effort for one batch. A reasoning model that spends the whole
+    # budget thinking returns no content, so a client asking a denser question has to raise this
+    # deliberately rather than inherit the classifier's number.
+    request_max_tokens = 6000
+    request_reasoning_effort = "low"
+
+    def __init__(self, endpoint: Optional[str] = None, model: Optional[str] = None,
                  max_requests: int = 300, timeout: int = 180, output_dir: Optional[str] = None,
                  policy_path: Optional[str] = None,
                  reference_paths: Optional[List[str]] = None,
                  crop_regions: bool = False,
-                 enable_thinking: bool = True):
-        self.endpoint = endpoint.rstrip("/")
+                 enable_thinking: bool = True,
+                 max_attempts: int = 3):
+        self.endpoint = local_model.chat_completions_url(endpoint or local_model.default_endpoint())
         self.crop_regions = crop_regions
-        self.model = model
+        self.model = model or local_model.default_model()
         self.max_requests = max_requests
+        self.max_attempts = max_attempts
         self.timeout = timeout
         self.output_dir = Path(output_dir) if output_dir else None
         self.policy_path = Path(policy_path) if policy_path else _POLICY
@@ -234,24 +341,95 @@ class VisionClient:
                 label = self._ref_labels.get(p.stem + ".png", "appearance_reference")
                 self._processed_refs.append({"path": str(p), "label": label})
 
-    def classify(self, frames: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def _versioned_prompt(self):
+        # type: () -> str
+        """The prompt identity in force now, so a bump to PROMPT_VERSION invalidates old batches."""
+        return self.prompt_version or PROMPT_VERSION
+
+    def classify(self, frames: List[Dict[str, Any]], max_attempts: Optional[int] = None) -> List[Dict[str, Any]]:
+        """Classify one batch, retrying the request when the reply is unusable.
+
+        Malformed output is retried, never repaired: the model is asked again and only a response
+        that parses against the policy is returned. Every attempt is charged to the request budget
+        and every failed attempt keeps its own provenance record, so exhaustion raises with the
+        evidence still on disk rather than fabricating observations.
+        """
         if not frames:
             return []
-        if self.calls >= self.max_requests:
-            raise ValueError("Budget exhausted: {}/{}".format(self.calls, self.max_requests))
-        self.calls += 1
-        
+        attempts = self.max_attempts if max_attempts is None else max_attempts
+        if not isinstance(attempts, int) or isinstance(attempts, bool) or attempts < 1:
+            raise ValueError("max_attempts must be a positive integer")
+
         content = self._build_content(self._policy_snapshot, frames, crop_regions=self.crop_regions)
         # Include the actual instructions and references, not just field names.
         fingerprint = self._prompt_fingerprint()
 
-        body = {"model": self.model, "max_tokens": 6000, "reasoning_effort": "low",
+        body = {"model": self.model, "max_tokens": self.request_max_tokens,
+                "reasoning_effort": self.request_reasoning_effort,
                 "messages": [{"role": "user", "content": content}]}
         if not self.enable_thinking:
             body["chat_template_kwargs"] = {"enable_thinking": False}
+
+        last_error = None
+        for attempt in range(1, attempts + 1):
+            if self.calls >= self.max_requests:
+                if last_error is not None:
+                    # Keep the model's actual failure as the headline; the budget note explains
+                    # why it was not retried again.
+                    raise ValueError("Budget exhausted: {}/{} (batch aborted on attempt {}/{} after: {})".format(
+                        self.calls, self.max_requests, attempt, attempts, last_error))
+                raise ValueError("Budget exhausted: {}/{}".format(self.calls, self.max_requests))
+            self.calls += 1
+            api_resp = None
+            try:
+                api_resp = self._post(body)
+                text = api_resp["choices"][0]["message"]["content"]
+                results = self._parse_output(text, frames)
+            except TransportUncertain as exc:
+                # Saved and re-raised without a second attempt: whether the work finished is unknown,
+                # and a retry is the one action that cannot be undone by noticing later.
+                last_error = exc
+                if self.output_dir:
+                    self._save_provenance(fingerprint, body, None, [], frames,
+                                          attempt=attempt, error=str(exc))
+                raise
+            except (ValueError, KeyError, IndexError, TypeError) as exc:
+                last_error = exc
+                # The reply arrived, was parsed, was rejected -- and was billed. Recording usage only on
+                # the accepted path used to make a retried malformed answer invisible in every consumer's
+                # total while the ledger still charged it, so the same compute appeared as two different
+                # numbers depending on which report was read.
+                self._stamp_usage(api_resp, fingerprint, frames, attempt,
+                                  accepted=False, error=str(exc))
+                if self.output_dir:
+                    self._save_provenance(fingerprint, body, api_resp, [], frames,
+                                          attempt=attempt, error=str(exc))
+                continue
+            if self.output_dir:
+                self._save_provenance(fingerprint, body, api_resp, results, frames, attempt=attempt)
+            self._stamp_usage(api_resp, fingerprint, frames, attempt, accepted=True)
+            return results
+        raise last_error
+
+    def _stamp_usage(self, api_resp, fingerprint, frames, attempt, accepted, error=None):
+        """One record per attempt that produced a response, accepted or not.
+
+        ``accepted`` keeps the two figures separable rather than merged: an accepted-reply total is a
+        scoring diagnostic, an all-attempt total is what the box actually spent. Missing usage stays
+        missing -- an absent block is reported as absent, never added up as zero.
+        """
+        usage = (api_resp or {}).get("usage")
+        self.usage.append({"call": self.calls, "attempt": attempt, "accepted": accepted,
+                           "frame_ids": [f["id"] for f in frames] if frames else [],
+                           "policy_hash": self._policy_hash, "fingerprint": fingerprint,
+                           "prompt_version": self._versioned_prompt(),
+                           "tokens": usage or {}, "usage_reported": bool(usage),
+                           **({"error": error} if error else {})})
+
+    def _post(self, body: Dict[str, Any]) -> Dict[str, Any]:
         import urllib.request
         req = urllib.request.Request(
-            self.endpoint + "/v1/chat/completions",
+            self.endpoint,
             data=json.dumps(body).encode("utf-8"),
             headers={"Content-Type": "application/json",
                      "Authorization": "Bearer " + os.environ.get("QWEN_API_KEY", "")},
@@ -259,40 +437,43 @@ class VisionClient:
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                 raw = resp.read().decode("utf-8")
+        except (socket.timeout, TimeoutError) as exc:
+            # The request went out and the answer is unknown: the endpoint may still be generating.
+            # Retrying stacks a second job behind one nobody is waiting for, which on a
+            # single-purpose box spends the machine's whole attention twice.
+            raise TransportUncertain("API request timed out: {}".format(_strip_urls(str(exc))))
+        except urllib.error.URLError as exc:
+            if isinstance(exc.reason, (socket.timeout, TimeoutError)):
+                raise TransportUncertain("API connection timed out: {}".format(
+                    _strip_urls(str(exc.reason))))
+            if isinstance(exc.reason, ConnectionRefusedError):
+                # Nothing was ever listening, so no server-side work can be outstanding and retrying
+                # is harmless. Any other transport break leaves that in doubt.
+                raise ValueError("API request failed: {}".format(_strip_urls(str(exc))))
+            raise TransportUncertain("API connection dropped: {}".format(_strip_urls(str(exc))))
         except Exception as e:
             raise ValueError("API request failed: {}".format(_strip_urls(str(e))))
         try:
-            api_resp = json.loads(raw)
+            return json.loads(raw)
         except (json.JSONDecodeError, ValueError):
             raise ValueError("API returned invalid JSON")
-        try:
-            text = api_resp["choices"][0]["message"]["content"]
-        except (KeyError, IndexError, TypeError):
-            raise ValueError("Malformed API response")
-        try:
-            results = self._parse_output(text, frames)
-        except ValueError:
-            if self.output_dir:
-                self._save_provenance(fingerprint, body, api_resp, [], frames)
-            raise
-        if self.output_dir:
-            self._save_provenance(fingerprint, body, api_resp, results, frames)
-        self.usage.append({"call": self.calls, "frame_ids": [f["id"] for f in frames],
-                           "policy_hash": self._policy_hash, "fingerprint": fingerprint, "tokens": api_resp.get("usage", {})})
-        return results
 
     def _prompt_fingerprint(self) -> str:
-        template = {"model": self.model, "content": self._build_content(self._policy_snapshot, [], crop_regions=self.crop_regions), "enable_thinking": self.enable_thinking}
+        template = {"prompt_version": self._versioned_prompt(), "model": self.model,
+                    "content": self._build_content(self._policy_snapshot, [], crop_regions=self.crop_regions),
+                    "enable_thinking": self.enable_thinking}
         return hashlib.sha256(json.dumps(template, sort_keys=True).encode("utf-8")).hexdigest()[:16]
 
     def _build_content(self, policy_text: str, frames: List[Dict[str, Any]], crop_regions: Optional[bool] = None) -> List[Dict[str, Any]]:
         if crop_regions is None:
             crop_regions = self.crop_regions
             
-        parts = []
+        # The policy is part of the request, not a local variable: v1 built these parts and then
+        # returned content without them, so policy hashes proved the file, never the sent prompt.
+        content: List[Dict[str, Any]] = []
         if policy_text:
-            parts.append("## Cutting Policy\n" + policy_text)
-        
+            content.append({"type": "text", "text": "## Cutting Policy\n" + policy_text})
+
         ref_parts = []
         for i, ref in enumerate(self._processed_refs, 1):
             ref_parts.append("Reference #{} ({})".format(i, ref["label"]))
@@ -323,7 +504,7 @@ class VisionClient:
             "Do NOT include timestamps.\nFrames to classify:\n" +
             "\n".join("id={} t={}s".format(f["id"], f["timestamp"]) for f in frames)
         )
-        content: List[Dict[str, Any]] = [{"type": "text", "text": content_text}]
+        content.append({"type": "text", "text": content_text})
         for ref in self._processed_refs:
             p = Path(ref["path"])
             b64 = base64.b64encode(p.read_bytes()).decode("ascii")
@@ -466,13 +647,51 @@ class VisionClient:
             raise ValueError("Missing ids: {}".format(frame_ids - seen))
         return results
 
-    def _save_provenance(self, fingerprint: str, body: Dict, api_resp: Dict, results: List, frames=None) -> None:
+    def _save_provenance(self, fingerprint: str, body: Dict, api_resp: Dict, results: List, frames=None,
+                         attempt: int = 1, error: Optional[str] = None) -> None:
         if not self.output_dir:
             return
         bdir = self.output_dir / "batches"
         bdir.mkdir(parents=True, exist_ok=True)
-        record = {"call": self.calls, "policy_hash": self._policy_hash, "fingerprint": fingerprint,
+        record = {"call": self.calls, "attempt": attempt, "policy_hash": self._policy_hash,
+                  "prompt_version": self._versioned_prompt(),
+                  "writer_pid": os.getpid(),
+                  "fingerprint": fingerprint,
                   "model": self.model, "frame_ids": [r["id"] for r in (frames if frames is not None else results)],
                   "request": _strip_b64(body), "response": api_resp, "results": results}
-        (bdir / "batch-{:04d}.json".format(self.calls)).write_text(
-            json.dumps(record, indent=2, default=str), encoding="utf-8")
+        if error is not None:
+            record["error"] = error
+        # Named by the request itself, not by this process's call counter: the counter restarts at 1 on
+        # every resume, so the second process used to overwrite the first one's records -- attempts that
+        # were sent, answered and charged, leaving no trace. The prompt fingerprint is identical for two
+        # frames of the same policy, so the digest covers the stripped body too.
+        content_tag = hashlib.sha256(json.dumps(_strip_b64(body), sort_keys=True,
+                                                default=str).encode("utf-8")).hexdigest()[:10]
+        # A request that failed and is re-asked by a later process produces the identical name, because
+        # the attempt counter restarts there too: 4 charged attempts used to leave 2 records, the two
+        # earlier failures gone. Provenance is an append-only log, so a taken name is passed over.
+        return _append_record(bdir, "batch-{}-{}-a{}".format(fingerprint[:8], content_tag, attempt),
+                              record)
+
+
+def _append_record(bdir: Path, stem: str, record: Dict[str, Any], limit: int = 1000):
+    """Write one provenance record to a name nothing has used yet, and return ``(path, slot)``.
+
+    The stem identifies the request and the in-process attempt; it cannot identify the *process*, and a
+    resume restarts the attempt counter, so the same stem can be earned twice by two charged attempts.
+    Slot 1 keeps the historical filename, later slots get ``-r2``, ``-r3``. ``O_EXCL`` closes the gap
+    between looking and writing, and ``provenance_slot`` in the record says which attempt a file is
+    without anyone having to parse a filename.
+    """
+    for slot in range(1, limit + 1):
+        path = bdir / ("{}.json".format(stem) if slot == 1 else "{}-r{}.json".format(stem, slot))
+        try:
+            handle = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        except FileExistsError:
+            continue
+        record["provenance_slot"] = slot
+        with os.fdopen(handle, "w", encoding="utf-8") as stream:
+            json.dump(record, stream, indent=2, default=str)
+        return path, slot
+    raise RuntimeError("{} provenance slots taken in {}; refusing to overwrite a charged attempt"
+                       .format(limit, bdir))

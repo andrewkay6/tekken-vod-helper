@@ -29,6 +29,12 @@ def test_failed_batch_keeps_requested_ids(tmp_path):
          patch('urllib.request.urlopen', return_value=response):
         with pytest.raises(ValueError, match='Score'):
             client.classify(frames)
-    saved = json.loads((tmp_path / 'batches' / 'batch-0001.json').read_text())
-    assert saved['frame_ids'] == [7]
-    assert saved['results'] == []
+    # Provenance is named after the request and its attempt number, so every try keeps its own record.
+    # When the name was a bare call counter all three of these overwrote each other and only the last
+    # failure was left on disk -- which is how a run could spend three attempts and show one.
+    files = sorted((tmp_path / 'batches').glob('batch-*.json'))
+    assert len(files) == 3, [p.name for p in files]
+    for path in files:
+        saved = json.loads(path.read_text())
+        assert saved['frame_ids'] == [7]
+        assert saved['results'] == []

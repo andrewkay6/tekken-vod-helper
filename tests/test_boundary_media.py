@@ -2,8 +2,9 @@ import json, math, os, tempfile, unittest
 from pathlib import Path
 from unittest import mock
 
+from tekken_vod_helper import boundary_media
 from tekken_vod_helper.boundary_media import (
-    ALLOWED_STATES, VisionClient, _FMT, _parse_pts, resolve_source, sample_frames,
+    ALLOWED_STATES, PROMPT_VERSION, VisionClient, _FMT, _parse_pts, resolve_source, sample_frames,
 )
 
 
@@ -393,6 +394,53 @@ class TestVisionClient(unittest.TestCase):
         fp_off = vc_off._prompt_fingerprint()
         fp_on = vc_on._prompt_fingerprint()
         self.assertNotEqual(fp_off, fp_on)
+
+    @mock.patch("urllib.request.urlopen")
+    def test_policy_text_reaches_the_serialized_request(self, mock_urlopen):
+        """Hashing the policy proved the file existed; only the sent bytes prove the model saw it."""
+        vc = VisionClient(max_requests=3, policy_path="docs/cutting-policy.md")
+        frames = self._make_frames(1)
+        mock_resp = mock.Mock()
+        mock_resp.read.return_value = json.dumps({
+            "choices": [{"message": {"content": '[{"id":1,"state":"gameplay","confidence":0.9,'
+                                           '"player1":"","player2":"","character1":"","character2":"",'
+                                           '"score1":null,"score2":null,"evidence":""}]'}}],
+            "usage": {},
+        }).encode()
+        mock_urlopen.return_value.__enter__ = mock.Mock(return_value=mock_resp)
+        mock_urlopen.return_value.__exit__ = mock.Mock(return_value=False)
+        vc.classify(frames)
+
+        request = mock_urlopen.call_args[0][0]
+        body = json.loads(request.data.decode("utf-8"))
+        sent = json.dumps(body["messages"][0]["content"])
+        policy = vc._policy_snapshot
+        self.assertTrue(policy)
+        self.assertIn("## Cutting Policy", sent)
+        for line in [l.strip() for l in policy.splitlines() if len(l.strip()) > 25][:5]:
+            self.assertIn(line[:60], sent.replace("\\n", "\n"))
+        self.assertIn("State precedence", sent.replace("\\n", "\n"))
+
+    def test_prompt_version_travels_with_the_fingerprint_and_provenance(self):
+        vc = VisionClient(max_requests=1)
+        original = vc._prompt_fingerprint()
+        with mock.patch("urllib.request.urlopen") as mock_urlopen:
+            mock_resp = mock.Mock()
+            mock_resp.read.return_value = json.dumps({
+                "choices": [{"message": {"content": '[{"id":1,"state":"gameplay","confidence":0.9,'
+                                               '"player1":"","player2":"","character1":"",'
+                                               '"character2":"","score1":null,"score2":null,'
+                                               '"evidence":""}]'}}],
+                "usage": {},
+            }).encode()
+            mock_urlopen.return_value.__enter__ = mock.Mock(return_value=mock_resp)
+            mock_urlopen.return_value.__exit__ = mock.Mock(return_value=False)
+            vc.classify(self._make_frames(1))
+        self.assertEqual(vc.usage[0]["prompt_version"], PROMPT_VERSION)
+        self.assertEqual(vc.usage[0]["fingerprint"], original)
+        # A batch saved under another revision must never be read as this classifier's work.
+        with mock.patch.object(boundary_media, "PROMPT_VERSION", "vision-qwen-v1"):
+            self.assertNotEqual(vc._prompt_fingerprint(), original)
 
 
 if __name__ == "__main__":

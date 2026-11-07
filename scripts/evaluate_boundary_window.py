@@ -9,7 +9,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-from tekken_vod_helper.boundary_media import resolve_source, sample_frames, VisionClient
+from tekken_vod_helper import local_model
+from tekken_vod_helper.boundary_media import PROMPT_VERSION, resolve_source, sample_frames, VisionClient
 from tekken_vod_helper.boundary_reasoning import TemporalAdjudicator
 from tekken_vod_helper.boundary_workflow import _refine, _build_project, _load_manifest, score_saved_predictions
 
@@ -64,6 +65,12 @@ def main(argv=None):
         parser.add_argument('--'+name,type=int,default=default)
     parser.add_argument('--yt-dlp',default='C:/tmp/tekken-vod-helper-tools/yt-dlp.exe')
     parser.add_argument('--ffmpeg',default='C:/ProgramData/chocolatey/lib/ffmpeg-full/tools/ffmpeg/bin/ffmpeg.exe')
+    parser.add_argument('--endpoint',default=local_model.default_endpoint(),
+                        help='Default: $QWEN_BASE_URL or {}.'.format(local_model.DEFAULT_ENDPOINT))
+    parser.add_argument('--model',default=local_model.default_model(),
+                        help='Historical cached batches record the model id, so replaying an older '
+                             'run directory needs its original model passed here. Default: $QWEN_MODEL '
+                             'or {}.'.format(local_model.DEFAULT_MODEL))
     args = parser.parse_args(argv)
     out = Path(args.output_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -99,15 +106,20 @@ def main(argv=None):
                     known[row['timestamp']] = row
             return [known[f['timestamp']] for f in batch]
 
-    client = ResumeClient(endpoint='http://127.0.0.1:8010', model='qwen3.8-27b',
+    client = ResumeClient(endpoint=args.endpoint, model=args.model,
                           max_requests=args.max_requests - 1, output_dir=str(out), crop_regions=True,
-                          enable_thinking=True, policy_path='docs/cutting-policy.md')
+                          enable_thinking=True,
+                          policy_path=str(ROOT / 'docs' / 'cutting-policy.md'))
     by_id = {f['id']: f for f in frames}
     recovered = []
     for path in sorted((out / 'batches').glob('batch-*.json')):
         batch = json.loads(path.read_text())
-        if batch['policy_hash'] != client._policy_hash or batch['model'] != client.model:
-            raise ValueError('Saved batch profile mismatch: ' + path.name)
+        if (batch['policy_hash'] != client._policy_hash or batch['model'] != client.model
+                or batch.get('prompt_version') != PROMPT_VERSION):
+            raise ValueError(
+                'Saved batch profile mismatch: {}: saved {} / {}, policy {} / {}'.format(
+                    path.name, batch.get('prompt_version'), PROMPT_VERSION,
+                    batch['policy_hash'], client._policy_hash))
         client.calls = max(client.calls, batch['call'])
         results = batch['results']
         if not results:
@@ -140,13 +152,13 @@ def main(argv=None):
         save('refinement-issues.json', issues)
         save('timeline-refined.json', rows)
     print(json.dumps({'phase':'refined','observations':len(rows),'calls':client.calls}), flush=True)
-    policy = Path('docs/cutting-policy.md').read_text(encoding='utf-8')
+    policy = (ROOT / 'docs' / 'cutting-policy.md').read_text(encoding='utf-8')
     saved_response = None
     if (out / 'adjudication.json').exists():
         saved_response = json.loads((out / 'adjudication.json').read_text())['raw_response']
     elif (out / 'adjudication-response.json').exists():
         saved_response = json.loads((out / 'adjudication-response.json').read_text())['choices'][0]['message']['content']
-    adj = TemporalAdjudicator(endpoint='http://127.0.0.1:8010', model='qwen3.8-27b',
+    adj = TemporalAdjudicator(endpoint=args.endpoint, model=args.model,
                               timeout=1800, output_dir=None if saved_response is not None else str(out))
     if saved_response is not None:
         adj._call_model = lambda content: saved_response
