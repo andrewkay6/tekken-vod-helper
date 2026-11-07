@@ -12,6 +12,7 @@ import urllib.request
 # Ensure the package is importable
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from tekken_vod_helper import boundary_contract
 from tekken_vod_helper.boundary_reasoning import (
     TemporalAdjudicationError,
     TemporalAdjudicator,
@@ -335,8 +336,14 @@ class TestTemporalAdjudicatorValidation(unittest.TestCase):
                 adj.propose(timeline, "")
         self.assertIn("missing required fields", str(ctx.exception))
 
-    def test_candidate_start_must_be_stage_select(self):
-        """Candidate starting at non-stage_select should be rejected."""
+    def test_a_start_without_a_stage_grid_is_partial_not_rejected(self):
+        """A set whose opening grid was never broadcast is still a set.
+
+        The old validator rejected this outright, and the rejection was the bug: on BB9 it deleted two
+        labelled matches and published nothing in their place, while the model had found the play. The
+        span is now accepted with its start edge marked partial, so a reviewer is sent to the seconds
+        of tape that decide it.
+        """
         timeline = [
             {"timestamp": 0.0, "state": "character_select", "confidence": 0.9, "player1": "A", "player2": "B", "evidence": "chars"},
             {"timestamp": 5.0, "state": "gameplay", "confidence": 0.95, "player1": "A", "player2": "B", "evidence": "fight"},
@@ -354,12 +361,15 @@ class TestTemporalAdjudicatorValidation(unittest.TestCase):
 
         with patch("urllib.request.urlopen", return_value=mock_resp):
             adj = self._adjudicator()
-            with self.assertRaises(TemporalAdjudicationError) as ctx:
-                adj.propose(timeline, "")
-        self.assertIn("must be stage_select", str(ctx.exception))
+            matches, review, provenance = adj.propose(timeline, "")
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(matches[0]["partial"], ["start"])
+        self.assertEqual(matches[0]["start_completeness"], "supporting")
+        self.assertEqual(matches[0]["end_completeness"], "strong")
+        self.assertEqual(matches[0]["edge_contract"], boundary_contract.CONTRACT_VERSION)
 
-    def test_candidate_end_must_be_controller_prompt(self):
-        """Candidate ending at controller_disconnected should be rejected."""
+    def test_a_disconnect_ending_is_partial_not_rejected(self):
+        """A set that ends because the player left is real footage and stays in the output."""
         timeline = [
             {"timestamp": 0.0, "state": "stage_select", "confidence": 0.95, "player1": "A", "player2": "B", "evidence": "stage"},
             {"timestamp": 5.0, "state": "gameplay", "confidence": 0.95, "player1": "A", "player2": "B", "evidence": "fight"},
@@ -377,9 +387,29 @@ class TestTemporalAdjudicatorValidation(unittest.TestCase):
 
         with patch("urllib.request.urlopen", return_value=mock_resp):
             adj = self._adjudicator()
-            with self.assertRaises(TemporalAdjudicationError) as ctx:
-                adj.propose(timeline, "")
-        self.assertIn("must be controller_prompt", str(ctx.exception))
+            matches, review, provenance = adj.propose(timeline, "")
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(matches[0]["partial"], ["end"])
+        self.assertEqual(matches[0]["start_completeness"], "strong")
+        self.assertEqual(matches[0]["end_completeness"], "supporting")
+
+    def test_both_edges_inferred_is_still_published_as_partial(self):
+        """Play on tape is never dropped because a screen is missing at both ends."""
+        timeline = [
+            {"timestamp": 0.0, "state": "gameplay", "confidence": 0.95, "player1": "A", "player2": "B", "evidence": "fight"},
+            {"timestamp": 5.0, "state": "gameplay", "confidence": 0.95, "player1": "A", "player2": "B", "evidence": "fight"},
+            {"timestamp": 10.0, "state": "gameplay", "confidence": 0.95, "player1": "A", "player2": "B", "evidence": "fight"},
+        ]
+        model_response = json.dumps([
+            {"start_id": "obs_0000", "end_id": "obs_0002", "evidence_ids": [],
+             "disposition": "candidate", "reason": "continuous play, no screens observed"},
+        ])
+        with patch("urllib.request.urlopen", return_value=_make_response(model_response)):
+            adj = self._adjudicator()
+            matches, review, provenance = adj.propose(timeline, "")
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(matches[0]["partial"], ["start", "end"])
+        self.assertIn("no screen", matches[0]["notes"])
 
     def test_candidate_requires_gameplay(self):
         """Candidate with no gameplay between start and end should be rejected."""
@@ -543,7 +573,12 @@ class TestTemporalDetectIntegration(unittest.TestCase):
 
             self.assertEqual(result["status"], "complete")
             self.assertEqual(result["match_count"], 1)
-            self.assertEqual(result["proposal_algorithm"], "temporal-qwen-v1")
+            self.assertEqual(result["proposal_algorithm"], "temporal-qwen-v2")
+            # A timeline that fits one window must still cost exactly one adjudication call.
+            adjudication = result["adjudication"]
+            self.assertEqual(adjudication["window_count"], 1)
+            self.assertEqual(adjudication["model_calls"], 1)
+            self.assertEqual(result["adjudication_model_calls"], 1)
 
             # Verify predictions were written
             pred_path = Path(result["paths"]["predictions"])

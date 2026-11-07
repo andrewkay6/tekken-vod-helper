@@ -1,5 +1,6 @@
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+import re
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 DEFAULT_OVERLAY_ACCENT_COLOR = "#f3135e"
 DEFAULT_OVERLAY_OPACITY = 1.0
@@ -21,6 +22,13 @@ class MatchSegment:
     character2: str = ""
     round_name: str = ""
     notes: str = ""
+    # Two blocks a review pass depends on, kept on the segment so a save/load cannot quietly destroy them.
+    # ``recovery`` is the machine's evidence and reasoning; ``review`` is what a human decided about it.
+    # They were dropped on the floor by ``from_dict`` until the review path existed, which meant opening a
+    # recovered project once was enough to lose the per-game evidence, the uncertainty and every decision
+    # made against it.
+    recovery: Dict[str, Any] = field(default_factory=dict)
+    review: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -32,6 +40,10 @@ class MatchSegment:
             "character2": self.character2,
             "round_name": self.round_name,
             "notes": self.notes,
+            # Written only when present, so a project that never went through the review path saves
+            # byte-for-byte the way it always has.
+            **({"recovery": self.recovery} if self.recovery else {}),
+            **({"review": self.review} if self.review else {}),
         }
 
     @classmethod
@@ -49,6 +61,8 @@ class MatchSegment:
             character2=str(data.get("character2", data.get("char2", "")) or ""),
             round_name=str(data.get("round_name", data.get("round", "")) or ""),
             notes=str(data.get("notes", "") or ""),
+            recovery=dict(data.get("recovery") or {}),
+            review=dict(data.get("review") or {}),
         )
 
 
@@ -159,12 +173,67 @@ class ProjectState:
     characters: List[str] = field(default_factory=list)
     player_characters: Dict[str, str] = field(default_factory=dict)
     matches: List[MatchSegment] = field(default_factory=list)
+    # The review journal lives at project level because a decision is a fact about the whole pass, not
+    # about one row: undo has to find it again after a segment moves, and a re-import must be able to see
+    # what a person already settled before it touches the evidence underneath. ``to_dict`` used to omit it,
+    # which meant Save in the app silently destroyed every answer.
+    review: Dict[str, Any] = field(default_factory=dict)
     overlay: OverlayState = field(default_factory=OverlayState)
     obs: ObsSettings = field(default_factory=ObsSettings)
     startgg: StartggSettings = field(default_factory=StartggSettings)
 
     def sorted_matches(self) -> List[MatchSegment]:
         return sorted(self.matches, key=lambda segment: segment.start)
+
+    @staticmethod
+    def player_key(player: str) -> str:
+        return re.sub(r"\s+", " ", player or "").strip().casefold()
+
+    def remembered_character(self, player: str) -> str:
+        """The operator's usual character for this player, or "" when nothing was ever recorded."""
+        return self.player_characters.get(self.player_key(player), "")
+
+    def character_and_source_for_player(self, player: str,
+                                        observed: Sequence[Tuple[str, str]] = ()) -> Tuple[str, str]:
+        """Resolve a character field and say where the answer came from.
+
+        Two rules the earlier version of this method got wrong. An observation with no name attached is
+        **not** evidence about the player being asked for: the recording saw a character on a side, and
+        which player sat on that side is the orientation question, so a nameless observation is skipped
+        here and handled by ``boundary_review.resolve_characters`` instead of being matched to whoever is
+        being typed. And when the answer is the operator's habit, it is returned as ``"remembered"`` so a
+        caller can never present it as something the tape showed.
+        """
+        wanted = self.player_key(player)
+        for seen_player, seen_character in observed:
+            if not (seen_player or "").strip():
+                continue                      # side evidence, not name evidence
+            if self.player_key(seen_player) == wanted and (seen_character or "").strip():
+                return seen_character, "observed"
+        remembered = self.remembered_character(player)
+        if remembered:
+            return remembered, "remembered"
+        return "", ""
+
+    def character_for_player(self, player: str, observed: Sequence[Tuple[str, str]] = ()) -> str:
+        """What to put in a character field when a player is attached to a match or a bracket set.
+
+        Observed beats remembered, and an unknown stays unknown. A remembered default exists so the
+        operator types less during a live set; it is not evidence about this recording, and a recovered
+        segment can legitimately carry a character nobody has typed before (a per-game change, a debut, a
+        mis-recorded default). Falling through to "" is deliberate: no character is invented to fill a
+        field.
+        """
+        return self.character_and_source_for_player(player, observed=observed)[0]
+
+    def observed_side_characters(self, observed: Sequence[Tuple[str, str]] = ()) -> List[str]:
+        """Characters the recording placed on a side it could not name.
+
+        These are the ones a name-scoped lookup cannot use, and the reason a bracket assignment has to ask
+        about orientation rather than matching strings.
+        """
+        return [character for player, character in observed
+                if not (player or "").strip() and (character or "").strip()]
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -182,6 +251,9 @@ class ProjectState:
             "characters": self.characters,
             "player_characters": self.player_characters,
             "matches": [match.to_dict() for match in self.sorted_matches()],
+            # Written only when present, so a project that never went through the review path keeps saving
+            # exactly the fields it always had.
+            **({"review": self.review} if self.review else {}),
             "overlay": self.overlay.to_dict(),
             "obs": self.obs.to_dict(),
             "startgg": self.startgg.to_dict(),
@@ -208,6 +280,7 @@ class ProjectState:
                 for item in data.get("matches", [])
                 if isinstance(item, dict)
             ],
+            review=dict(data.get("review") or {}) if isinstance(data.get("review"), dict) else {},
             overlay=OverlayState.from_dict(data.get("overlay", {}) if isinstance(data.get("overlay"), dict) else {}),
             obs=ObsSettings.from_dict(data.get("obs", {}) if isinstance(data.get("obs"), dict) else {}),
             startgg=StartggSettings.from_dict(data.get("startgg", {}) if isinstance(data.get("startgg"), dict) else {}),

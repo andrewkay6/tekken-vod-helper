@@ -9,10 +9,15 @@ import ast
 import json
 import os
 from pathlib import Path
+import sys
 import urllib.request
 
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from tekken_vod_helper import local_model
 
 
 def main():
@@ -20,8 +25,10 @@ def main():
     parser.add_argument("task", type=Path)
     parser.add_argument("--context", nargs="*", default=[])
     parser.add_argument("--allow", nargs="*", default=[])
-    parser.add_argument("--endpoint", default=os.environ.get("QWEN_BASE_URL", "http://127.0.0.1:8010"))
-    parser.add_argument("--model", default="qwen3.8-27b")
+    parser.add_argument("--endpoint", default=local_model.default_endpoint(),
+                        help="Default: $QWEN_BASE_URL or {}.".format(local_model.DEFAULT_ENDPOINT))
+    parser.add_argument("--model", default=local_model.default_model(),
+                        help="Default: $QWEN_MODEL or {}.".format(local_model.DEFAULT_MODEL))
     parser.add_argument("--effort", default="low", choices=["low", "medium", "xhigh"])
     parser.add_argument("--max-tokens", type=int, default=32000)
     parser.add_argument("--no-thinking", action="store_true", help="Disable Qwen thinking for bounded implementation packets.")
@@ -46,7 +53,7 @@ def main():
     if args.no_thinking:
         payload["chat_template_kwargs"] = {"enable_thinking": False}
     request = urllib.request.Request(
-        args.endpoint.rstrip("/") + "/v1/chat/completions",
+        local_model.chat_completions_url(args.endpoint),
         data=json.dumps(payload).encode("utf-8"),
         headers={"Content-Type": "application/json", "Authorization": "Bearer " + os.environ.get("QWEN_API_KEY", "local")},
     )
