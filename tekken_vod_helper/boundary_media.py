@@ -183,7 +183,11 @@ def sample_frames(
         try:
             r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                text=True, encoding="utf-8", errors="replace",
-                               timeout=min(900, max(90, span * 2)))
+                               # Streams keep the 15-minute cap; a local master's one-pass cache
+                               # legitimately takes longer (BB9's ~870 s pass sat just under it,
+                               # and BB11's 2 h 11 min original did not fit).
+                               timeout=(min(900, max(90, span * 2)) if headers or "://" in uri
+                                        else max(90, span * 2)))
         except subprocess.TimeoutExpired as exc:
             raise ValueError("Frame extraction timed out") from exc
         if r.returncode != 0:
@@ -573,10 +577,24 @@ class VisionClient:
         try:
             data = json.loads(text)
         except (json.JSONDecodeError, ValueError):
-            m = re.search(r"\[.*\]", text, re.DOTALL)
-            if not m:
-                raise ValueError("Model output is not valid JSON")
-            data = json.loads(m.group(0))
+            # Replies often wrap the array in prose that itself contains brackets ("Press [stick] on
+            # the controller", before or after a fenced block). A greedy [.*] match ran into those, so
+            # decode from each "[" in turn and take the first one that is a whole JSON array.
+            data = None
+            first_error = None
+            decoder = json.JSONDecoder()
+            for m in re.finditer(r"\[", text):
+                try:
+                    candidate, _ = decoder.raw_decode(text, m.start())
+                except (json.JSONDecodeError, ValueError) as exc:
+                    first_error = first_error or exc
+                    continue
+                if isinstance(candidate, list) and candidate and all(isinstance(e, dict) for e in candidate):
+                    data = candidate
+                    break
+            if data is None:
+                # Keep the decoder's own words: they say where the reply broke.
+                raise ValueError("Model output is not valid JSON" + (": {}".format(first_error) if first_error else ""))
         if not isinstance(data, list):
             raise ValueError("Model output must be a JSON array")
         frame_ids = {f["id"] for f in frames}
