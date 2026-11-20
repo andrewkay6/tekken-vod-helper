@@ -811,3 +811,169 @@ def test_the_runs_side_by_side_keep_each_answer_apart(tmp_path):
     assert historic["provenance"]["approval"] == "ungoverned"
     assert historic["provenance"]["attempts_governed_by_a_cap"] is False
     assert historic["provenance"]["incident_recorded"] is True
+
+
+# ----------------------------------------------------------- saved observations, through the real command
+
+
+CACHE = ROOT / "build/work/bb9/detect-1440p-v1/frames"
+CACHE_SOURCE = "build/work/bb9/oct22-1440p.mp4"
+
+
+def _admissible_row():
+    """A real gameplay row this command can be pointed at: an instant, a seat, the string it drew."""
+    rows = json.loads((ROOT / "build/work/bb9/games-pilot-game1/run1/timeline-with-facts.json")
+                      .read_text(encoding="utf-8"))
+    if isinstance(rows, dict):
+        rows = rows.get("rows") or rows.get("observations")
+    for row in rows:
+        at = float(row["timestamp"])
+        name = str(row.get("player1") or "").strip()
+        if STAGE_A[0] < at < STAGE_A[1] and str(row.get("state") or "") == "gameplay" and name:
+            return at, name
+    return None, None
+
+
+def _frame():
+    for path in sorted(CACHE.glob("frame-*.jpg")):
+        return path
+    return None
+
+
+def _observation(tmp_path, *, source, at, raw, observed, frame):
+    import hashlib
+    document = {"observations": [{
+        "kind": "text_observation", "raw_text": raw, "observed_text": observed,
+        "reviewed_by": "machine", "settled_by": "saved_frame_pixels",
+        "evidence_tier": "machine_display_text", "accepted_by": None, "authoritative": False,
+        "bound_participant_identity": False, "requires_operator_confirmation": True,
+        "scope": {"source": source, "side": "p1", "at": round(at, 3),
+                  "frame_file": str(frame.relative_to(ROOT)),
+                  "frame_sha256": hashlib.sha256(frame.read_bytes()).hexdigest()}}]}
+    path = tmp_path / "observations.json"
+    path.write_text(json.dumps(document), encoding="utf-8")
+    return path
+
+
+requires_frame_cache = pytest.mark.skipif(not _frame(), reason="the cached frames are not present")
+
+
+@requires_frame_cache
+def test_the_command_refuses_to_apply_an_observation_without_a_named_recording(tmp_path, monkeypatch,
+                                                                               capsys, no_clients):
+    """`--source` is optional for the band report and mandatory once observations arrive.
+
+    An observation is a claim about one recording's frames. Handed to a run that never said which recording it
+    is, the only honest answer is "nothing applied", because the alternative is applying another file's reading
+    to this one just because the frame path happens to exist on disk.
+    """
+    at, raw = _admissible_row()
+    path = _observation(tmp_path, source=CACHE_SOURCE, at=at, raw=raw, observed=raw + "z",
+                        frame=_frame())
+    module = load_module("report_no_source", "report_saved_header.py", monkeypatch)
+    monkeypatch.setattr(sys, "argv", [str(ROOT / "scripts/report_saved_header.py"), "--responses",
+                                      str(PRESERVED), "--region", *[str(v) for v in STAGE_A],
+                                      "--observations", str(path)])
+    with pytest.raises(SystemExit) as refused:
+        module.run()
+    assert "--observations needs --source" in str(refused.value)
+
+
+@requires_frame_cache
+def test_an_observation_about_another_recording_is_refused_by_name(tmp_path, monkeypatch, capsys,
+                                                                   no_clients):
+    at, raw = _admissible_row()
+    path = _observation(tmp_path, source="someone-elses-oct22.mp4", at=at, raw=raw,
+                        observed=raw + "z", frame=_frame())
+    out = report(["--region", *[str(v) for v in STAGE_A], "--source", CACHE_SOURCE,
+                  "--observations", str(path)], monkeypatch, capsys)
+    block = out["observations"]
+    assert block["accepted"] == 0
+    assert any("scope.source" in row["why"] for row in block["rejected"]), block["rejected"]
+    assert block["run_scope"]["applied_anything"] is False
+    assert block["disposition"]["admitted_text_observations"] == 0
+    assert block["authoritative"] is False and block["counts_as_acceptance"] is False
+    assert not [row for candidate in out["candidates"]
+                for row in (candidate.get("attribution_confidence") or {})
+                .get("display_text_observations") or []]
+
+
+@requires_frame_cache
+def test_a_saved_frame_reading_reaches_the_recovery_through_the_command(tmp_path, monkeypatch, capsys,
+                                                                        no_clients):
+    """The whole point of the seam, proven at the command rather than in a fixture.
+
+    One observation, applied to the row it names, reported once, with the role it earned -- and the numbers
+    that could have been inflated (candidates quoting it, references inside a candidate) kept apart from the
+    count of readings anybody made.
+    """
+    at, raw = _admissible_row()
+    path = _observation(tmp_path, source=CACHE_SOURCE, at=at, raw=raw, observed=raw + "z",
+                        frame=_frame())
+    out = report(["--region", *[str(v) for v in STAGE_A], "--source", CACHE_SOURCE,
+                  "--observations", str(path), "--format-policy", str(FORMAT_POLICY)],
+                 monkeypatch, capsys)
+    block = out["observations"]
+    assert block["accepted"] == 1 and block["unique_text_observations"] == 1, block["rejected"]
+    assert block["run_scope"]["applied_anything"] is True
+    summary = block["disposition"]
+    assert summary["admitted_text_observations"] == 1
+    assert summary["counts"]["applied_within_game"] == 1, summary["observations"]
+    assert summary["untraceable_references"] == []
+    assert summary["identity_bound_by_observations"] == 0 and summary["accepted_by_operator"] == 0
+    reading = summary["observations"][0]
+    assert "within_game" in reading["roles"] and reading["candidates"]
+    assert reading["disposition"] == "applied_within_game"
+    quoted = [row for candidate in out["candidates"]
+              for row in (candidate.get("attribution_confidence") or {}).get(
+                  "display_text_observations") or []]
+    assert len(quoted) == len(reading["candidates"]), "one entry per candidate that quotes the reading"
+    assert {row["observation_id"] for row in quoted} == {reading["observation_id"]}
+    assert sum(row["reference_count"] for row in quoted) == reading["reference_count"]
+    assert quoted[0]["observed_text"] == raw + "z" and quoted[0]["row_text"] == raw
+    assert quoted[0]["role"] == "within_game"
+    assert all(row["accepted_by"] is None and row["bound_participant_identity"] is False
+               for row in quoted)
+    assert block["inference_sent"] is False and out["attempts_charged_now"] == 0
+
+
+@requires_frame_cache
+def test_a_reading_that_names_the_wrong_string_is_refused_by_the_command(tmp_path, monkeypatch, capsys,
+                                                                        no_clients):
+    """Coordinates are not association: right recording, right seat, right instant, wrong nameplate.
+
+    The frame digest proves a file was looked at, not which row its reading belongs to. So the row has to
+    carry the string the observation says it corrects, and when it does not, nothing may be rewritten -- while
+    the disagreement itself stays in the record, because "somebody looked and did not agree" is information.
+    """
+    at, raw = _admissible_row()
+    path = _observation(tmp_path, source=CACHE_SOURCE, at=at, raw="A Tag Nobody Drew",
+                        observed="A Tag Nobody Drewz", frame=_frame())
+    out = report(["--region", *[str(v) for v in STAGE_A], "--source", CACHE_SOURCE,
+                  "--observations", str(path)], monkeypatch, capsys)
+    block = out["observations"]
+    assert block["accepted"] == 1, block["rejected"]
+    summary = block["disposition"]
+    assert summary["counts"]["applied_within_game"] == 0
+    assert summary["counts"]["refused_on_row_text"] == 1, summary["observations"]
+    reading = summary["observations"][0]
+    assert reading["roles"] == ["not_applied_row_text_mismatch"] and reading["candidates"]
+    applied = [row for candidate in out["candidates"]
+               for row in (candidate.get("attribution_confidence") or {}).get(
+                   "display_text_observations") or []]
+    assert applied == [], "a refused reading must not appear among the corrections"
+    refused = [row for candidate in out["candidates"]
+               for row in (candidate.get("attribution_confidence") or {}).get(
+                   "display_text_correction_refusals") or []]
+    assert refused and refused[0]["row_text"] == raw
+    assert refused[0]["declared_text"] == "A Tag Nobody Drew"
+    assert refused[0]["observed_text"] == "A Tag Nobody Drewz"
+    assert "neither string is applied" in refused[0]["why"]
+    assert all(row["accepted_by"] is None and row["bound_participant_identity"] is False
+               for row in refused)
+    # and the trajectory the grouping layer could ever read still holds what the classifier wrote
+    for candidate in out["candidates"]:
+        for game in (candidate.get("attribution_confidence") or {}).get("games") or []:
+            for side in ("p1", "p2"):
+                assert "A Tag Nobody Drewz" not in ((game.get("nameplate_timing") or {}).get("sides")
+                                                    .get(side) or {}).get("trajectory", [])

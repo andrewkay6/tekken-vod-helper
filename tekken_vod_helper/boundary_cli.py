@@ -304,10 +304,59 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--event", default="", help="Event name for the generated project.")
     p.add_argument("--duration", type=float, default=None,
                    help="Recording length in seconds; taken from the recovery when omitted.")
+    p.add_argument("--sequence-timeline", dest="sequence_timeline", default=None,
+                   help="Saved sequence rows (a timeline JSON) to reference for opening questions. "
+                        "Omitted: the plan's own evidence.facts path is used when it resolves, and the "
+                        "project records that no sequence was available when it does not.")
+    p.add_argument("--machine-bounds", dest="machine_bounds", action="store_true",
+                   help="apply the pipeline's own supported clip bounds as machine work: the record keeps "
+                        "the prior instant, basis, uncertainty and fallback flag, and creates no operator "
+                        "decision, human end or acceptance. A boundary a person answered is never moved.")
     p.add_argument("--games-from", dest="games_from", default=None,
                    help="Saved per-game records (a games list, or a document with a 'games' key) to "
                         "attach by containment. Omitted: sets import without game evidence and the "
                         "report says how many.")
+
+    p = sub.add_parser("annotate-footage",
+                       help="Validate a manual pass over a recording into a standalone annotation file: "
+                            "zero model calls, no media, and no reviewed project read or written.")
+    p.add_argument("--recording", required=True,
+                   help="The recording the pass was watched from. Only recorded as provenance -- nothing "
+                                        "is decoded and no player is started.")
+    p.add_argument("--duration", required=True, type=float,
+                   help="Recording length in seconds. Required so the report can name the footage nobody "
+                                        "described instead of leaving it unmentioned.")
+    p.add_argument("--input", required=True,
+                   help="A JSON document with a 'records' list, or a JSONL file, one annotation per line. "
+                        "Each record needs kind, from and optional to, boundary_at, view, note, observer.")
+    p.add_argument("--output", required=True,
+                   help="Where to write the validated annotation file. A reference pass is kept beside the "
+                        "project, never inside it: what a reviewer decided and what a watcher described "
+                        "have different futures, and only the first may move a boundary.")
+    p.add_argument("--observer", default="", help="Who watched. Recorded on every record that named nobody.")
+    p.add_argument("--procedure", default="",
+                   help="How the pass was watched (continuous, at what speed, with what pauses). Recorded "
+                        "verbatim; nothing checks it, and an empty field is written as \"not recorded\" "
+                        "rather than guessed.")
+    p.add_argument("--prior-exposure", dest="prior_exposure", default="",
+                   help="What the watcher had already seen: the machine's boundaries, a reviewed project, "
+                        "a previous pass, or nothing. This is the field that decides whether a later "
+                        "comparison can be called independent of anything, and a CLI that takes no project "
+                        "does not fill it in for you.")
+    p.add_argument("--pass-label", dest="pass_label", default="",
+                   help="A name for this pass, so a second look can be told from the first.")
+
+    p = sub.add_parser("compare-reference",
+                       help="Measure where a reference pass and a project's boundaries agree. Reports "
+                            "agreement only: it cannot, and does not, validate anything.")
+    p.add_argument("--reference", required=True,
+                   help="A file written by annotate-footage.")
+    p.add_argument("--project", required=True,
+                   help="The reviewed project to compare against. Read only.")
+    p.add_argument("--tolerance", required=True, type=float,
+                   help="Seconds within which two openings count as the same one. Stated by the person "
+                        "running the comparison and never read from the project: a tolerance taken from the "
+                        "thing being scored is a conclusion waiting to be widened.")
 
     return parser
 
@@ -448,19 +497,48 @@ def main(argv=None) -> None:
                 loaded = json.loads(Path(args.games_from).read_text(encoding="utf-8"))
                 games = loaded.get("games") if isinstance(loaded, dict) else loaded
             imported = boundary_review.import_recovery(recovery, source=args.recovery, games=games)
+            # The sequence is referenced, never copied: openings are decided against the file this plan was
+            # built from, and a digest makes "the file changed underneath the project" a visible answer
+            # instead of a silent one. The plan names its own facts file, so the association is inherited
+            # rather than invented here.
+            timeline = args.sequence_timeline or str(
+                ((document.get("evidence") or {}).get("facts")) or "")
+            sequence_source: dict = {}
+            if timeline and Path(timeline).is_file():
+                sequence_source = boundary_review.sequence_reference(
+                    timeline, note="named by %s" % (args.recovery if args.sequence_timeline is None
+                                                    else "--sequence-timeline"))
+                sequence_source["path_as_recorded"] = timeline
+                sequence_source["resolved_path"] = str(Path(timeline).resolve())
             target = Path(args.output)
             project = boundary_review.merge_into_project(
                 json.loads(target.read_text(encoding="utf-8")) if target.is_file() else {},
                 imported["segments"], event=args.event,
-                duration=args.duration if args.duration is not None else document.get("duration"))
+                duration=args.duration if args.duration is not None else document.get("duration"),
+                sequence_source=sequence_source)
+            if args.machine_bounds:
+                # The pipeline finishing its own arithmetic, before anything is reported: no decision, no
+                # human end, no acceptance -- and a boundary a person has already answered is left alone.
+                project.setdefault("review", {})["machine_bounds"] = \
+                    boundary_review.apply_machine_bounds(project)
             queue = boundary_review.review_queue(project)
             # Provenance travels in the project, so a reviewer opening it months later can see what the
             # import was told, without needing the terminal output that produced it.
+            #
+            # The saved-observation block travels with it deliberately. Per-set rows say which readings a
+            # candidate quotes; only this block says how many readings there were, how many actually corrected
+            # a gameplay row, and how many were kept as off-play or refused -- and without it a project
+            # carrying three mentions would leave a reader deciding for themselves whether that was three
+            # observations or one quoted twice, which is precisely the ambiguity this revision fixed.
             project["import_provenance"] = {"source": args.recovery,
                                             "games_from": args.games_from or "",
                                             "inference_sent": False, "media_rendered": False,
                                             **imported["accounting"],
+                                            "saved_observations": (document.get("observations") or {}),
                                             "questions_queued": len(queue),
+                                            "sequence_source": (sequence_source.get("path_as_recorded")
+                                                                or "none: openings were not considered"),
+                                            "sequence_rows": sequence_source.get("rows", 0),
                                             "by_kind": {kind: sum(1 for item in queue
                                                                   if item["kind"] == kind)
                                                         for kind in sorted({item["kind"]
@@ -468,6 +546,93 @@ def main(argv=None) -> None:
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(json.dumps(project, indent=2, sort_keys=True) + "\n", encoding="utf-8")
             result = {"written": str(target), **project["import_provenance"]}
+        elif args.command == "annotate-footage":
+            # A reference pass is written from the recording and kept beside the project. Reading a reviewed
+            # project here would be the one way to spoil what makes the pass independent, so this command has
+            # no project argument at all: the only numbers it can see are the tape's own.
+            source = Path(args.input)
+            text = source.read_text(encoding="utf-8")
+            # Three shapes have to be told apart, and two of them are dictionaries: a wrapped document
+            # ({"records": [...]}), a bare list, and JSONL -- where a pass of exactly one record is also a
+            # single line that parses as a dict. A dict with no 'records' key is therefore read as one
+            # annotation, not as a document, or a watcher describing a single stretch of tape is told their
+            # file has no annotations in it.
+            try:
+                supplied = json.loads(text)
+            except json.JSONDecodeError:
+                supplied = None
+            if isinstance(supplied, dict) and isinstance(supplied.get("records"), list):
+                rows = supplied["records"]
+            elif isinstance(supplied, list):
+                rows = supplied
+            elif isinstance(supplied, dict):
+                rows = [supplied]
+            else:
+                rows = [json.loads(line) for line in text.splitlines() if line.strip()]
+            if not isinstance(rows, list) or not rows:
+                raise ValueError("annotations have to be JSONL, a list, one record, or a document with a "
+                                 "'records' list")
+            frame = {"duration": args.duration}
+            records, rejected = [], []
+            for position, row in enumerate(rows, start=1):
+                if not isinstance(row, dict):
+                    rejected.append({"line": position, "error": "an annotation has to be an object"})
+                    continue
+                # Only what the watcher wrote survives: a record cannot arrive carrying a decision, a
+                # boundary of the pipeline's, or anything else that would let it look like review.
+                wanted = {key: value for key, value in row.items()
+                          if key in ("kind", "from", "to", "boundary_at", "view", "note", "observer")}
+                try:
+                    record = boundary_review.annotation_record(
+                        wanted.get("kind"), wanted.get("from"), wanted.get("to"),
+                        boundary=wanted.get("boundary_at"), view=wanted.get("view", ""),
+                        note=wanted.get("note", ""), observer=wanted.get("observer") or args.observer,
+                        project=frame)
+                except boundary_review.InvalidAnswer as exc:
+                    rejected.append({"line": position, "error": str(exc)})
+                    continue
+                record["sequence"] = len(records) + 1
+                records.append(record)
+            coverage_document = boundary_review.reference_pass_document(
+                records, recording=args.recording, duration=args.duration, observer=args.observer,
+                procedure=args.procedure, prior_exposure=args.prior_exposure,
+                pass_label=args.pass_label, rejected=rejected)
+            target = Path(args.output)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(json.dumps(coverage_document, indent=2, sort_keys=True) + "\n",
+                              encoding="utf-8")
+            coverage = coverage_document["coverage"]
+            result = {"written": str(target), "records": len(records), "rejected": len(rejected),
+                      "seconds_annotated": coverage["seconds_annotated"],
+                      "seconds_unwatched": coverage["seconds_unwatched"],
+                      "unwatched_intervals": len(coverage["unwatched_intervals"]),
+                      "whole_recording_annotated": coverage["whole_recording_annotated"],
+                      # Reported here so the person running the pass sees, at the moment they finish, that
+                      # an unrecorded exposure leaves the pass unevaluated -- not by any fault in the
+                      # watching, and fixable without watching again.
+                      "independence_claimable": coverage_document["independence_claimable"],
+                      "independence_unclaimed_because":
+                          coverage_document["independence_unclaimed_because"],
+                      "inference_sent": False, "media_rendered": False}
+        elif args.command == "compare-reference":
+            # A measurement of agreement between a reference pass and a project, and nothing else. The
+            # tolerance is the caller's, never read from the project, and the report cannot say "validated"
+            # at any tolerance -- so neither can this command.
+            reference = json.loads(Path(args.reference).read_text(encoding="utf-8"))
+            project = json.loads(Path(args.project).read_text(encoding="utf-8"))
+            plan = boundary_review.export_plan(project)
+            report = boundary_review.compare_reference(
+                reference, [{"start": clip["start"]} for clip in plan["clips"]],
+                tolerance_seconds=args.tolerance)
+            report["reference"] = str(args.reference)
+            report["project"] = str(args.project)
+            report["reference_method"] = (reference or {}).get("method")
+            report["reference_independence_claimable"] = (reference or {}).get(
+                "independence_claimable")
+            report["openings_offered_by_the_reference"] = len(
+                [row for row in (reference or {}).get("records") or []
+                 if row.get("kind") == "play_new_match"])
+            result = report
         else:
             parser.print_help()
             sys.exit(1)

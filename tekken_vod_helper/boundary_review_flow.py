@@ -33,6 +33,23 @@ DEFAULT_CONTEXT_SECONDS = 12.0
 FLAT_FIELDS = ("player1", "player2", "character1", "character2", "round_name", "notes")
 
 
+def _candidate_label(adjust):
+    # type: (Dict[str, Any]) -> str
+    """The text on the button that offers an earlier instant to look at.
+
+    It names the level, because jumping to a round's opening is not jumping to a set start. It also names the
+    width when the sampling only bounds the instant, because an interval shown as a point is how a proposal
+    gets read as a measurement -- and the label is the one place a reviewer meets that number before deciding
+    whether to move the playhead at all. Rounding is presentation only: ``jump_to`` keeps full precision, so
+    no disagreement between two frames can be created by the sentence describing them.
+    """
+    level = adjust.get("jump_to_level") or "none"
+    width = adjust.get("jump_to_uncertainty_seconds")
+    if level == "round_opening" and isinstance(width, (int, float)) and not isinstance(width, bool):
+        return "Look just before the candidate (%s, ±%s s)" % (level, review.span_text(width))
+    return "Look just before the candidate (%s)" % level
+
+
 class ReviewFlow:
     """Every decision a reviewer can make about a project, callable without a display."""
 
@@ -67,7 +84,22 @@ class ReviewFlow:
         return {"duration": self.state.duration, "video_path": self.state.video_path,
                 "event_name": self.state.event_name, "event": self.state.event_name,
                 "matches": [view for _match, view in self.rows()],
-                "review": self.state.review}
+                "review": self.state.review,
+                # The same evidence the raw helper is given, or the queue a reviewer sees and the queue a
+                # test exercised are two different things -- which is exactly how the sequence path shipped
+                # working in one and empty in the app.
+                "sequence_source": self.state.sequence_source,
+                "sequence_rows": self.state.sequence_rows}
+
+    def sequence_provenance(self) -> Dict[str, Any]:
+        """What the saved sequence can support right now, in the reviewer's terms.
+
+        Whether openings were considered at all is a fact about this project's evidence, and a reviewer
+        told "no opening problems found" while no sequence is on disk would be misled twice: once by the
+        absence, once by the wording.
+        """
+        _rows, provenance = review.project_sequence(self.project())
+        return provenance
 
     def store(self) -> review.ReviewStore:
         return review.ReviewStore(self.project())
@@ -147,12 +179,157 @@ class ReviewFlow:
         return changed
 
     def undo_last(self) -> Optional[str]:
+        """The most recent answer that can still be withdrawn.
+
+        A plain undo deletes the decision record but leaves its log entry behind, and a structural undo
+        truncates the log to where it stood before the change. Scanning the log alone therefore names an
+        answer that is already gone: the panel calls ``undo`` on it, gets False, and reports "nothing to
+        undo" while every earlier decision sits unreachable behind it. Only an entry with a snapshot to
+        restore or a decision still in force is offered.
+        """
+        state = self.store().state
+        snapshots = state.get("snapshots") or {}
+        decided = {entry.get("fingerprint") for entry in (state.get("decisions") or [])}
         for entry in reversed(list(self.state.review.get("log") or [])):
-            if entry.get("action") in ("decide", "regroup", "split"):
-                return entry.get("fingerprint")
+            # A claim is the most structural thing on the list: it put a row where there was none. Leaving it
+            # out would make "Undo last" step back over the end answer it recorded and leave the row behind,
+            # which is not the thing the reviewer just did.
+            if entry.get("action") not in ("decide", "regroup", "split", "claim"):
+                continue
+            fingerprint = entry.get("fingerprint")
+            if fingerprint and (fingerprint in snapshots or fingerprint in decided):
+                return fingerprint
         return None
 
     # ---------------------------------------------------------------------------- boundary editing
+
+    def opening_candidate(self, fingerprint: str) -> Dict[str, Any]:
+        """The earlier instant the saved sequence supports for a start question, with its level.
+
+        Looking is not moving. This says where to put the playhead so a person can judge the proposal
+        against the boundary the pipeline predicted; the boundary itself changes only when they answer, so a
+        recovered candidate can never become a runtime hint by way of being displayed.
+        """
+        item = self.item(fingerprint, view="all")
+        if item is None:
+            raise review.InvalidAnswer("no question %s in this project" % fingerprint)
+        adjust = item.get("adjust") or {}
+        at = adjust.get("jump_to")
+        return {"at": at, "level": adjust.get("jump_to_level"),
+                # The width travels with the instant. A recovered opening is an interval, and an API that
+                # returns the midpoint alone hands a frontend a precision the sampling never supported -- the
+                # state-word error one layer up, and the second opinion's job is to catch exactly that.
+                "uncertainty_seconds": adjust.get("jump_to_uncertainty_seconds"),
+                "first_active_at": adjust.get("first_active_gameplay_at"),
+                "first_active_uncertainty_seconds": adjust.get("first_active_uncertainty_seconds"),
+                "first_active_status": adjust.get("first_active_status"),
+                "current": (item.get("boundary") or {}).get("at"), "playable": at is not None,
+                "sequence": self.sequence_provenance(), "inference_sent": False}
+
+    # ---------------------------------------------------------------------------------- proposals
+
+    def propose_opening(self, segment_start: float, *, at: Optional[float] = None,
+                        why: Optional[str] = None, evidence: Optional[Dict[str, Any]] = None,
+                        uncertainty_seconds: Optional[float] = None,
+                        generated_by: str = "opening_sequence") -> Dict[str, Any]:
+        """Ask the reviewer to move an opening, without moving it.
+
+        Given no instant, the suggestion is the one the saved sequence already supports -- the very
+        ``jump_to``, level and width :meth:`opening_candidate` publishes, so no second idea about where a set
+        starts is invented here. Given one, the caller states its own evidence, which is how a proposal comes
+        to rest on character and stage continuity rather than on a cue the walk recognises.
+
+        Either way the row does not move, the owner's question stays open, and nothing about the export
+        changes. A machine may put a number in front of a person; it may not become the person.
+        """
+        fingerprint = self.start_fingerprint(segment_start)
+        item = self.item(fingerprint, view="all")
+        if item is None:
+            raise review.InvalidAnswer("no opening question for %.6f" % segment_start)
+        current = float((item.get("boundary") or {}).get("at") or segment_start)
+        candidate = self.opening_candidate(fingerprint)
+        if at is None:
+            at = candidate.get("at")
+            if uncertainty_seconds is None:
+                uncertainty_seconds = candidate.get("uncertainty_seconds")
+            if why is None:
+                why = ("the saved sequence supports this opening at level %s"
+                       % (candidate.get("level") or "unknown"))
+            if at is None:
+                raise review.InvalidAnswer(
+                    "the sequence offers no earlier instant for %.6f, so a proposal here would have to "
+                    "invent one" % segment_start)
+        if float(at) >= current - 1e-9:
+            raise review.InvalidAnswer(
+                "an opening proposal has to be earlier than the boundary it questions (%.6f is not before "
+                "%.6f); the row is already at the instant the evidence supports" % (float(at), current))
+        record = review.proposal_record(
+            "opening", float(at), why=why or "", evidence=evidence or {},
+            uncertainty_seconds=uncertainty_seconds, generated_by=generated_by)
+        record["current_start"] = current
+        record["seconds_saved"] = round(current - float(at), 6)
+        record["play_cut_at_current"] = (candidate.get("first_active_at") is not None
+                                         and float(candidate["first_active_at"]) <= current + 0.001)
+        return self.store().propose({"start": segment_start}, record)
+
+    def propose_end(self, segment_start: float, at: float, *, why: str,
+                    evidence: Optional[Dict[str, Any]] = None,
+                    uncertainty_seconds: Optional[float] = None, purpose: str = "presentation",
+                    generated_by: str = "opening_sequence") -> Dict[str, Any]:
+        """Ask for a different clip end, and say plainly whether the ask is evidence or presentation.
+
+        ``purpose`` is not decoration. Proposing an extension because a read *confirms the winner* and
+        proposing one because the victory camera is nicer to watch are different claims, and the second does
+        not become the first by being recorded in the same field.
+        """
+        record = review.proposal_record("end", float(at), why=why, evidence=evidence or {},
+                                        uncertainty_seconds=uncertainty_seconds, purpose=purpose,
+                                        generated_by=generated_by)
+        row = next((view for _match, view in self.rows()
+                    if number(view.get("start")) == number(segment_start)), None)
+        if row is None:
+            raise review.InvalidAnswer("no row starting at %.6f" % segment_start)
+        clip = review.resolve_clip_end(dict(row), following=None,
+                                       duration=self.state.duration or None)
+        record["current_end"] = clip.get("end")
+        record["current_end_basis"] = clip.get("basis")
+        return self.store().propose({"start": segment_start}, record)
+
+    def proposals(self, segment_start: Optional[float] = None) -> List[Dict[str, Any]]:
+        return self.store().proposals(segment_start)
+
+    def apply_proposal(self, segment_start: float, kind: str, *,
+                       proposal_id: Optional[str] = None, note: str = "") -> Dict[str, Any]:
+        """The operator's own act of taking a suggestion: it becomes their decision, and stops being pending.
+
+        The boundary moves through the same controller a person driving the tab would use, so the decision
+        carries their authorship and none of the proposal's -- and undo withdraws the boundary, not a label.
+        """
+        store = self.store()
+        record = store.find_proposal(segment_start, kind, proposal_id=proposal_id)
+        origin = float(record["at"])
+        if kind == "opening":
+            decision = self.move_start(self.start_fingerprint(segment_start), origin)
+        else:
+            decision = self.set_human_end(segment_start, origin)
+        # Stamped by identity: an applied opening proposal no longer lives on a row that starts where the
+        # caller named, because applying it is precisely what moved the row.
+        store.set_proposal_status(None, kind, review.PROPOSAL_APPLIED,
+                                  note=note or ("applied the machine proposal at %.3f s" % origin),
+                                  record=record)
+        return decision
+
+    def reject_proposal(self, segment_start: float, kind: str, *,
+                        proposal_id: Optional[str] = None, note: str = "") -> Dict[str, Any]:
+        """Refuse a suggestion. The boundary is left exactly where it was, and the refusal is the record.
+
+        The refused record stays on the row -- history the next pass has to see -- and a fresh proposal of the
+        same kind may be filed beside it, which is why resolution goes by id or by "the live one" and never by
+        "the first of this kind".
+        """
+        return self.store().set_proposal_status(segment_start, kind, review.PROPOSAL_REFUSED,
+                                                note=note or "refused by the reviewer",
+                                                proposal_id=proposal_id)
 
     def nudge_boundary(self, fingerprint: str, seconds: float) -> Dict[str, Any]:
         """Move the boundary a question is about by a signed number of seconds.
@@ -338,6 +515,149 @@ class ReviewFlow:
         store.state["log"].append({"action": "split", "fingerprint": fingerprint,
                                    "note": "cut at %.3f" % cut})
         return decision
+
+    def claim_footage(self, start: float, end: Optional[float] = None, *,
+                      note: str = "") -> Dict[str, Any]:
+        """Make footage that no candidate covered into a row a reviewer can answer questions about.
+
+        Before this, an operator who played an unclaimed stretch and recognised a match in it had nowhere
+        to say so: the row could be played, and it could not be claimed, so the recording exported without
+        it and the coverage report went on calling the footage unplaced. A new row is the only thing that
+        puts a stretch into the plan.
+
+        What it arrives with is the honest minimum: no machine evidence, so both boundary questions are open
+        and every claim about it starts at "not accepted by anyone". What it must not arrive with is a
+        boundary inside another clip -- that is a split or a merge, and each has its own answer.
+
+        Rejection is a no-op, in both senses. Every question a claim raises is asked and answered *before*
+        the project is touched, and the mutation itself runs inside a capture-and-restore, because a row
+        appended and then abandoned by a later validation is worse than no row: the count changed, the
+        coverage changed, an export job appeared for footage nobody approved, and there is no undo entry to
+        take it back, since undo records answers and this was never one.
+        """
+        placed, placed_end, notes = self._checked_claim(start, end)
+        captured = self._capture()
+        try:
+            snapshot = self._snapshot()
+            segment = MatchSegment(start=placed, end=placed_end,
+                                   notes=note or "operator claimed footage no candidate covered",
+                                   recovery={},
+                                   # Where the row came from, in the row. It is not machine evidence and it
+                                   # is not a decision about a boundary: it says a person watched this tape
+                                   # and asked for it to count.
+                                   review={"claim": {"note": note, "end_claimed": placed_end is not None,
+                                                     "clamped": notes}})
+            self.state.matches.append(segment)
+            self.reflow()
+            store = self.store()
+            if placed_end is not None:
+                self.set_human_end(placed, placed_end)
+            store.recompute_all()
+            question = next((candidate for candidate in self.queue("all")
+                             if candidate["kind"] == "new_match"
+                             and number(candidate["segment"]["start"]) == placed), None)
+            # The log entry names the question it can be stepped back over, because that is what "Undo
+            # last" reads.
+            store.state.setdefault("log", []).append({"action": "claim", "start": placed,
+                                                      "end": placed_end, "note": note,
+                                                      "fingerprint": (question["fingerprint"]
+                                                                      if question else None)})
+            if question is not None:
+                self._store_snapshot(question["fingerprint"], snapshot, "claim")
+        except Exception:
+            self._rollback(captured)
+            raise
+        return {"claimed_from": placed, "claimed_to": placed_end, "question": (
+            question["fingerprint"] if question else None)}
+
+    def _checked_claim(self, start, end):
+        """Every reason a claim can be refused, found before anything is refused *after*.
+
+        The order is the point. An opening is checked against the row that follows it and an end against the
+        opening it must stop before, and both need the neighbours as they stand -- which is why neither can
+        wait until the new row is in the list, where it becomes its own neighbour and a legitimate claim
+        turns into a collision with itself.
+        """
+        duration = self.state.duration or None
+        rows = self.rows()
+        existing = sorted(value for value in (number(row.get("start")) for _match, row in rows)
+                          if value is not None)
+        # Validate the raw start before trusting it as a position: an infinite or missing opening has no
+        # neighbours to check against, and comparing against NaN says "yes" to everything.
+        wanted = number(start)
+        nearest = next((value for value in existing
+                        if wanted is not None and value > wanted + review.INSTANT_EPSILON), None)
+        placed, clamp_note = review.validate_boundary_value(
+            start=None, value=start, duration=duration, following_start=nearest)
+        for _match, row in rows:
+            claimed_from = number(row.get("start"))
+            if claimed_from is None:
+                continue
+            if abs(placed - claimed_from) <= review.INSTANT_EPSILON:
+                raise review.InvalidAnswer(
+                    "a row already opens at %s. Two matches cannot start at one instant on one recording: "
+                    "if this footage belongs to that row, answer that row's questions; if it holds another "
+                    "match, cut the row above at the opening you saw and claim the rest"
+                    % review.instant_text(claimed_from))
+            if placed <= claimed_from + review.INSTANT_EPSILON:
+                continue
+            claimed_to = number(review.resolve_clip_end(row, duration=duration).get("end"))
+            if claimed_to is not None and placed < claimed_to - review.INSTANT_EPSILON:
+                raise review.InvalidAnswer(
+                    "%s is already inside the clip that opens at %s and stops at %s. Footage two clips "
+                    "claim is a split or a merge: cut the row above, or fold this one into it, rather than "
+                    "starting a second match on top of the first"
+                    % (review.instant_text(placed), review.instant_text(claimed_from),
+                       review.instant_text(claimed_to)))
+        if end is None:
+            return placed, None, clamp_note
+        # The end is asked the same question the exporter will ask it later: does this clip stop before
+        # whatever opens next. Answering it here is what makes a refusal leave nothing behind.
+        after = next((value for value in existing if value > placed + review.INSTANT_EPSILON), None)
+        placed_end, end_note = review.validate_boundary_value(
+            start=placed, value=end, duration=duration, following_start=after)
+        note = " ".join(text for text in (clamp_note, end_note) if text) or None
+        return placed, placed_end, note
+
+    def _capture(self) -> Dict[str, Any]:
+        """The whole mutable project, deep-copied, so a half-finished action can be un-done exactly."""
+        return {"matches": copy.deepcopy([match.to_dict() for match in self.state.matches]),
+                "review": copy.deepcopy(self.state.review)}
+
+    def _rollback(self, captured: Dict[str, Any]) -> None:
+        self.state.matches = [MatchSegment.from_dict(view) for view in captured["matches"]]
+        self.state.review = captured["review"]
+        self.reflow()
+
+    def annotate_footage(self, kind: str, start: float, end: Optional[float] = None, *,
+                         boundary: Optional[float] = None, view: str = "", note: str = "",
+                         observer: str = "") -> Dict[str, Any]:
+        """Write down what a person saw in a stretch of tape.
+
+        It moves nothing, accepts nothing and validates nothing.
+
+        The disposition path exists because footage the pipeline never proposed has nowhere else to go: an
+        operator can watch a gap and know it is a match, and the only record available was a free-text note
+        that no comparison could read. A record carries the exact instant somebody says a match opened, what
+        was on screen there, and their words about it, so a later pass has something to line up against --
+        and so "somebody watched this" is a fact on the page instead of something inferred from silence.
+        """
+        record = review.annotation_record(kind, start, end, boundary=boundary, view=view, note=note,
+                                         observer=observer,
+                                         project={"duration": self.state.duration or None})
+        block = self.state.review if isinstance(self.state.review, dict) else {}
+        existing = [item for item in (block.get("annotations") or []) if isinstance(item, dict)]
+        record["sequence"] = len(existing) + 1
+        block["annotations"] = existing + [record]
+        self.state.review = block
+        block.setdefault("log", []).append({"action": "annotate", "kind": kind, "from": record["from"],
+                                           "to": record["to"], "boundary_at": record["boundary_at"]})
+        return record
+
+    def footage_coverage(self) -> Dict[str, Any]:
+        """What has been said about the tape, and how much of it nobody has looked at yet."""
+        return review.footage_coverage({"duration": self.state.duration or None},
+                                       annotations=(self.state.review or {}).get("annotations"))
 
     def _snapshot(self) -> Dict[str, Any]:
         """Everything an undo has to put back: the rows, and the journal as it stood beforehand.
@@ -612,14 +932,49 @@ class ReviewFlow:
                 "exportable": len(plan["exportable"]),
                 "unplaced_seconds": plan["counts"]["unplaced_seconds"],
                 "openings_needing_review": plan["counts"]["openings_needing_review"],
-                "boundary_accepted": plan["counts"]["boundary_accepted"],
+                # A different count from the one above, and the tab has to be able to say which is which:
+                # an opening needing a reading includes the ones where the rows simply stop short, and on
+                # BB9 that is five rows against three the saved clock actually contradicts.
+                "machine_contradicted_starts": sum(1 for clip in plan["clips"]
+                                                   if clip["boundary"]["machine_supports_start"]
+                                                   == "contradicted"),
+                # Also apart, because it answers a different question: not what the evidence says about the
+                # boundary, but that the pipeline's own readings of it say different things.
+                "start_readings_conflict": sum(1 for clip in plan["clips"]
+                                               if clip["boundary"]["start_readings_conflict"]),
+                "operator_accepted": plan["counts"]["operator_accepted"],
+                "operator_approved_partials": plan["counts"]["operator_approved_partials"],
+                # Its own number, and deliberately not folded into any of the counts above: a proposal has
+                # answered nothing, moved nothing and been accepted by nobody. Without it on the summary line
+                # a reviewer cannot see that suggestions are waiting without opening rows one by one.
+                "machine_proposals_pending": plan["counts"]["machine_proposals_pending"],
+                "machine_supported_starts": plan["counts"]["machine_supported_starts"],
+                "unknown_starts": plan["counts"]["unknown_starts"],
+                # Its own line, and its own fallback half, because a machine-applied bound is neither a cue
+                # settled at this frame nor a bound with nothing behind it -- and a reviewer skimming for
+                # "how much of this did the pipeline decide for itself, and how much of that was a fallback"
+                # cannot get at it from either neighbour.
+                "machine_applied_starts": plan["counts"]["machine_applied_starts"],
+                "machine_applied_starts_fallback": plan["counts"]["machine_applied_starts_fallback"],
+                # Always zero until an independent reference exists, and printed even when it is: the
+                # number a report must never be allowed to imply is "validated".
+                "independently_validated": plan["counts"]["independently_validated"],
                 "inference_sent": False}
 
     def unresolved_gameplay(self) -> List[Dict[str, Any]]:
-        """Every interval no clip claims, plus every clip on hold, in tape order."""
+        """Every interval no clip claims, plus every clip on hold, in tape order.
+
+        Each row keeps the three things that are easy to collapse into one: what the stretch *is* (an
+        interval no candidate claims), what the saved evidence says about it (play reaches it, or it does
+        not, or nothing was recorded either way), and how it would be known if anybody wanted to know. The
+        last two are the difference between "no play here" and "nobody looked", and a list that shows only
+        the first invites the wrong one.
+        """
         plan = self.export_plan()
         rows = [{"from": row["from"], "to": row["to"], "seconds": row["seconds"],
                  "kind": "gap", "edge": row["edge"], "why": row["why"],
+                 "what_it_is": row.get("what_it_is") or "",
+                 "how_it_would_be_known": row.get("how_it_would_be_known") or "",
                  "gameplay_seen_in_saved_evidence": row["gameplay_seen_in_saved_evidence"],
                  "playable": True} for row in plan["unplaced_play"]]
         for clip in plan["held"]:
@@ -628,6 +983,9 @@ class ReviewFlow:
                          else round(clip["end"] - clip["start"], 6),
                          "kind": "held", "edge": "candidate",
                          "why": "; ".join(clip["reasons"]) or "held",
+                         "what_it_is": "a clip the project proposes and the plan refuses to render",
+                         "how_it_would_be_known": "answer the question it is held for, or watch the "
+                                                  "boundary it is argued about",
                          "gameplay_seen_in_saved_evidence": None,
                          # A held clip is the most watchable thing on the list: the reviewer has to see the
                          # boundary that is being argued about before they can answer the question about it.
@@ -653,6 +1011,10 @@ class ReviewPanel:
         self.context_wide: Dict[str, float] = {}
         self.playback: Optional[Dict[str, Any]] = None
         self.preferred_index: Optional[int] = None
+        # Which proposal the card currently on screen is offering, remembered at render time. A button that
+        # resolves "the live proposal" when it is pressed will happily apply a suggestion that appeared after
+        # the reviewer looked at it; remembering what was drawn is what lets a stale press refuse instead.
+        self.rendered: Optional[Dict[str, Any]] = None
 
     def state_view(self) -> Dict[str, Any]:
         items = self.flow.queue(self.view)
@@ -665,6 +1027,11 @@ class ReviewPanel:
                              items[0]["fingerprint"] if items else None)
         selected = next((item for item in items if item["fingerprint"] == self.selected), None)
         plan = self.flow.export_plan()
+        # Recorded as part of drawing the card, not consulted to change what the card says: this is the
+        # identity the apply/reject buttons under it were rendered for.
+        self.rendered = ({"fingerprint": self.selected, "kind": (selected.get("proposal") or {}).get("kind"),
+                          "proposal_id": (selected.get("proposal") or {}).get("proposal_id")}
+                         if selected and selected.get("proposal") else None)
         return {"version": PANEL_VERSION,
                 "source": {"video_path": self.flow.state.video_path,
                            "has_source": bool(self.flow.state.video_path),
@@ -683,9 +1050,35 @@ class ReviewPanel:
                                 "reasons": clip["reasons"], "review_kind": clip["review_kind"]}
                                for clip in plan["held"]],
                 "unresolved": self.flow.unresolved_gameplay(),
+                "footage_actions": self._footage_actions(self.flow.unresolved_gameplay()),
                 "coverage": self._coverage_view(plan),
+                # What has been said about the tape and what nobody has looked at. A stretch with no record
+                # is unwatched, and it stays listed as unwatched however many of its neighbours were noted:
+                # an annotation pass that stops halfway is not a reviewed recording.
+                "footage_coverage": self.flow.footage_coverage(),
                 "message": self.message,
                 "costs_inference": False}
+
+    def _footage_actions(self, unresolved: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """What a watcher can do with a stretch of tape, per stretch, in tape order.
+
+        Two kinds of action and nothing else. A gap can become a row -- the only way a match nobody marked
+        reaches an export -- or it can be described and left alone. Neither marks the footage reviewed: the
+        row a claim creates arrives with its opening still open, and a description leaves every boundary
+        exactly where it was.
+        """
+        actions = []
+        for row in unresolved:
+            if row.get("kind") != "gap" or row.get("from") is None:
+                continue
+            span = "%s_%s" % (row["from"], row.get("to") if row.get("to") is not None else row["from"])
+            actions.append({"from": row["from"], "to": row.get("to"), "seconds": row.get("seconds"),
+                            "controls": [{"action": "claim-interval:" + span,
+                                          "label": "Claim it as a match"}] +
+                                         [{"action": "dispose:%s:%s" % (kind, span), "label": label}
+                                          for kind, label in sorted(review.FOOTAGE_DISPOSITIONS.items())
+                                          if kind != "play_new_match"]})
+        return actions
 
     @staticmethod
     def _coverage_view(plan: Dict[str, Any]) -> Dict[str, Any]:
@@ -697,6 +1090,10 @@ class ReviewPanel:
         """
         coverage = plan.get("coverage") or {}
         candidates, jobs = coverage.get("candidates") or {}, coverage.get("exportable_jobs") or {}
+        # The sequence provenance travels with the coverage view because it qualifies every number next to
+        # it: "no opening candidate" means something different when no rows were available at all, and the
+        # panel line that renders it reads from here.
+        sequence = plan.get("sequence") or {}
         uncovered = coverage.get("uncovered_by_exportable_jobs") or []
         return {"duration": coverage.get("duration"),
                 "candidates_seconds": candidates.get("seconds", 0.0),
@@ -712,7 +1109,51 @@ class ReviewPanel:
                                      if row.get("gameplay_seen_in_saved_evidence") is False],
                 "openings_needing_review": len(plan.get("opening_review") or []),
                 "exportable_is_not_accepted": plan.get("exportable_is_not_accepted"),
-                "invalid_bounds": coverage.get("invalid_bounds") or []}
+                "boundary_summary": ReviewPanel._boundary_summary(plan),
+                "invalid_bounds": coverage.get("invalid_bounds") or [],
+                "sequence": sequence}
+
+    @staticmethod
+    def _boundary_summary(plan: Dict[str, Any]) -> Dict[str, Any]:
+        """Four counts, because one "accepted" number is what got this wrong in the first place."""
+        clips = plan.get("clips") or []
+        return {
+            "exportable": sum(1 for clip in clips if clip["boundary"]["exportable"]),
+            "held": sum(1 for clip in clips if not clip["boundary"]["exportable"]),
+            "start_supported": sum(1 for clip in clips
+                                   if clip["boundary"]["machine_supports_start"] == "supported"),
+            "start_contradicted": sum(1 for clip in clips
+                                      if clip["boundary"]["machine_supports_start"] == "contradicted"),
+            "start_unknown": sum(1 for clip in clips
+                                 if clip["boundary"]["machine_supports_start"] == "unknown"),
+            # Reported apart from all three, because it is a different fact: not what the evidence says about
+            # the boundary, but that the pipeline's own readings of it do not agree with each other. A row
+            # can be counted here and "supported" at the same time, and that is not a contradiction to
+            # resolve by arithmetic -- it is the frames to go and look at.
+            "start_readings_conflict": sum(1 for clip in clips
+                                           if clip["boundary"]["start_readings_conflict"]),
+            "operator_accepted": sum(1 for clip in clips
+                                     if clip["boundary"]["operator_accepted_boundary"]),
+            # Counted apart from every one of those: a proposal has answered nothing, moved nothing and been
+            # accepted by nobody. Without its own number on the line a reviewer cannot see that work is
+            # waiting on them without selecting rows one by one.
+            "machine_proposals_pending": sum(1 for clip in clips
+                                             if clip["boundary"].get("machine_proposal_pending")),
+            # Its own line, because "a person approved shipping this" and "a person accepted this boundary"
+            # are different claims and the first one used to be counted as the second.
+            "operator_approved_partial": sum(1 for clip in clips
+                                             if clip["boundary"]["partial_override"]),
+            "independently_validated": 0,
+            "note": ("exportable is permission to cut a file; supported is what the machine evidence says "
+                     "about the instant the boundary is on now; operator_accepted is a person's decision "
+                     "that this is the boundary; an approved partial is a person agreeing to ship footage "
+                     "that loses its opening or its ending, which does not certify the boundary; "
+                     "machine proposals awaiting a decision are a machine's suggestion about where a bound "
+                     "could move: no boundary moved, no question closed, nobody accepted anything; "
+                     "start_readings_conflict counts rows whose saved readings do not agree with each other "
+                     "about where the opening is, which is neither support nor contradiction and is settled "
+                     "by watching the frames, not by ranking the cues; validated needs a reference outside "
+                     "both, and no boundary on this recording has one")}
 
     def _question_view(self, item: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         if item is None:
@@ -729,14 +1170,36 @@ class ReviewPanel:
         buttons.append({"action": "undo", "label": "Undo this",
                         "enabled": item.get("decision") is not None})
         buttons.append({"action": "undo-last", "label": "Undo last", "enabled": bool(log)})
+        # The queue builds the proposed-versus-current block; the tab shows it and offers the two answers a
+        # person can give it. Nothing here recomputes an instant, so the card and the queue cannot drift.
+        proposal = item.get("proposal")
+        proposal_buttons = ([{"action": "proposal:apply", "label": "Apply this proposal",
+                              "enabled": True, "needs_note": False},
+                             {"action": "proposal:reject", "label": "Reject this proposal",
+                              "enabled": True, "needs_note": False}]
+                            if proposal else [])
         return {"fingerprint": item["fingerprint"], "kind": item["kind"], "state": item["state"],
                 "segment": item["segment"],
+                "proposal": proposal,
                 "ask": item["ask"], "why": item["why_flagged"], "boundary": item["boundary"],
                 "context": context, "evidence": item["evidence"],
                 "consequence": item["export_consequence"], "decision": item.get("decision"),
                 "adjust": item["adjust"],
-                "controls": buttons + [
+                "controls": buttons + proposal_buttons + [
+                    # An earlier instant the saved rows support looking at, if there is one, labelled with
+                    # the level it is supported at and the width the sampling can claim for it: "Look just
+                    # before the candidate (round_opening)" must not read like an offer to jump to a set
+                    # start, and an instant offered without its interval reads like a measurement.
+                    {"action": "play:candidate", "label": _candidate_label(item.get("adjust") or {}),
+                     "enabled": item.get("adjust", {}).get("jump_to") is not None},
                     {"action": "play:context", "label": "Play this boundary", "enabled": True},
+                    # Only offered when the saved readings of this opening name different frames. It plays
+                    # the span that contains them both, because that is the only evidence that can say which
+                    # one the footage agrees with -- and the reviewer is not being asked to rank cues.
+                    {"action": "play:dispute",
+                     "label": "Play the frames in dispute (%.0f s)"
+                              % (item["boundary"].get("dispute_window") or {}).get("seconds", 0.0),
+                     "enabled": bool(item["boundary"].get("readings_conflict"))},
                     {"action": "play:back", "label": "More footage backward", "enabled": True},
                     {"action": "play:forward", "label": "More footage forward", "enabled": True},
                     {"action": "start:now", "label": "Set opening to current time",
@@ -810,6 +1273,38 @@ class ReviewPanel:
                 decision = self.flow.answer(self.selected, argument, note=note)
                 self.preferred_index = None if answered is None else answered["index"]
                 self.message = "%s recorded as %s" % (decision["kind"], decision["status"])
+            elif verb == "proposal":
+                # Applying is the reviewer's decision, taken through the same controller a boundary move
+                # always goes through; rejecting changes no boundary at all. Both leave the proposal on the
+                # row as the record it is, and an undo of the applied move puts the suggestion back to pending
+                # because the snapshot predates it.
+                #
+                # The card is the instruction: this acts on the proposal that was *drawn*, by the id recorded
+                # when it was drawn. Re-resolving the live proposal at click time once moved a row to 770 s
+                # while the reviewer was looking at a card that said 785.785 -- the number on the screen and
+                # the number applied were different suggestions of the same kind. If the row has been
+                # refreshed since, the controller refuses by id rather than substituting, and the card is
+                # redrawn so the next press sees what is actually on offer. A row starting at 0.0 also has to
+                # count, so presence is tested against None and never by truthiness.
+                shown = self.rendered or {}
+                start = number(((self.flow.item(self.selected, view="all") or {}).get("segment") or {})
+                               .get("start")) if self.selected else None
+                kind, proposal_id = shown.get("kind"), shown.get("proposal_id")
+                if kind is None or proposal_id is None or start is None:
+                    self.message = "this card shows no proposal to act on"
+                else:
+                    try:
+                        if argument == "apply":
+                            decision = self.flow.apply_proposal(start, kind, proposal_id=proposal_id,
+                                                                note=note)
+                            self.message = "applied the %s proposal: recorded as %s under your answer" % (
+                                kind, decision["status"])
+                        else:
+                            self.flow.reject_proposal(start, kind, proposal_id=proposal_id, note=note)
+                            self.message = "rejected the %s proposal; the boundary did not move" % kind
+                    except review.InvalidAnswer as exc:
+                        self.message = "%s - the card has been refreshed" % exc
+                self.state_view()
             elif verb == "undo":
                 self.message = self._undo()
             elif verb == "undo-last":
@@ -842,6 +1337,40 @@ class ReviewPanel:
                 self.play_interval(float(first), float(second))
                 self.message = "playing %.3f-%.3f of footage no clip claims" % (
                     self.playback["from"], self.playback["to"])
+            elif verb == "claim-interval":
+                # "I watched this stretch and there is a match in it" has to be sayable. Before it was, the
+                # unclaimed list was a list of things the operator could look at but never act on, so a
+                # completely unmarked match stayed outside the workflow forever.
+                first, _sep, second = (argument or "").partition("_")
+                end = float(second) if second and second != "None" else None
+                claimed = self.flow.claim_footage(float(first), end, note=note)
+                self.selected = next((item["fingerprint"] for item in self.flow.queue("open")
+                                      if item["kind"] == "new_match"
+                                      and item["segment"]["start"] == claimed["claimed_from"]),
+                                     self.selected)
+                self.message = ("claimed %.3f%s as a match: its opening is open and nothing about it is "
+                                "accepted yet%s"
+                                % (claimed["claimed_from"],
+                                   "" if end is None else "-%.3f" % end,
+                                   "" if end is None else " (you set that end, so that answer is yours)")
+                                )
+            elif verb == "claim-here":
+                claimed = self.flow.claim_footage(self.current_time, None, note=note)
+                self.message = "claimed the footage from %.3f as a match; its end is still open" \
+                    % claimed["claimed_from"]
+            elif verb == "dispose":
+                # A disposition says what a stretch of tape is. It is not an answer to a review question:
+                # it moves no boundary, and it cannot make any part of the recording look reviewed.
+                kind, _sep, interval = argument.partition(":")
+                first, _sep2, second = interval.partition("_")
+                record = self.flow.annotate_footage(
+                    kind, float(first), float(second) if second and second != "None" else None,
+                    boundary=self.current_time if kind == "play_new_match" else None,
+                    note=note, observer="operator")
+                self.message = ("noted %.3f-%s as %s; nothing about this project moved"
+                                % (record["from"],
+                                   "%.3f" % record["to"] if record["to"] is not None else "…",
+                                   record["kind"]))
             elif verb == "bracket":
                 self.message = "choose a bracket match, then say which side is which"
             else:
@@ -863,6 +1392,31 @@ class ReviewPanel:
             raise review.InvalidAnswer("no question selected")
         context = self._context(item)
         step = float(context["seconds_each_side"])
+        if which == "candidate":
+            # Look at the instant the saved sequence proposes, without moving the boundary: the reviewer
+            # decides whether to bring the clip start there, and only their answer is recorded.
+            candidate = self.flow.opening_candidate(item["fingerprint"])
+            if candidate["at"] is None:
+                raise review.InvalidAnswer(str(candidate["sequence"].get("reason")
+                                               or "no earlier opening candidate is available"))
+            self.playback = {"from": max(0.0, candidate["at"] - step),
+                             "to": candidate["at"] + step, "boundary_at": candidate["at"]}
+            return ("playing the %s candidate at %.3f; the clip still opens at %.3f until you move it"
+                    % (candidate["level"], candidate["at"], item["boundary"]["at"] or 0.0))
+        if which == "dispute":
+            # The two readings are seconds to a minute apart, and the ordinary ±12 s window around the
+            # boundary would show one of them and hide the other. Play the span that holds both, and say
+            # plainly that the question is what is on screen there -- not which cue to trust.
+            window = (item["boundary"] or {}).get("dispute_window")
+            if not window:
+                raise review.InvalidAnswer("nothing about this opening is in dispute between the saved "
+                                           "readings, so there is no wider span to inspect")
+            self.playback = {"from": window["from"], "to": window["to"],
+                             "boundary_at": item["boundary"]["at"]}
+            return ("playing %s-%s, the frames the saved evidence disagrees about (%d readings of this "
+                    "opening); the question is what is on screen there, not which cue to believe"
+                    % (review.instant_text(window["from"]), review.instant_text(window["to"]),
+                       window["readings"]))
         if which == "back":
             context = self._grow(item["fingerprint"], context, earlier=step)
         elif which == "forward":

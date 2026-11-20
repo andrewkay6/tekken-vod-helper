@@ -2084,3 +2084,25 @@ def test_a_claim_that_costs_nothing_is_never_also_a_purchase():
         for claim in entry["unresolved_claims"]:
             assert (claim["route"] == "user_policy") is (not claim["costs_inference"]), claim
             assert claim["missing"] and claim["would_resolve"], claim
+
+
+def test_the_published_set_record_carries_the_nameplate_hypotheses():
+    """A hypothesis computed and left inside the set record is a hypothesis nobody can read.
+
+    The tier exists so a withheld winner says what the broadcast graphic did claim, and at what share,
+    instead of leaving "withheld" to be read as "nothing was seen". That only reaches an operator if the
+    published record carries it: measured on the delivered machine package the run reported 30 hypothesis
+    rows and the artifact reported none.
+    """
+    result = track([row(0, clock=60, call=1), row(30, clock=30), row(60, "post_match_menu", s1=1)])
+    published = result["sets"][0]
+    hypotheses = published.get("nameplate_hypotheses")
+    assert hypotheses, "the field has to be published, not merely computed"
+    assert hypotheses["authoritative"] is False
+    assert hypotheses["changes_grouping_or_targets"] is False
+    assert "same broadcast graphic" in hypotheses["trust_note"]
+    game = hypotheses["games"][0]
+    assert game["basis"] == bg.OVERLAY_IDENTITY_TRUST, game
+    # The names come from this game's own rows; nothing here invents a participant the footage never showed.
+    assert game["sides"] == {"p1": "Ann", "p2": "Zoe"}
+    assert game["band_cover"] is None, "no band answer was supplied, so none may be claimed"

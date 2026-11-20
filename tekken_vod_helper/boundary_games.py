@@ -31,6 +31,7 @@ from typing import Any, Dict, FrozenSet, Iterable, List, Optional, Sequence, Tup
 
 from . import boundary_bracket as bracket_context
 from . import boundary_format
+from . import boundary_identity
 from . import boundary_names as names
 
 SCHEMA_VERSION = "games-v1"
@@ -85,6 +86,9 @@ _HUD_ABSENT_STATES = frozenset(["stage_select", "character_select", "controller_
                                 "controller_assignment", "post_match_menu", "controller_disconnected",
                                 "unknown"])
 _GAME_OPENING_STATES = frozenset(["stage_select", "stage_intro", "character_select", "vs_screen"])
+# Public alias: the review path reports an opening candidate against this vocabulary instead of keeping a
+# second list of its own, so the two can never disagree about which screen means what.
+GAME_OPENING_STATES = _GAME_OPENING_STATES
 _GAME_CLOSING_STATES = frozenset(["post_match_menu", "controller_prompt", "controller_assignment"])
 
 # What a screen between two games says about whether they are one set. The policy exists because both
@@ -109,6 +113,17 @@ SET_CUE_WEIGHT = {
 # rather than correctness: the threshold below only decides whether a pairing hypothesis is worth carrying
 # forward as a mapping question.
 NAME_DOMINANT_SHARE = 0.80
+
+#: A stretch of the nameplate record longer than this with no named row at all is an *unobserved* span, and
+#: has to be reported as one. Half a minute is comfortably longer than the sampling interval of this
+#: recording's classification pass (5.005 s), so a gap this wide really means "nothing was read", and it is
+#: short enough that a real broadcast cut-away to a close-up still shows up as one.
+NAMEPLATE_GAP_SECONDS = 30.0
+
+#: How far from an observation's own instant a saved text correction may still apply. Half a second is well
+#: inside this recording's 5.005 s sampling, so an observation can touch only the row it was made about --
+#: which is the entire point of scoping it to an instant instead of to a name.
+OBSERVATION_TIME_TOLERANCE_SECONDS = 0.5
 
 #: Mapping-question outcomes, named once because three different callers have to agree on which ones
 #: count as "we know who sat where" and which ones are still a question about the footage.
@@ -142,6 +157,170 @@ _ROUND_CALL_RE = re.compile(r"\bROUND\s*([1-9])\b|\bFINAL\s*ROUND\b", re.I)
 # opening; case-insensitive matching finds 190 rows ("Active fight with timer 46", "Mid-fight frame"),
 # which are prose about fighting, not a banner.
 _ROUND_OPEN_RE = re.compile(r"\b(READY|FIGHT)\b")
+
+# --------------------------------------------------------------------------- what a frame says about combat
+# ``screen_state`` describes what is *drawn* -- arena, health bars, HUD -- and Tekken draws all of that
+# behind a round banner, behind a pause menu and in the first second of a fight alike. So "gameplay" is
+# not evidence that anybody was playing, and the review layer turning every gameplay row into "on-screen
+# play was still running" invented two contradictions on this recording out of one intro banner (785.785,
+# ROUND 1) and one in-match pause menu (2722.720). These patterns read the phase out of the same prose the
+# rest of this module reads, once, so no consumer has to keep its own copy of the vocabulary.
+#
+# Measured over all 2,019 saved rows (see build/work/bb9/disputed-openings-fixes-2026-11-07/
+# phase-vocabulary-measurement.json): a pause menu is named on 3 rows and denied on none; a round banner
+# appears on 19, of which 18 sit next to an on-screen noun ("'ROUND 4' banner", "'ROUND 1' callout") and
+# 1 is a bracket label in the broadcast bar ("Basement Brawl #9 Losers Round 1"); the READY/FIGHT cue
+# appears on 41, of which 1 is denied in its own clause ("the 'READY' text **has cleared** ... marking the
+# start of live play"). Case matters for the cue for the reason the pattern above already gives: the
+# capitals are what the game draws, and reading them case-insensitively finds 190 rows of prose about
+# fighting that are not banners at all.
+_PAUSE_OVERLAY_RE = re.compile(r"\bin-?match pause menu\b|\bpause menu\b|\bpause(?:ing)? "
+                               r"(?:screen|overlay|menu)\b", re.I)
+#: A menu named as the place the camera came from is not a menu on the screen. "Tekken 8 'Main Menu'
+#: screen (...) **reached from** the pause menu" describes the pause menu in the past tense to explain where
+#: the user is now, and reading that as an open pause overlay turns a navigation sentence into a claim about
+#: the frame. Same family as the cleared-banner denial above and the negation window below: prose names
+#: things that are not there, and only the clause around the phrase says whether it is being shown.
+_NAVIGATION_PAST_RE = re.compile(r"\b(?:reached|came|coming|navigated|moved|went|gone|returned|exit(?:ed|s|ing)?"
+                                 r"|left|leav(?:e|ing)|clos(?:e|ed|ing)|back|drop(?:ped)?|return(?:ed)?)\b"
+                                 r"\s*(?:\w+\s+){0,3}?\bfrom\b|\bafter\s+(?:the\s+)?(?:player\s+)?"
+                                 r"(?:closing|exiting|leaving|selecting)\b", re.I)
+_ON_SCREEN_BANNER_RE = re.compile(r"\b(?:banner|overlay|callout|splash|prompt|text|graphic)\b|"
+                                  r"\b(?:displayed|displaying|shows|showing|reads|callout)\b|"
+                                  r"\bin-?round\b|\bround\s*start\b|\bstart\s+intro\b", re.I)
+_BROADCAST_ROUND_LABEL_RE = re.compile(r"\b(?:losers|winners|grand finals?|upper|lower)"
+                                       r"\s*(?:bracket\s*)?round\s*[1-9]", re.I)
+# A banner that has *gone* is not a banner. The negation control reads backwards from a match only, so a
+# denial written after the phrase needs its own clause check, and it can only ever remove a claim.
+_BANNER_CLEARED_RE = re.compile(r"\b(?:has|had|have)?\s*(?:now\s*)?(?:cleared|disappeared|gone|faded"
+                                r"|ended)\b|\bno longer\b|\bnot\s+(?:visible|present|shown|displayed)\b"
+                                r"|\babsent\b", re.I)
+_ACTIVE_COMBAT_RE = re.compile(r"\bactive combat\b|\bin combat\b|\blive play\b|\bstart of live play\b|"
+                               r"\bfighters? (?:engaged|attacking|fighting|trading)\b|\bcombat underw"
+                               r"ay\b", re.I)
+
+#: The four things a frame can say about combat. ``unknown`` is a real answer and the most common one:
+#: an arena at timer 60 with no banner, no cue and no pause menu says the round had not visibly begun,
+#: which is not a claim that anything was being played.
+ROUND_PHASE_ACTIVE = "active"
+ROUND_PHASE_OPENING = "round_opening"
+ROUND_PHASE_PAUSED = "paused"
+ROUND_PHASE_UNKNOWN = "unknown"
+ROUND_PHASES = (ROUND_PHASE_ACTIVE, ROUND_PHASE_OPENING, ROUND_PHASE_PAUSED, ROUND_PHASE_UNKNOWN)
+#: Phases that say a round was **not** being played at this instant. Used by every consumer that would
+#: otherwise read an arena frame as live play; a pause is listed because a paused clock freezes, and a
+#: frozen clock is the exact signature the boundary layer already refuses to treat as a tick.
+#:
+#: What this vocabulary answers is about **one round on one frame**, and nothing above round level:
+#:
+#: * a pause can happen mid-game, during a controller/button check, or on the way out of a match, so it
+#:   neither establishes a game or set end nor rules one out -- it is evidence that the clock stopped;
+#: * ROUND n, READY and FIGHT date a round, and a round lives inside a game inside a set, so an opening
+#:   frame never settles which game or which set it is: that needs the sequence evidence
+#:   (:func:`_classify_link`, the win-dot tally and the pairing screens), which ranks nothing and returns
+#:   ``ambiguous`` when the signals do not agree.
+NON_COMBAT_PHASES = frozenset([ROUND_PHASE_OPENING, ROUND_PHASE_PAUSED])
+
+
+def _clause_of(text, start, end):
+    # type: (str, int, int) -> str
+    """The clause holding a match, in both directions -- the denial of a banner usually follows it."""
+    left = max((index for index in (text.rfind(".", 0, start), text.rfind(";", 0, start),
+                                    text.rfind(",", 0, start)) if index != -1), default=-1)
+    right = min((index for index in (text.find(".", end), text.find(";", end), text.find(",", end))
+                 if index != -1), default=len(text))
+    return text[left + 1:right]
+
+
+def round_phase_facts(evidence, *, clock=None, clock_start=ROUND_CLOCK_START, ignore_pause=False,
+                      hud_present=None):
+    # type: (str, Optional[int], int, bool, Optional[bool]) -> Dict[str, Any]
+    """Whether this frame shows combat being played, a round opening, or a menu sitting over a match.
+
+    Returns the phase plus what produced it and what it cannot settle. Two rules hold it back from being
+    a smarter guess:
+
+    * **A pause outranks an opening, and an opening outranks a timer.** A frame can show a HUD, a round
+      banner and an open menu at once -- 2722.720 is exactly that -- and the question the phase answers
+      is "was the round being played", to which a menu is a flat no whatever the digits say.
+    * **Absence proves nothing.** No banner does not mean combat, no clock does not mean a pause, and no
+      pause menu does not mean the round was live. What is not stated stays :data:`ROUND_PHASE_UNKNOWN`.
+    * ``ignore_pause`` re-answers the question with the pause sighting removed, because a caller that has
+      been *told* the menu was closed must not have the prose's own "pause menu" wording outvote it. The
+      conflict is the caller's to report; this only declines to re-derive what was corrected.
+
+    The claims are reported with their provenance and their contradictions, never resolved into the
+    convenient answer: a row that names a banner *and* says combat is active gets a note, not a verdict.
+    """
+    text = str(evidence or "")
+    basis, notes = [], []
+
+    def claimed(pattern, *, require_unnegated=True, extra_denial=None):
+        hits = []
+        for match in pattern.finditer(text):
+            if require_unnegated and _negated(text, match.start()):
+                continue
+            clause = _clause_of(text, match.start(), match.end())
+            if _BANNER_CLEARED_RE.search(clause):
+                notes.append("a phrase this pattern could have read was denied in its own clause "
+                             "(%r)" % match.group(0))
+                continue
+            if extra_denial is not None and extra_denial.search(clause):
+                notes.append("%r was named as the place the frame came from, not as something drawn on it"
+                             % match.group(0))
+                continue
+            hits.append(match)
+        return hits
+
+    paused = [] if ignore_pause else claimed(_PAUSE_OVERLAY_RE, extra_denial=_NAVIGATION_PAST_RE)
+    banners = [match for match in claimed(_ROUND_CALL_RE)
+               if _ON_SCREEN_BANNER_RE.search(_clause_of(text, match.start(), match.end()))]
+    bracket_labels = list(_BROADCAST_ROUND_LABEL_RE.finditer(text))
+    cues = [match for match in claimed(_ROUND_OPEN_RE, require_unnegated=True)]
+    active = claimed(_ACTIVE_COMBAT_RE)
+    # A clock reading only dates a frame that shows the clock. On a row whose screen state was never
+    # recorded, "44" is a number: it may be a round timer, a damage count in a replay, or a value a
+    # partial pass guessed at, and treating it as proof of live play let a stateless clock series -- the
+    # shape an early draft of the timeline had -- manufacture a continuing round out of nothing.
+    timer_running = (clock is not None and int(clock) < int(clock_start)
+                     and (True if hud_present is None else bool(hud_present)))
+
+    if paused:
+        phase = ROUND_PHASE_PAUSED
+        basis.append("pause_overlay")
+    elif banners or cues:
+        phase = ROUND_PHASE_OPENING
+        if banners:
+            basis.append("round_banner")
+        if cues:
+            basis.append("round_open_cue")
+    elif active:
+        phase = ROUND_PHASE_ACTIVE
+        basis.append("active_combat_prose")
+    elif timer_running:
+        # The one timer claim allowed: inside a round the clock only falls, so digits *below* the opening
+        # value mean the round was already counting down. At 60 the same digits mean nothing of the kind,
+        # which is why an opening banner and a fresh clock are indistinguishable without the banner.
+        phase = ROUND_PHASE_ACTIVE
+        basis.append("clock_below_opening")
+    else:
+        phase = ROUND_PHASE_UNKNOWN
+
+    if bracket_labels:
+        notes.append("the row also contains a broadcast bracket label (%s), which numbers the "
+                     "tournament match and says nothing about the round on screen"
+                     % ", ".join(match.group(0) for match in bracket_labels))
+    if phase == ROUND_PHASE_OPENING and (active or timer_running):
+        notes.append("the same row describes combat, so the opening reading comes from its banner/cue "
+                     "and the live-play reading from its prose; both are kept and neither is settled here")
+    if phase == ROUND_PHASE_PAUSED and (banners or cues):
+        notes.append("a round opening is also named on this paused frame; a pause stops the clock, so "
+                     "the digits cannot date the play")
+    return {"combat_phase": phase, "combat_phase_basis": basis, "combat_phase_notes": notes,
+            "pause_overlay": bool(paused), "round_banner_on_screen": bool(banners),
+            "round_open_cue_on_screen": bool(cues)}
+
+
 #: Start bases that say this span *is* a round's opener: the game drew its own start signal and no clock
 #: was ever read inside the span. That shape is not a very short round, it is the next round's opener
 #: sampled in the second before its digits appeared -- see :func:`_is_callout_sliver`.
@@ -264,6 +443,241 @@ def _clause_denies_clock(evidence, start, end):
     return bool(_CLOCK_DENIAL_RE.search(evidence[left:end + right]))
 
 
+#: How far back a saved sequence is asked for a round's opening. Two rounds of presentation and a stage
+#: intro fit inside it on this recording; anything past that is the previous game's business and is
+#: answered by the game/set layer, not here.
+OPENING_RECOVERY_SCAN_SECONDS = 180.0
+
+#: Screen states that end a round-opening run: they are a station or a pairing event, and whatever they
+#: say about a *game* or *set* starting, the round's own presentation began after them.
+OPENING_RUN_BREAKS = frozenset(["stage_select", "character_select", "controller_prompt",
+                                "controller_assignment", "controller_disconnected", "post_match_menu",
+                                "lobby", "rounds_select", "mode_select", "menu", "vs_screen",
+                                "station", "technical_timeout"])
+
+
+def opening_sequence(observations, at, *, scan_seconds=OPENING_RECOVERY_SCAN_SECONDS,
+                     clock_start=ROUND_CLOCK_START):
+    # type: (Sequence[Dict[str, Any]], float, float, int) -> Dict[str, Any]
+    """The round-opening run a saved sequence shows around one instant, and what it can and cannot claim.
+
+    Asked "where does this round open?", the recording answers with a sequence: fighters on a stage, a
+    ROUND banner, a READY or FIGHT splash, then a clock that starts falling. This walks backwards from the
+    instant over exactly that, and stops at the first frame that shows the round *being played*, at a
+    station/pairing screen (a different question, answered at the game layer), or at the edge of the
+    window -- and says which of the three it hit.
+
+    What it returns is an interval and its resolution, never a cut:
+
+    * ``opening_start_at`` -- the earliest frame of that run that still shows the opening itself. Frames
+      merely adjacent to it (a stage shot before the banner) are kept in ``frames`` with their phase, so a
+      reader can see how much of the approach the sampling happened to catch.
+    * ``first_active_at`` -- the first frame at or after the run that shows the round being fought, found by
+      a walk that **stops at a break in continuity**: a station screen, or another round's banner. A fight
+      seen past either one is not this round's opening play, so the answer there is no answer, not a
+      timestamp. This is what the coarse state word used to claim at the banner frame instead.
+    * ``clip_start_options`` -- the two different starts a reviewer might mean, each with what it costs:
+      a clip opened at the intro keeps the presentation the game drew; one opened at first active play
+      cuts it away. Neither is "correct", and the configured padding is applied to whichever is chosen,
+      once, at the layer that owns clip bounds.
+    * ``uncertainty_seconds`` -- the widest gap between consecutive frames **inside the opening run**: how
+      precisely the tape can say *where the opening is*. On a tape sampled once a second the honest claim is
+      a one-second interval, not an instant.
+    * ``active_onset_uncertainty_seconds`` -- the widest gap between consecutive frames **between that
+      opening and the first frame showing play**: how precisely the tape can say *when play started*. These
+      are two questions and they are reported separately, because they routinely differ: a round announced
+      one second before the candidate and next seen fought 89 seconds later has a one-second opening and an
+      89-second hole. ``sampled_frames_between_opening_and_play`` says how much coverage that hole has --
+      zero means unsampled, not settled.
+
+    No number here is ever produced by subtracting the round clock from a timestamp: the clock says a round
+    *had begun*, and only a frame says when.
+
+    A run with no opening frame in it is reported as such, and an empty window says the sequence was never
+    asked to cover this far -- which is not evidence that nothing was there.
+    """
+    wanted = None if not _finite(at) else float(at)
+
+    # Two writers, two key spellings: an observation says ``timestamp`` and a normalised sequence row says
+    # ``at``. Accepting only the first returns "no sequence" to the caller that already did the work, which
+    # is a silent failure in the direction of claiming nothing.
+    def instant(observation):
+        for key in ("timestamp", "at"):
+            if _finite(observation.get(key)):
+                return float(observation[key])
+        return None
+
+    rows = sorted((obs for obs in (observations or []) if instant(obs) is not None), key=instant)
+    result = {"at": wanted, "status": "no_sequence", "opening_start_at": None,
+              "opening_end_at": None, "first_active_at": None, "frames": [],
+              "clip_start_options": {"include_opening": None, "first_active_gameplay": None},
+              "uncertainty_seconds": None, "stopped_at": None, "observed_basis": [],
+              "first_active_source": None, "active_onset_status": None,
+              "active_onset_anchor_at": None, "active_onset_uncertainty_seconds": None,
+              "active_onset_span_seconds": None, "sampled_frames_between_opening_and_play": None,
+              "what_this_cannot_say": "an opening run is a place a clip could start. It does not settle "
+                                      "which game or set the round belongs to, and its resolution is the "
+                                      "sampling, not the fight.",
+              "inference_sent": False}
+    if wanted is None or not rows:
+        return result
+    low = wanted - float(scan_seconds)
+    window = [obs for obs in rows if low <= instant(obs) <= wanted + 1e-9]
+    if not window:
+        result["stopped_at"] = "window edge"
+        result["basis"] = ("nothing was sampled between %.3f and %.3f, so the sequence cannot say where "
+                           "this round opened" % (low, wanted))
+        return result
+    # Walk backwards from the candidate. Frames at or after the candidate count too: the candidate can sit
+    # *inside* its own opening (ROUND 1 drawn at 2771.769, fighters still in stance), and stopping at the
+    # candidate would report the intro as if the clip had begun mid-round.
+    #
+    # Shown play at the candidate is where that walk has to start, not where it stops. A clip opened five
+    # seconds into a round has its opening behind the active frames, and refusing to look because the first
+    # frame was already fighting is how the recovery would report nothing about the one case it exists for.
+    # So any run of active frames touching the candidate is stepped over first, and counted: the distance
+    # between them is exactly what the clip would gain back.
+    ordered = sorted(window, key=instant, reverse=True)
+    index = 0
+    lead_active = []
+    while index < len(ordered) and row_combat_phase(ordered[index]) == ROUND_PHASE_ACTIVE:
+        lead_active.append(ordered[index])
+        index += 1
+    run, stopped = [], None
+    for obs in ordered[index:]:
+        state = str(obs.get("state") or obs.get("screen_state") or "")
+        if state in OPENING_RUN_BREAKS:
+            stopped = "station_screen"
+            break
+        if row_combat_phase(obs) == ROUND_PHASE_ACTIVE:
+            stopped = "active_play"
+            break
+        run.append(obs)
+    run.reverse()
+    after = [obs for obs in rows if wanted + 1e-9 < instant(obs)
+             <= wanted + float(scan_seconds)]
+    # Walk *forward* for the first frame showing this round played, and stop at anything that breaks the
+    # continuity that makes the answer about this round: a station screen means whatever fights after it is a
+    # different game's business, and a banner naming a different round means this round was never played in
+    # between. Crossing either one to produce a first-play timestamp would be the coarse-state mistake
+    # wearing a different hat -- combat associated with an opening the tape does not connect it to.
+    round_shown = next((row_round_call(obs) for obs in reversed(run)
+                        if row_round_call(obs) is not None), None)
+    first_active_forward, forward_status = None, None
+    for obs in after:
+        state = str(obs.get("state") or obs.get("screen_state") or "")
+        if state in OPENING_RUN_BREAKS:
+            forward_status = "station_screen_between"
+            break
+        phase = row_combat_phase(obs)
+        if phase == ROUND_PHASE_OPENING and round_shown is not None \
+                and row_round_call(obs) is not None and row_round_call(obs) != round_shown:
+            forward_status = "later_round_opening_between"
+            break
+        if phase == ROUND_PHASE_ACTIVE:
+            first_active_forward, forward_status = obs, "observed"
+            break
+    else:
+        forward_status = "not_sampled_ahead" if after else "nothing_sampled_ahead"
+    result["has_opening_evidence"] = any(row_combat_phase(obs) == ROUND_PHASE_OPENING for obs in run)
+    if result["has_opening_evidence"]:
+        result["status"] = "opening_found"
+    elif run:
+        result["status"] = "frames_without_opening"
+    elif lead_active:
+        result["status"] = "active_at_candidate"
+    else:
+        result["status"] = "no_opening_frames"
+    result["played_frames_at_candidate"] = len(lead_active)
+    result["played_seconds_at_candidate"] = (round(wanted - instant(lead_active[-1]), 6)
+                                             if lead_active and len(lead_active) > 1 else
+                                             (0.0 if lead_active else None))
+    result["stopped_at"] = stopped
+    result["frames"] = [{"at": round(instant(obs), 6),
+                         "state": str(obs.get("state") or obs.get("screen_state") or ""),
+                         "phase": row_combat_phase(obs),
+                         "clock": obs.get("round_clock"),
+                         "call": obs.get("round_call"),
+                         "cue": obs.get("round_open_cue"),
+                         "id": obs.get("id") or obs.get("observation_id")} for obs in run]
+    basis = sorted({str(item["phase"]) for item in result["frames"] if item["phase"] != ROUND_PHASE_UNKNOWN}
+                   | {str(item["cue"]) for item in result["frames"] if item.get("cue")}
+                   | {"round_call_%s" % item["call"] for item in result["frames"]
+                      if item.get("call") is not None})
+    result["observed_basis"] = basis
+    openings = [item for item in result["frames"] if item["phase"] == ROUND_PHASE_OPENING]
+    result["opening_frames"] = [item["at"] for item in openings]
+    if openings:
+        result["opening_start_at"] = openings[0]["at"]
+        result["opening_end_at"] = openings[-1]["at"]
+    else:
+        # No frame in the run shows an opening. The stretch behind the candidate is real and it is listed,
+        # but calling its first frame "the opening" would be the coarse-state mistake in a different hat, so
+        # the start stays unknown and the run is reported as what it is: frames that say nothing either way.
+        result["opening_start_at"] = None
+        result["opening_end_at"] = None
+        result["run_start_at"] = result["frames"][0]["at"] if result["frames"] else None
+        result["run_end_at"] = result["frames"][-1]["at"] if result["frames"] else None
+    # Where the round is first seen being played *after* the opening run. The leading active frames of a
+    # clip that starts mid-round are the answer, so they are consulted before anything later; a candidate
+    # that was never active falls back to the continuous forward walk, which may find nothing.
+    first_active = lead_active[-1] if lead_active else first_active_forward
+    result["first_active_at"] = round(instant(first_active), 6) if first_active else None
+    result["first_active_source"] = ("playing_at_candidate" if lead_active else
+                                     ("observed_ahead" if first_active else None))
+    result["active_onset_status"] = ("playing_at_candidate" if lead_active else forward_status)
+    stamps = [item["at"] for item in result["frames"]] + [wanted]
+    stamps = sorted(set(round(value, 6) for value in stamps if value is not None))
+    gaps = [round(later - earlier, 6) for earlier, later in zip(stamps, stamps[1:])
+            if later > earlier]
+    # This is the resolution of *"where is the opening"*: the widest unsampled stretch inside the run that
+    # establishes the banner. It has never been, and is not now, the resolution of *"when did play start"* --
+    # reporting one number for both is how a round whose fight was first seen 89 seconds later came to look
+    # like a one-second claim.
+    result["uncertainty_seconds"] = max(gaps) if gaps else None
+    anchor = result["opening_end_at"] if result["opening_end_at"] is not None else round(wanted, 6)
+    result["active_onset_anchor_at"] = anchor
+    if first_active is None:
+        result["active_onset_uncertainty_seconds"] = None
+        result["active_onset_span_seconds"] = None
+        result["sampled_frames_between_opening_and_play"] = 0
+    else:
+        edge = round(instant(first_active), 6)
+        span = sorted({round(instant(obs), 6) for obs in rows if anchor <= instant(obs) <= edge})
+        span_gaps = [round(later - earlier, 6) for earlier, later in zip(span, span[1:])
+                     if later > earlier]
+        result["active_onset_uncertainty_seconds"] = max(span_gaps) if span_gaps else None
+        result["active_onset_span_seconds"] = round(edge - anchor, 6)
+        # Frames the tape offered between the presentation and the fight, excluding both endpoints: zero is
+        # the interesting case, and it means the interval is unsampled rather than short.
+        result["sampled_frames_between_opening_and_play"] = max(len(span) - 2, 0)
+    result["sampled_frames_in_run"] = len(result["frames"])
+    result["clip_start_options"] = {
+        "include_opening": result["opening_start_at"],
+        "include_opening_uncertainty_seconds": result["uncertainty_seconds"],
+        "first_active_gameplay": result["first_active_at"],
+        "first_active_uncertainty_seconds": result["active_onset_uncertainty_seconds"],
+        "candidate": round(wanted, 6),
+        "note": ("starting at the opening keeps the presentation the game drew; starting at first active "
+                 "play cuts it away. Padding is added once to whichever is chosen, at the clip layer. Each "
+                 "start carries its own sampling uncertainty: where the tape did not look, the interval is "
+                 "the answer")}
+    if not result["frames"]:
+        result["basis"] = ("the frame at or nearest this instant already shows the round being played, so "
+                           "these rows show no opening run to recover")
+    elif stopped == "active_play":
+        result["basis"] = ("the run stops at a frame showing the round being played; where the run "
+                           "actually began is inside the sampled frames listed here")
+    elif stopped == "station_screen":
+        result["basis"] = ("the run stops at a station screen, which is a game or set question rather "
+                           "than a round one")
+    else:
+        result["basis"] = ("the run reaches %.3f with no active frame and no station screen between it "
+                           "and the candidate; the true opening may lie earlier than the sampling shows"
+                           % (result["frames"][0]["at"],) if result["frames"] else "")
+    return result
+
+
 def parse_round_facts(row):
     # type: (Dict[str, Any]) -> Dict[str, Any]
     """What one observation says about the *game*, not about the broadcast.
@@ -277,7 +691,10 @@ def parse_round_facts(row):
     same as a round that did not tick.
     """
     evidence = row.get("evidence") or ""
-    state = row.get("state") or "unknown"
+    state = row.get("state") or row.get("screen_state") or "unknown"
+    # Read from either spelling for the same reason :func:`hud_on_frame` exists: the tracker writes
+    # ``state`` and the classifier writes ``screen_state``, and a phase computed from a state that was
+    # silently absent is a phase computed from nothing.
     clock = None
     # Which of the two wordings produced the reading, so a reviewer can tell a clock the tracker has always
     # read from one it only started reading after the prose-order gap was closed. None means no reading.
@@ -342,6 +759,9 @@ def parse_round_facts(row):
         "win_dots_unattributed": dots,
         "prose_negated": sorted(set(events["negated"])),
         "hud_present": hud_present,
+        # Filled in below, once the clock this row ends up with is known. See :func:`round_phase_facts`.
+        "combat_phase": ROUND_PHASE_UNKNOWN, "combat_phase_basis": [], "combat_phase_notes": [],
+        "pause_overlay": False, "round_banner_on_screen": False, "round_open_cue_on_screen": False,
         "characters": tuple(row.get(key) or "" for key in ("character1", "character2")),
         # Kept for the reviewer only. Nothing below reads these, because a header that changes
         # mid-round is exactly the failure this module exists to survive.
@@ -356,6 +776,8 @@ def parse_round_facts(row):
     # explicit ``result_transition: false`` is a correction of the prose, and treating it as "nothing
     # was said" let an old wrong guess survive every later pass. Where the two disagree the stated
     # value wins and the disagreement is recorded, never silently overwritten.
+    # ``combat_phase`` and ``pause_overlay`` are deliberately not resolved here: both depend on the clock
+    # this loop is still deciding, and the phase is settled after it. See the block below.
     for key in ("round_clock", "round_call", "round_end", "result_transition", "round_open_cue",
                 "win_dots", "win_dots_drawn", "win_dots_confidence"):
         if key not in row:
@@ -382,6 +804,41 @@ def parse_round_facts(row):
         facts["characters"] = tuple(list(row["characters"]) + ["", ""])[:2]
     if any(key in row for key in ("round_clock", "win_dots", "round_end", "result_transition")):
         facts["fact_source"] = "vision_group"
+
+    # The phase is computed **last**, from the clock and cue this row finally carries, not from the prose
+    # alone. Computing it earlier made a vision answer that states "round_clock": 39 with no evidence string
+    # read as an unknown frame, which then read as "nobody was playing", which then read as no contradiction
+    # -- three hops from a stated timer to a wrong boundary. Every other fact here already resolves
+    # prose-then-stated; the one claim that depends on them has to wait for them.
+    stated_phase = row.get("combat_phase")
+    if stated_phase in ROUND_PHASES:
+        facts["combat_phase"] = stated_phase
+        facts["combat_phase_basis"] = ["stated_field"]
+    else:
+        if stated_phase is not None:
+            facts["combat_phase_notes"].append(
+                "a vision answer stated an unrecognised combat phase (%r); the reading below was derived "
+                "from the frame's own evidence instead" % (stated_phase,))
+        # The note above is part of the row's story and has to survive the derivation that follows. It has
+        # to be read *before* the update, though: `derived` carries its own notes list under the same key,
+        # so updating first and merging after would combine the fresh list with itself and report a clean
+        # reading for a frame whose stated answer had to be rejected to get there.
+        prior_notes = list(facts["combat_phase_notes"])
+        derived = round_phase_facts(evidence, clock=facts["round_clock"],
+                                    hud_present=bool(facts["hud_present"]))
+        facts.update(derived)
+        facts["combat_phase_notes"] = list(dict.fromkeys(prior_notes + list(derived["combat_phase_notes"])))
+        if "pause_overlay" in row:
+            # A stated pause sighting is its own fact, and it outranks prose in the one direction prose
+            # cannot: an answer that says the menu was closed must not be overruled by the words "pause
+            # menu" appearing anywhere in the description.
+            if bool(row["pause_overlay"]) != bool(facts["pause_overlay"]):
+                facts["conflicts"].append({"field": "pause_overlay",
+                                           "from": facts["pause_overlay"], "to": row["pause_overlay"]})
+                facts["combat_phase"] = (ROUND_PHASE_PAUSED if row["pause_overlay"]
+                                         else round_phase_facts(evidence, clock=facts["round_clock"],
+                                                                ignore_pause=True)["combat_phase"])
+                facts["combat_phase_basis"] = ["stated_field"]
     return facts
 
 
@@ -458,7 +915,7 @@ def track_games(observations, rounds_per_game=DEFAULT_ROUNDS_PER_GAME,
                 clip_pad_seconds=CLIP_PAD_SECONDS,
                 end_bound_uncertain_seconds=END_BOUND_UNCERTAIN_SECONDS,
                 bracket=None, header=None, format_policy=None, stage_readings=None,
-                analysis_window=None, source=None):
+                analysis_window=None, source=None, text_corrections=()):
     # type: (Sequence[Dict[str, Any]], int, int, int, float, float, Optional[Dict[str, Any]], Optional[Dict[str, Any]], Optional[Dict[str, Any]], Optional[Sequence[Dict[str, Any]]], Optional[Sequence[float]], Optional[Dict[str, Any]]) -> Dict[str, Any]
     """Follow the round -> game hierarchy over ordered observations.
 
@@ -790,7 +1247,8 @@ def track_games(observations, rounds_per_game=DEFAULT_ROUNDS_PER_GAME,
     sets_out = _group_into_sets(games, games_per_set, observations,
                                 clip_pad_seconds=clip_pad_seconds, bracket=bracket, header=header,
                                 format_policy=format_policy, stage_readings=stage_readings,
-                                analysis_window=analysis_window, source=source)
+                                analysis_window=analysis_window, source=source,
+                                text_corrections=text_corrections)
     unresolved.extend(_unresolved(rounds, games, observations, clock, contradictions))
     for record in sets_out:
         # What the event record thinks this pairing's match score was, attached as something to account
@@ -842,6 +1300,9 @@ def track_games(observations, rounds_per_game=DEFAULT_ROUNDS_PER_GAME,
             "questions": record.get("questions") or [],
             "alternative_groupings": record.get("alternative_groupings") or [],
             "attribution": record.get("attribution"),
+            # Published, not just computed: the hypotheses live in the set record, and a candidate that keeps
+            # them to itself leaves the operator package reporting that the pipeline saw no nameplate at all.
+            "nameplate_hypotheses": record.get("nameplate_hypotheses"),
             "cut_before": record.get("cut_before"),
             "cut_after": record.get("cut_after"),
             "reason": record["basis"],
@@ -2746,6 +3207,89 @@ def _dominant(read):
                and read["share"][side] >= NAME_DOMINANT_SHARE for side in ("player1", "player2"))
 
 
+OVERLAY_IDENTITY_TRUST = "overlay_nameplate_hypothesis"
+
+
+def _nameplate_hypotheses(games, band_map, pairings):
+    # type: (Sequence[Dict[str, Any]], Dict[float, Dict[str, Any]], Dict[float, Dict[str, Any]]) -> Dict[str, Any]
+    """Who the overlay says was on which side, published as a hypothesis and never as an identity.
+
+    The band answers and these rows are readings of **one broadcast graphic** -- the same lagging, repainting
+    nameplate, sampled by two routes. Where both exist and agree that is an internal consistency check on the
+    reading, not a second witness confirming that the graphic names the players correctly, so agreement is
+    reported and labelled instead of being quietly promoted.
+
+    Authority is unchanged by anything here. Grouping, target closure and ``set_winner`` never consult this: a
+    game the overlay cannot name stays unnamed, a game whose own rows disagree stays unnamed, and a game with
+    a usable band answer keeps the band, which at least read a crop at a declared instant. What is added is
+    the machine's best *possible* answer with its counts, share, span and reason for being only a guess, so
+    "withheld" no longer reads as "nothing was seen".
+    """
+    per_game = []
+    named = {}
+    for entry in games:
+        at = round(float(entry["start"]), 6)
+        overlay = (pairings or {}).get(at) or {}
+        band = (band_map or {}).get(at) or {}
+        band_usable = bool(band.get("usable"))
+        sides = overlay.get("sides") or {}
+        both = bool(sides.get("p1") and sides.get("p2"))
+        agrees = None
+        if band_usable and both and band.get("sides"):
+            agrees = (band["sides"].get("p1") == sides.get("p1")
+                      and band["sides"].get("p2") == sides.get("p2"))
+        if band_usable:
+            basis, admitted = "header_band_saved", True
+            # The band's own read is what gets published here, even when it disagrees with the rows: naming
+            # the overlay's players under a band basis would let the weaker read of the graphic replace the
+            # stronger one in the output while the label claimed otherwise. The disagreement stays visible as
+            # `contradicts`, because a nameplate that moved inside a game is a fact worth seeing.
+            sides = dict(band.get("sides") or {})
+            why = ("a usable band reading at %s names both sides; the crop and these rows are the same graphic, "
+                   "so this is the better read of one witness, not a second witness" % band.get("at"))
+        elif overlay.get("dominant") and both:
+            basis, admitted = OVERLAY_IDENTITY_TRUST, True
+            why = ("the game's own rows name both sides on a dominant reading (share %s over %s rows); that is "
+                   "the broadcast graphic itself, so this is a hypothesis and not an identity"
+                   % (overlay.get("share"), overlay.get("named_rows")))
+        else:
+            basis, admitted = "none", False
+            why = ("no usable band reading, and the rows do not dominantly name both sides (share %s over %s "
+                   "rows)" % (overlay.get("share"), overlay.get("named_rows")))
+        record = {"at": entry["start"], "basis": basis, "admitted": admitted,
+                  "sides": dict(sides) if admitted else {}, "share": overlay.get("share"),
+                  "named_rows": overlay.get("named_rows"), "band_cover": band_usable or None,
+                  "band_agrees": agrees, "why": why,
+                  "span": [entry.get("start"), entry.get("end")]}
+        if basis == "header_band_saved" and agrees is False:
+            record["contradicts"] = {"overlay_nameplate_rows": overlay.get("sides"),
+                                     "share": overlay.get("share"),
+                                     "named_rows": overlay.get("named_rows"),
+                                     "because": "the rows inside this game read the same graphic differently"}
+        if band_usable and band.get("image_sha256"):
+            record["band_crop_sha256"] = band["image_sha256"]
+        per_game.append(record)
+        if admitted:
+            named[id(entry)] = (entry, sides)
+    tally = {}
+    for entry, sides in named.values():
+        if not entry.get("counts_toward_set") or entry.get("winner") not in ("p1", "p2"):
+            continue
+        who = sides.get(entry["winner"])
+        if who:
+            hit = tally.setdefault(who, {"wins": 0, "games": [], "unit": OVERLAY_IDENTITY_TRUST})
+            hit["wins"] += 1
+            hit["games"].append(entry["start"])
+    return {"unit": OVERLAY_IDENTITY_TRUST, "authoritative": False,
+            "changes_grouping_or_targets": False,
+            "trust_note": ("hypothesis only: the band answers and these rows are reads of the same broadcast "
+                           "graphic, whose names are known to repaint mid-round"),
+            "games": per_game,
+            "possible_winners": [{"name": who, "wins": data["wins"], "games": data["games"], "unit": data["unit"]}
+                                 for who, data in sorted(tally.items(), key=lambda kv: (-kv[1]["wins"], kv[0]))],
+            "unnamed_games": [row["at"] for row in per_game if not row["admitted"]]}
+
+
 def _score_signal(earlier, later):
     # type: (Dict[str, Any], Dict[str, Any]) -> str
     """What the broadcast tally appears to have done. A hint only: it was trusted once and split a set."""
@@ -2801,6 +3345,31 @@ def _bracket_expectation(bracket, record):
                 independent_of_recording=False)
 
 
+def _reading_offered_to_candidate(reading, lo, hi):
+    # type: (Dict[str, Any], float, float) -> bool
+    """Whether this stage reading was made *about* this candidate, rather than merely falling near it.
+
+    A saved band answer has no declared candidate, so it is scoped by its timestamp as it always was. A
+    reading that came from an observation file does name the span(s) it was offered to, and that scope has to
+    be enforced where it is consumed or it is decoration: one label sampled inside a long set would otherwise
+    narrow whichever neighbouring candidate happened to overlap the instant -- and machine bounds shift by a
+    few seconds between revisions, which is exactly how a label could migrate across a transition. Overlap of
+    the declared span is the test, not equality, because the author of an observation writes a candidate's
+    bounds as they were when it was written.
+    """
+    named = reading.get("candidates")
+    if not named:
+        return True
+    for span in named:
+        try:
+            a, b = float(span[0]), float(span[1])
+        except (TypeError, ValueError, IndexError, KeyError):
+            continue
+        if a - 1e-9 <= float(hi) and float(lo) <= b + 1e-9:
+            return True
+    return False
+
+
 def _bucket_formats(header, policy, games_per_set, lo, hi, stage_readings=None):
     # type: (Optional[Dict[str, Any]], Optional[Dict[str, Any]], Optional[int], float, float, Optional[Sequence[Dict[str, Any]]]) -> Dict[str, Any]
     """Which target(s) apply to one candidate, from the band readings inside that candidate's own span.
@@ -2820,7 +3389,8 @@ def _bucket_formats(header, policy, games_per_set, lo, hi, stage_readings=None):
                 else (header or {}).get("readings") or ())
     stages = [(r.get("at"), ((r.get("pairing") or {}).get("label")))
               for r in readings
-              if r.get("at") is not None and float(lo) <= float(r["at"]) <= float(hi)]
+              if r.get("at") is not None and float(lo) <= float(r["at"]) <= float(hi)
+              and _reading_offered_to_candidate(r, lo, hi)]
     if policy is not None:
         formats = boundary_format.applicable_formats(stages, policy)
         if formats["targets"]:
@@ -2856,6 +3426,7 @@ def _reached_under(targets, deciding, attributed=None):
 
 def _group_into_sets(games, games_per_set, observations=(), clip_pad_seconds=CLIP_PAD_SECONDS,
                      bracket=None, header=None, format_policy=None, stage_readings=None,
+                     text_corrections=(),
                      analysis_window=None, source=None):
     # type: (List[Dict[str, Any]], Optional[int], Sequence[Dict[str, Any]], float, Optional[Dict[str, Any]], Optional[Dict[str, Any]], Optional[Dict[str, Any]], Optional[Sequence[Dict[str, Any]]], Optional[Sequence[float]], Optional[Dict[str, Any]]) -> List[Dict[str, Any]]
     """Bundle games into candidate sets from combined evidence, and keep every reading the evidence allows.
@@ -2880,7 +3451,7 @@ def _group_into_sets(games, games_per_set, observations=(), clip_pad_seconds=CLI
     # Computed over every game, not per bucket: the mapping question sits on the link that split them, so
     # answering it needs the reading from the candidate on the other side of that cut.
     band_map = _band_map(header, games)
-    pairings = _overlay_pairings(observations, games)
+    pairings = _overlay_pairings(observations, games, text_corrections=text_corrections)
     if observations:
         links = [_classify_link(a, b, observations, bracket=bracket) for a, b in zip(games, games[1:])]
     else:
@@ -3043,7 +3614,201 @@ def _wins_of(games):
     return wins
 
 
-def _overlay_pairings(observations, games):
+def _name_sequence(observations, lo, hi, window_start=None, previous_play_end=None,
+                   text_corrections=()):
+    # type: (Sequence[Dict[str, Any]], float, float, Optional[float]) -> Dict[str, Any]
+    """The ordered story the nameplate told across a span, per side -- not just its majority.
+
+    A share cannot tell a wrong name from a late repaint: both look like two names on one side. What separates
+    them is *when* each was drawn against the boundary, and that ordering is thrown away by majority voting.
+    So this keeps the change events inside the span, and, for the instant the span opened, the last read from
+    before it (``carried_in``) with its age. A name already on screen for 40 s before a game started is the
+    header still showing the previous pairing; one that first appears 3 s in is a fresh read of this one.
+
+    Deliberately cheap and deliberately not a judgement: nothing here decides a boundary or a winner, and a
+    span with no rows is reported as an unobserved gap rather than as agreement.
+    """
+    lookback = float(window_start if window_start is not None else lo)
+    # Whether a reading before this span belongs to the gap or to the match that came before it. The
+    # difference is the whole question: a name still drawn *during the pause between games* is the header not
+    # yet having changed, while a name last drawn in the middle of the previous match is simply the previous
+    # pairing, and no repaint is implied by the boundary in between.
+    boundary = float(previous_play_end) if previous_play_end is not None else lo
+    # Only a fight's own HUD is a pairing reading. A vs screen, a stage intro card and a results panel
+    # legitimately draw different -- often fuller -- text for the same player, and reading those rows as
+    # nameplate changes would invent a repaint at every menu. They are kept, and reported as what they are:
+    # off-play readings, not evidence about who sat where during the round.
+    play = [obs for obs in observations if lookback - 1e-9 <= float(obs["timestamp"]) <= hi + 1e-9]
+    rows = [obs for obs in play if obs.get("screen_state") == "gameplay"]
+    offscreen = [obs for obs in play if obs.get("screen_state") != "gameplay"
+                 and any(str((obs.get("overlay") or {}).get(key) or "").strip()
+                         for key in ("player1", "player2"))]
+    per_side = {}
+    stamps = []
+    applied, mismatches = [], []
+    for side, key in (("p1", "player1"), ("p2", "player2")):
+        events, last, first_at, last_at, named_rows = [], None, None, None, 0
+        carried = None
+        for obs in rows:
+            at = float(obs["timestamp"])
+            value = str((obs.get("overlay") or {}).get(key) or "").strip()
+            correction, status = _correction_match(text_corrections, side, at, value)
+            if status == "applies":
+                # The row's own text is preserved in the record, because the correction is an observation
+                # about this instant and this seat and not a rewrite of what the classifier recorded -- and
+                # the classifier's string is the thing a reader needs in order to see that a difference was
+                # seen. ``role`` says which of the three jobs it did: corrected a name inside this game,
+                # corrected the name carried in from before it, or was never a gameplay read at all.
+                applied.append(_applied_reading(correction, side, at, value,
+                                                "within_game" if at >= lo else "carry_in_context"))
+                value = correction["observed_text"]
+            elif status == "row_text_mismatch":
+                mismatches.append(_mismatched_reading(correction, side, at, value, False))
+            if not value:
+                continue
+            if at < lo:
+                if carried is None or at > carried["at"]:
+                    carried = {"at": round(at, 3), "name": value}
+                continue
+            named_rows += 1
+            stamps.append(at)
+            if first_at is None:
+                first_at = at
+            last_at = at
+            if value != last:
+                # ``from`` is None on the first read inside the span, and that is an arrival, not a change:
+                # counting it as one would invent a nameplate move at the exact instant the game started,
+                # which is the worst possible place to manufacture one. The caller tells the two apart.
+                events.append({"at": round(at, 3), "from": last, "to": value,
+                               "offset_from_span_start": round(at - lo, 3), "state": "gameplay"})
+                last = value
+        off_play_observed = []
+        for obs in offscreen:
+            at = float(obs["timestamp"])
+            value = str((obs.get("overlay") or {}).get(key) or "").strip()
+            if not value:
+                continue
+            correction, status = _correction_match(text_corrections, side, at, value)
+            if status == "applies":
+                off_play_observed.append(_applied_reading(correction, side, at, value, "off_play"))
+            elif status == "row_text_mismatch":
+                mismatches.append(_mismatched_reading(correction, side, at, value, True))
+        per_side[side] = {"change_events": events, "named_rows": named_rows,
+                          "first_named_at": round(first_at, 3) if first_at is not None else None,
+                          "last_named_at": round(last_at, 3) if last_at is not None else None,
+                          "carried_in": (dict(carried, age_seconds_before_span=round(lo - carried["at"], 3),
+                                              drawn_during=("gap" if carried["at"] >= boundary - 1e-9
+                                                            else "previous_match"))
+                                         if carried else None),
+                          "names_seen": sorted({event["to"] for event in events}
+                                               | ({carried["name"]} if carried else set())),
+                          "display_text_corrections_applied": [row for row in applied
+                                                               if row["side"] == side],
+                          # A reading whose instant falls on a menu is still a reading that was made, and
+                          # silently dropping it would turn "admitted by the loader, never used" into an
+                          # invisible third state. It is reported here, at the instant and screen it came
+                          # from, and it is kept out of the trajectory above, which is the whole point of
+                          # separating off-play rows from gameplay rows in the first place.
+                          "off_play_text_observations": off_play_observed,
+                          "display_text_correction_mismatches": [row for row in mismatches
+                                                                 if row["side"] == side],
+                          # What the menus in and around this game drew, kept visible so a reader can see the
+                          # fuller spellings that the trajectory deliberately refuses to treat as changes.
+                          "off_play_reads": sorted(
+                              {(round(float(obs["timestamp"]), 3),
+                                str((obs.get("overlay") or {}).get(key) or "").strip(),
+                                obs.get("screen_state"))
+                               for obs in offscreen
+                               if str((obs.get("overlay") or {}).get(key) or "").strip()},
+                              key=lambda item: item[0])[:12]}
+    edges = sorted(set(stamps))
+    unobserved = [{"from": round(a, 3), "to": round(b, 3), "seconds": round(b - a, 3)}
+                  for a, b in zip(edges, edges[1:]) if b - a > NAMEPLATE_GAP_SECONDS]
+    if edges:
+        if edges[0] - lo > NAMEPLATE_GAP_SECONDS:
+            unobserved.insert(0, {"from": round(lo, 3), "to": round(edges[0], 3),
+                                  "seconds": round(edges[0] - lo, 3)})
+        if hi - edges[-1] > NAMEPLATE_GAP_SECONDS:
+            unobserved.append({"from": round(edges[-1], 3), "to": round(hi, 3),
+                               "seconds": round(hi - edges[-1], 3)})
+    else:
+        unobserved = [{"from": round(lo, 3), "to": round(hi, 3),
+                       "seconds": round(hi - lo, 3)}]
+    return {"span": [round(lo, 3), round(hi, 3)], "sides": per_side,
+            "unobserved_gaps": unobserved,
+            "lookback_from": round(lookback, 3),
+            "play_rows": len(rows), "off_play_rows": len(offscreen),
+            "meaning": ("when each name was drawn, in order, against this span -- the only thing that "
+                        "separates a header that repaints late from a name that is simply wrong")}
+
+
+def _reading_text(value):
+    # type: (Any) -> str
+    """A row's text as a claim of identity between readings: same letters, same order, ignoring spacing."""
+    return " ".join(str(value or "").split()).casefold()
+
+
+def _applied_reading(correction, side, at, row_text, role):
+    # type: (Dict[str, Any], str, float, str, str) -> Dict[str, Any]
+    """One record saying a scoped reading of the pixels was used at this seat and instant."""
+    return {"at": round(at, 3), "side": side, "role": role,
+            "observation_id": correction.get("observation_id"),
+            "row_text": row_text, "observed_text": correction.get("observed_text"),
+            "frame_file": correction.get("frame_file"), "frame_sha256": correction.get("frame_sha256"),
+            "reviewed_by": correction.get("reviewed_by"),
+            "evidence_tier": correction.get("evidence_tier"),
+            "accepted_by": None, "bound_participant_identity": False}
+
+
+def _mismatched_reading(correction, side, at, row_text, off_play):
+    # type: (Dict[str, Any], str, float, str, bool) -> Dict[str, Any]
+    """A scoped reading that names this seat and instant but not this string, kept as a refusal.
+
+    This is the case a scope check by side and time alone would get wrong: the frame digest can be perfect
+    and the association still be about a different reading. Applying it would rewrite a row nobody looked at;
+    dropping it silently would lose the fact that somebody looked and disagreed. So both strings travel,
+    neither is used, and the uncertainty the row already carried stays.
+    """
+    return {"at": round(at, 3), "side": side, "role": "not_applied_row_text_mismatch",
+            "observation_id": correction.get("observation_id"),
+            "row_text": row_text, "declared_text": correction.get("raw_text"),
+            "observed_text": correction.get("observed_text"), "off_play": bool(off_play),
+            "frame_file": correction.get("frame_file"), "frame_sha256": correction.get("frame_sha256"),
+            "reviewed_by": correction.get("reviewed_by"),
+            "accepted_by": None, "bound_participant_identity": False,
+            "why": ("the saved reading says it corrects %r at this seat and instant, but this row carries %r "
+                    "-- so this row is not the reading that was looked at, and neither string is applied"
+                    % (correction.get("raw_text"), row_text))}
+
+
+def _correction_match(corrections, side, at, row_text):
+    # type: (Sequence[Dict[str, Any]], str, float, Optional[str]) -> Tuple[Optional[Dict[str, Any]], Optional[str]]
+    """(observation, status) for this seat at this instant. Nothing else matches it.
+
+    Side and time pick the candidate; the row's own text then decides whether the observation is about *this*
+    reading. Matching on the string alone would apply a correction everywhere a tag appears, and matching on
+    side and time alone would apply it to whatever row happened to share an instant -- a valid ``p1`` and a
+    timestamp inside a real span are not evidence that the classifier text was the one a frame was compared
+    against. Statuses are ``applies``, ``row_text_mismatch``, and ``None`` when nothing was observed here.
+    """
+    for entry in corrections or ():
+        if entry.get("side") != side or entry.get("at") is None:
+            continue
+        if abs(float(entry["at"]) - float(at)) <= OBSERVATION_TIME_TOLERANCE_SECONDS:
+            declared = str(entry.get("raw_text") or "").strip()
+            actual = str(row_text or "").strip()
+            # A reading that declares a string has to find that string on the row. An empty row is not the
+            # nameplate somebody looked at either: it drew nothing, so there is nothing there to correct, and
+            # filling it in from a file would put a name on screen that no frame showed.
+            if declared and _reading_text(declared) != _reading_text(actual):
+                return entry, "row_text_mismatch"
+            if not actual:
+                return None, None
+            return entry, "applies"
+    return None, None
+
+
+def _overlay_pairings(observations, games, text_corrections=()):
     # type: (Sequence[Dict[str, Any]], Sequence[Dict[str, Any]]) -> Dict[float, Dict[str, Any]]
     """What each game's own classification rows say about who sat where.
 
@@ -3054,13 +3819,34 @@ def _overlay_pairings(observations, games):
     if not observations:
         return {}
     out = {}
-    for entry in games:
+    ordered = sorted((entry for entry in games if entry.get("start") is not None),
+                     key=lambda entry: float(entry["start"]))
+    for index, entry in enumerate(ordered):
         pair = _overlay_pair(observations, entry["start"], entry["end"])
+        # The lookback for the timing story is the previous game's opening, not an invented window: how long a
+        # name was already being drawn before *this* game began is exactly the quantity that separates the
+        # header still showing the last pairing from a pairing that started here.
+        lookback = (float(ordered[index - 1]["start"]) if index
+                    else max(0.0, float(entry["start"]) - 90.0))
         out[round(float(entry["start"]), 6)] = {
             "sides": {"p1": pair.get("player1"), "p2": pair.get("player2")},
             "dominant": _dominant(pair),
             "share": pair.get("share"),
             "named_rows": pair.get("named_rows"),
+            # The fighters, per named slot, plus every spelling the rows offered there. Carried because the
+            # identity audit needs to say which side-bound reads exist and which do not; the slot keys come
+            # from the classification row's own columns, whose side meaning is a separate question that
+            # `boundary_identity.character_audit` reports rather than assumes.
+            "characters": pair.get("characters"),
+            "character_reads": pair.get("character_reads"),
+            # And *when* each name was on screen, which majority voting throws away and a repaint question
+            # cannot be answered without.
+            "name_sequence": _name_sequence(observations, float(entry["start"]), float(entry["end"]),
+                                        text_corrections=text_corrections,
+                                        window_start=lookback,
+                                        previous_play_end=(float(ordered[index - 1]["end"])
+                                                           if index and ordered[index - 1].get("end")
+                                                           else None)),
         }
     return out
 
@@ -3339,10 +4125,24 @@ def _attributed_wins(games, band_map, contested=()):
     if not band_map:
         return None
     blocked = [entry for entry in contested if entry.get("status") == "contested"]
+    # Every reason this candidate cannot be read as a per-player score, collected across the whole
+    # candidate instead of the first one met, and each one *typed*: the confidence layer has to know whether
+    # a withheld tally is a coverage gap (one more crop fixes it) or an identity conflict (a tally that would
+    # be wrong whoever reads it), and matching that on the English wording is not an interface. An early
+    # return used to hide the seat conflict behind a missing cover, so a candidate with both reported only
+    # the cover -- which is also the case where the second one is the one that matters.
+    reasons, blockers = [], []
+
+    def refuse(kind, why, **provenance):
+        reasons.append(why)
+        blockers.append(dict({"kind": kind, "why": why}, **provenance))
+
     if blocked:
-        return {"withheld": "the band and the pairing hypothesis disagree about %s, so neither is "
-                            "promoted to a per-player credit"
-                % ", ".join(str(round(float(entry["at"]), 2)) for entry in blocked)}
+        refuse("mapping_contested",
+               "the band and the pairing hypothesis disagree about %s, so neither is promoted to a "
+               "per-player credit"
+               % ", ".join(str(round(float(entry["at"]), 2)) for entry in blocked),
+               at=[round(float(entry["at"]), 3) for entry in blocked])
     # Everyone the band named on either side of any game in this candidate, so the figure is a score and
     # not a list of winners: a reader who sees {Alice: 3} is entitled to ask whether Beth played.
     tally = {}   # type: Dict[str, int]
@@ -3363,12 +4163,17 @@ def _attributed_wins(games, band_map, contested=()):
             unattributed += 1
             continue
         if not cover:
-            return {"withheld": "the game at %s s was won on a screen side no band reading falls inside, "
-                                "so nobody is known to have won it"
-                    % round(float(entry["start"]), 2)}
+            refuse("win_uncovered",
+                   "the game at %s s was won on a screen side no band reading falls inside, so nobody is "
+                   "known to have won it" % round(float(entry["start"]), 2),
+                   at=round(float(entry["start"]), 3))
+            continue
         if not cover["usable"]:
-            return {"withheld": "a counted win at %s s cannot be credited: %s"
-                    % (round(float(entry["start"]), 2), cover.get("why_unusable"))}
+            refuse("cover_unusable",
+                   "a counted win at %s s cannot be credited: %s"
+                   % (round(float(entry["start"]), 2), cover.get("why_unusable")),
+                   at=round(float(entry["start"]), 3))
+            continue
         identity = cover["sides"][winner]
         key = next((k for k in tally if _names_agree(k, identity)), identity)
         tally[key] = tally.get(key, 0) + 1
@@ -3376,12 +4181,6 @@ def _attributed_wins(games, band_map, contested=()):
                          "from_band_at": cover["at"], "crop_sha256": cover.get("image_sha256"),
                          "readings_agreeing": cover.get("support"),
                          "confidence": cover.get("confidence")})
-    if not per_game:
-        # Nothing was credited, so nothing may be *called* credited -- including a roster of names at zero
-        # each. An empty identity tally printed as a per-player attribution is how "we found no winners"
-        # starts being read as "the score is level", and the unit field would then claim a basis the
-        # candidate never used.
-        return None
     # One screen side credited to two different participants inside one candidate. Nothing separated those
     # games -- a match-ending signal would have cut this candidate before this point -- so the seat kept its
     # player while the broadcast renamed it. Publishing the identity figure regardless would score a side
@@ -3402,20 +4201,21 @@ def _attributed_wins(games, band_map, contested=()):
         continuity = [entry.get("seat_continuity") for entry in contested
                       if entry.get("kind") != "no_mapping_question"] or ["unknown"]
         held = all(value == "held" for value in continuity)
-        reasons = []
         for side, entries in sorted(renamed.items()):
-            reasons.append(
-                "the %s side won %d of this candidate's games and the band called it %s, naming it %s at "
-                "%s s and %s at %s s: %s"
-                % (side, len(entries), " and ".join(sorted({e["credited_to"] for e in entries})),
-                   entries[0]["credited_to"], round(float(entries[0]["game_start"]), 2),
-                   entries[-1]["credited_to"], round(float(entries[-1]["game_start"]), 2),
-                   "one seat cannot be two people unless its player moved, and the fighters say it did not"
-                   if held else
-                   "and nothing on screen says whether that side kept its player, so the wins cannot be "
-                   "added up as one person's"))
-        return {
-            "withheld": "; ".join(reasons),
+            refuse("renamed_seat",
+                   "the %s side won %d of this candidate's games and the band called it %s, naming it %s at "
+                   "%s s and %s at %s s: %s"
+                   % (side, len(entries), " and ".join(sorted({e["credited_to"] for e in entries})),
+                      entries[0]["credited_to"], round(float(entries[0]["game_start"]), 2),
+                      entries[-1]["credited_to"], round(float(entries[-1]["game_start"]), 2),
+                      "one seat cannot be two people unless its player moved, and the fighters say it did "
+                      "not" if held else
+                      "and nothing on screen says whether that side kept its player, so the wins cannot be "
+                      "added up as one person's"),
+                   at=[round(float(e["game_start"]), 3) for e in entries], side=side,
+                   seat_continuity="held" if held else (continuity[0] if continuity else "unknown"))
+        seat_block = {
+            "blockers": blockers,
             "participant_hypotheses": {
                 side: [{"name": entry["credited_to"], "game_start": entry["game_start"],
                         "band_at": entry["from_band_at"], "crop_sha256": entry["crop_sha256"]}
@@ -3427,6 +4227,19 @@ def _attributed_wins(games, band_map, contested=()):
             "per_game": per_game, "unattributed_games": unattributed,
             "unit": "screen_side_with_participant_hypotheses", "approximate": True,
             "games_credited": len(per_game)}
+    else:
+        seat_block = None
+    if reasons:
+        # Everything the candidate got wrong is in `blockers` -- the missing cover, the unusable reading, the
+        # mapping the two routes disagree about, and the renamed seat -- and none of them is allowed to travel
+        # alone when another is also true.
+        return dict(seat_block or {}, withheld="; ".join(reasons), blockers=blockers)
+    if not per_game:
+        # Nothing was credited, so nothing may be *called* credited -- including a roster of names at zero
+        # each. An empty identity tally printed as a per-player attribution is how "we found no winners"
+        # starts being read as "the score is level", and the unit field would then claim a basis the
+        # candidate never used.
+        return None
     if not tally:
         return None
     return {"game_wins_by_identity": tally, "per_game": per_game, "unattributed_games": unattributed,
@@ -3658,6 +4471,90 @@ def _station_cue_states():
     return frozenset(state for state, weight in SET_CUE_WEIGHT.items() if weight == "preferred")
 
 
+def hud_on_frame(state, evidence, hud_present=None):
+    # type: (str, str, Optional[bool]) -> bool
+    """Whether this frame shows the in-match HUD, from the stated answer or from the frame's own keys.
+
+    The state arrives under two names depending on which stage wrote the row -- ``state`` from the tracker,
+    ``screen_state`` from the classifier -- and both are consulted, in that order, with the caller's stated
+    answer ahead of either. Reading only one of them made every ``screen_state`` row look like a frame of
+    no state at all, which is exactly the silence a clock reading must not be credited to.
+    """
+    if hud_present is not None:
+        return bool(hud_present)
+    named = str(state or "").strip().lower()
+    return named == "gameplay" or bool(named and named not in _HUD_ABSENT_STATES
+                                       and _HUD_RE.search(evidence or ""))
+
+
+def row_round_call(row):
+    # type: (Dict[str, Any]) -> Optional[int]
+    """Which round a saved row says is being announced, stated or derived.
+
+    The same two-writer problem as the phase: a normalised sequence row carries ``round_call`` and a raw
+    timeline row carries a sentence, so reading the field alone returns None exactly when the frame is the
+    most informative one in the window. A None here means the row says nothing about round number, which is
+    not the same as round 0 and never cancels a comparison.
+    """
+    stated = row.get("round_call")
+    if isinstance(stated, int) and not isinstance(stated, bool):
+        return stated
+    evidence = row.get("evidence") or row.get("description") or ""
+    if not evidence:
+        return None
+    return parse_round_facts(row).get("round_call")
+
+
+def row_combat_phase(row):
+    # type: (Dict[str, Any]) -> str
+    """The combat phase of a saved row, stated or derived, from the row alone.
+
+    The single entry point every consumer should use. Three mistakes it prevents: reading the coarse
+    ``screen_state`` as a claim about play (it is a claim about what is drawn), crediting a clock reading
+    to a frame that never showed a HUD, and missing that state because a different writer spelled the key
+    differently -- which is not a silent failure but a loud one in the wrong direction, since a row with no
+    state has no HUD and a bare number cannot date a round.
+    """
+    stated = str(row.get("combat_phase") or "")
+    if stated in ROUND_PHASES:
+        return stated
+    evidence = row.get("evidence") or row.get("description") or ""
+    if not evidence:
+        return ROUND_PHASE_UNKNOWN
+    state = str(row.get("state") or row.get("screen_state") or "")
+    return round_phase_facts(evidence, clock=row.get("round_clock"),
+                             hud_present=hud_on_frame(state, evidence, row.get("hud_present"))
+                             if "hud_present" in row or state else None)["combat_phase"]
+
+
+def _observation_phase(observation):
+    # type: (Dict[str, Any]) -> str
+    """This row's combat phase. See :func:`row_combat_phase`, which owns the rule.
+
+    Observations reach the edge walk from several writers: the canonical extractor, a vision group's answer,
+    and saved evidence written before the phase existed. A row with no stored phase is not a row with no
+    prose, and re-reading the sentence it already carries costs nothing and invents nothing -- it is the
+    same words, judged by the same rule.
+    """
+    return row_combat_phase(observation)
+
+
+def _walked_reason(phase, reason):
+    # type: (str, str) -> str
+    """Why this row was walked past, saying what the frame shows instead of what the state word implies.
+
+    Kept in one place because three call sites used the same sentence and then drifted: the review layer
+    quoted "on-screen play was still running" for a ROUND 1 banner it had no business calling play.
+    """
+    if phase == ROUND_PHASE_PAUSED:
+        return ("%s; a menu is open over the match, so this is a paused frame and its clock is stopped, "
+                "not play continuing" % reason)
+    if phase == ROUND_PHASE_OPENING:
+        return ("%s; a round is being announced on this frame, which is the opening of a round inside a "
+                "game, not live play already under way" % reason)
+    return reason
+
+
 def _edge_events(observations, lo, hi, anchor_clock, boundary, direction="after"):
     # type: (Sequence[Dict[str, Any]], float, float, Optional[int], float, str) -> tuple
     """What could settle an edge, in the order a walk outward from the boundary meets it.
@@ -3680,6 +4577,15 @@ def _edge_events(observations, lo, hi, anchor_clock, boundary, direction="after"
     ``anchor_clock`` seeds the comparison with the candidate's last (or first) readable clock, so a frame
     outside the bound that continues falling from it is live play on its very first appearance -- and, on the
     leading edge, the walk runs backwards through time with the same rule.
+
+    A clock change is read as a *change in the fight*, which it is not always. ``screen_state`` says what is
+    drawn, and Tekken draws the arena, the health bars and the timer behind a ROUND banner and behind an
+    open pause menu alike, so a row whose combat phase says :data:`NON_COMBAT_PHASES` cannot be the frame
+    that proves play continued past a bound: at 785.785 the digits change because the round was being
+    announced, and at 2722.720 they do not move at all because somebody opened the player-2 menu. Such a
+    row is still walked past and still named, with its phase, because the reader is owed the sighting even
+    when the sighting does not settle anything. The reading itself is never discarded -- the digit still
+    goes on the walk's clock -- only the conclusion drawn from it is corrected.
     """
     rows = sorted(observations, key=lambda o: float(o.get("timestamp", 0.0)))
     rows = [obs for obs in rows if lo < float(obs.get("timestamp", 0.0)) < hi]
@@ -3695,20 +4601,28 @@ def _edge_events(observations, lo, hi, anchor_clock, boundary, direction="after"
             continue
         if state != "gameplay":
             continue
+        phase = _observation_phase(obs)
         value = obs.get("round_clock")
         if value is None:
-            walked.append({"at": at, "state": state, "clock": None, "because": "clock unread"})
+            walked.append({"at": at, "state": state, "clock": None, "combat_phase": phase,
+                           "because": _walked_reason(phase, "clock unread")})
             continue
         if last is not None and int(value) != int(last):
-            events.append({"kind": "live", "at": at, "state": state,
-                           "because": "the round clock changed from %s to %s" % (last, value)})
+            reason = "the round clock changed from %s to %s" % (last, value)
+            if phase in NON_COMBAT_PHASES:
+                walked.append({"at": at, "state": state, "clock": value, "combat_phase": phase,
+                               "because": _walked_reason(phase, reason)})
+                last = value
+                continue
+            events.append({"kind": "live", "at": at, "state": state, "combat_phase": phase,
+                           "because": reason})
             last = value
             continue
-        walked.append({"at": at, "state": state, "clock": value,
-                       "because": "clock reads %s, %s" % (
+        walked.append({"at": at, "state": state, "clock": value, "combat_phase": phase,
+                       "because": _walked_reason(phase, "clock reads %s, %s" % (
                            value, "unchanged from the row nearer the bound" if last is not None
                            else "the first readable frame past the bound, with nothing beside it to change "
-                                "from -- a frozen result frame is indistinguishable from this")})
+                                "from -- a frozen result frame is indistinguishable from this"))})
         last = value
     events.sort(key=lambda event: abs(event["at"] - boundary))
     walked.sort(key=lambda event: abs(event["at"] - boundary))
@@ -4431,6 +5345,18 @@ def _set_record(games, games_per_set, membership, links, single, clip_pad_second
         clip_end = round(anchor + clip_pad_seconds, 6)
     clip_end = round(clip_end, 6) if clip_end is not None else None
 
+    # Computed once each and echoed into the rows below: the hypothesis tier, the report that prices it, and
+    # the fighter audit beside it. Recomputing one read per published key is how three copies of a number
+    # eventually disagree with each other inside a single record.
+    nameplate = _nameplate_hypotheses(games, band_map, pairings)
+    characters = boundary_identity.character_audit(games, pairings)
+    confidence = boundary_identity.candidate_report(
+        games, band_map=band_map, pairings=pairings, nameplate=nameplate, attributed=attributed,
+        formats=formats, membership=membership, links=links, status=status,
+        authoritative_winner=(leader[0] if (status == "complete" and deciding_unit == "identities"
+                                            and len(leader) == 1) else None),
+        deciding=deciding, deciding_unit=deciding_unit, characters=characters)
+
     return {
         "start": games[0]["start"],
         "end": last["end"],
@@ -4491,6 +5417,16 @@ def _set_record(games, games_per_set, membership, links, single, clip_pad_second
         "attribution": _attribution(games, links, header=header, band_map=band_map,
                                     mapping_questions=mapping_questions, attributed=attributed,
                                     pairings=pairings),
+        # Published beside the attribution, never inside it: the tier above decides whether wins can be read
+        # as one person's, and nothing here feeds a target, a closure or `set_winner`. It exists because a
+        # withheld winner and an unseen nameplate were indistinguishable in the output, which invited a
+        # reviewer to assume the footage said nothing when in fact the graphic said something untrustworthy.
+        "nameplate_hypotheses": nameplate,
+        # How much each name above deserves to be believed, and what a reviewer would have to look at to
+        # settle it. The tier and the estimate are computed from the verdicts on the rows above them and
+        # feed nothing back: an estimate that moved a boundary would be an inference dressed as a report.
+        "attribution_confidence": confidence,
+        "character_bindings": characters,
         "cut_mapping_resolution": [entry for entry in mapping_questions
                                    if entry.get("at") in {(cut_before or {}).get("at"),
                                                           (cut_after or {}).get("at")}],

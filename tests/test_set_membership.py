@@ -1037,3 +1037,127 @@ def test_a_set_that_opened_on_tape_keeps_its_completion_claim_clean():
     assert record["set_completion"]["state"] == "confirmed"
     assert not [m for m in record["missing_evidence"] if "the start of this set" in m], \
         record["missing_evidence"]
+
+
+# ------------------------------------------------------------------ nameplate identity hypotheses
+# The band answers and these rows are two reads of ONE broadcast graphic. Every test below therefore asks
+# two things at once: does the machine publish what the graphic said, and does it refuse to treat that as
+# a second witness, a settled identity, or a reason to move a boundary.
+
+def overlay(start, sides, dominant=True, share=1.0, rows=5):
+    return {start: {"sides": {"p1": sides[0], "p2": sides[1]}, "dominant": dominant,
+                    "share": {"player1": share, "player2": share} if not isinstance(share, dict) else share,
+                    "named_rows": rows}}
+
+
+def band(start, sides, at=None, sha="abcd1234"):
+    return {start: {"usable": True, "sides": {"p1": sides[0], "p2": sides[1]}, "at": at or start,
+                    "image_sha256": sha}}
+
+
+def test_a_dominant_in_span_nameplate_is_published_where_no_band_answer_exists():
+    """The tier that was missing: the rows named both sides and nothing consumed it."""
+    games = [game(0, "p1"), game(1, "p2")]
+    pairings = {}
+    pairings.update(overlay(0.0, ("Alpha", "Beta")))
+    pairings.update(overlay(200.0, ("Alpha", "Beta")))
+    got = bg._nameplate_hypotheses(games, {}, pairings)
+    assert got["authoritative"] is False and got["changes_grouping_or_targets"] is False
+    assert {row["basis"] for row in got["games"][:1]} == {bg.OVERLAY_IDENTITY_TRUST}
+    assert got["games"][0]["sides"] == {"p1": "Alpha", "p2": "Beta"}
+    assert got["games"][0]["band_cover"] is None
+    # Alpha took game 1 and Beta took game 2 on these two games: a leader is not a winner.
+    assert {w["name"]: w["wins"] for w in got["possible_winners"]} == {"Alpha": 1, "Beta": 1}
+    assert all(w["unit"] == bg.OVERLAY_IDENTITY_TRUST for w in got["possible_winners"])
+
+
+def test_a_band_answer_stays_the_basis_and_agreement_is_reported_as_the_same_witness():
+    games = [game(0, "p1")]
+    got = bg._nameplate_hypotheses(games, band(0.0, ("Alpha", "Beta")),
+                                   overlay(0.0, ("Alpha", "Beta")))
+    row = got["games"][0]
+    assert row["basis"] == "header_band_saved"
+    assert row["band_agrees"] is True
+    assert row["band_crop_sha256"] == "abcd1234"
+    assert "same graphic" in row["why"] and "not a second witness" in row["why"]
+
+
+def test_a_band_and_nameplate_disagreement_is_visible_and_the_band_is_not_overridden():
+    games = [game(0, "p1")]
+    got = bg._nameplate_hypotheses(games, band(0.0, ("Alpha", "Beta")),
+                                   overlay(0.0, ("Gamma", "Delta")))  # one game, one disagreement
+    row = got["games"][0]
+    assert row["basis"] == "header_band_saved" and row["band_agrees"] is False
+    assert row["sides"] == {"p1": "Alpha", "p2": "Beta"}, "the weaker read never replaces the band"
+    assert "same broadcast graphic" in got["trust_note"]
+    assert got["games"][0]["contradicts"]["overlay_nameplate_rows"] == {"p1": "Gamma", "p2": "Delta"}, \
+        "the weaker read is reported as a contradiction, not dropped or promoted"
+
+
+def test_a_game_whose_own_rows_switch_names_is_left_unnamed_rather_than_majority_ruled():
+    """Share below the configured floor is 'the graphic moved', not 'the quieter reading loses'."""
+    games = [game(0, "p1"), game(1, "p1")]
+    weak = {0.0: {"sides": {"p1": "Alpha", "p2": "Beta"}, "dominant": False,
+                  "share": {"player1": 0.692, "player2": 0.692}, "named_rows": 26}}
+    got = bg._nameplate_hypotheses(games, weak, weak)
+    assert got["games"][0]["admitted"] is False and got["games"][0]["sides"] == {}
+    assert got["unnamed_games"] == [0.0, 200.0]
+    assert got["possible_winners"] == []
+
+
+def test_a_blank_nameplate_or_a_missing_row_set_is_unknown_not_zero():
+    games = [game(0, "p1")]
+    blank = {0.0: {"sides": {"p1": None, "p2": None}, "dominant": False, "share": None, "named_rows": 0}}
+    got = bg._nameplate_hypotheses(games, {}, blank)
+    assert got["games"][0]["admitted"] is False
+    assert "share None over 0 rows" in got["games"][0]["why"]
+    assert got["unnamed_games"] == [0.0]
+
+
+def test_a_seat_swap_across_games_keeps_both_arrangements_visible():
+    """The swap BB9 actually contains: games 10-14 one way round, 15-16 the other. Both must survive."""
+    games = [game(0, "p1"), game(1, "p1")]
+    pairings = {}
+    pairings.update(overlay(0.0, ("Ariz", "Buk")))
+    pairings.update(overlay(200.0, ("Buk", "Ariz")))
+    got = bg._nameplate_hypotheses(games, {}, pairings)
+    assert [row["sides"] for row in got["games"]] == [{"p1": "Ariz", "p2": "Buk"},
+                                                      {"p1": "Buk", "p2": "Ariz"}]
+    # p1 won both games, and p1 was a different name in each: no single participant may lead on both.
+    assert {w["name"]: w["wins"] for w in got["possible_winners"]} == {"Ariz": 1, "Buk": 1}
+
+
+def test_a_uniformly_stale_graphic_yields_a_hypothesis_and_never_a_settled_identity():
+    """A majority can be confidently wrong: 57 rows of the same next-pairing advertisement is one witness."""
+    games = [game(0, "p1"), game(1, "p1")]
+    stale = {}
+    stale.update(overlay(0.0, ("Next", "Pairing"), share=1.0, rows=57))
+    stale.update(overlay(200.0, ("Next", "Pairing"), share=1.0, rows=61))
+    got = bg._nameplate_hypotheses(games, {}, stale)
+    assert all(row["basis"] == bg.OVERLAY_IDENTITY_TRUST for row in got["games"])
+    assert got["authoritative"] is False and got["changes_grouping_or_targets"] is False
+    assert "hypothesis and not an identity" in got["games"][0]["why"]
+    assert got["possible_winners"][0]["unit"] == bg.OVERLAY_IDENTITY_TRUST
+
+
+def test_the_hypothesis_tier_leaves_grouping_targets_and_the_authoritative_winner_alone():
+    games = [game(0, "p1"), game(1, "p1")]
+    rows = rows_for([(games[0], "Alpha", "Beta", [0, 0]), (games[1], "Alpha", "Beta", [1, 0])])
+    without = check(games, rows, games_per_set=2)
+    sides = {"p1": "Alpha", "p2": "Beta"}
+    got = bg._nameplate_hypotheses(games, {}, {0.0: {"sides": sides, "dominant": True,
+                                                    "share": {"player1": 1.0, "player2": 1.0},
+                                                    "named_rows": 3}})
+    again = check(games, rows, games_per_set=2)
+    assert [[round(float(s["start"]), 6), round(float(s["end"]), 6), s.get("status"),
+             s.get("set_winner")] for s in without] == \
+           [[round(float(s["start"]), 6), round(float(s["end"]), 6), s.get("status"),
+             s.get("set_winner")] for s in again], "the helper must not be able to move a boundary"
+    assert got["authoritative"] is False
+    assert "nameplate_hypotheses" in without[0] and \
+        without[0]["nameplate_hypotheses"]["authoritative"] is False
+    # It is carried through JSON, and its enum values are the declared ones.
+    revived = json.loads(json.dumps(without[0]["nameplate_hypotheses"], default=str))
+    assert revived["unit"] == bg.OVERLAY_IDENTITY_TRUST
+    assert {row["basis"] for row in revived["games"]} <= {bg.OVERLAY_IDENTITY_TRUST,
+                                                          "header_band_saved", "none"}

@@ -33,6 +33,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from tekken_vod_helper import boundary_evidence as be        # noqa: E402
 from tekken_vod_helper import boundary_format                # noqa: E402
 from tekken_vod_helper import boundary_header as bh          # noqa: E402
+from tekken_vod_helper import boundary_observations          # noqa: E402
+
+#: Repo root, used to resolve an observation's frame reference. Frames are named relative to it so a
+#: observations file can be moved with the tree instead of carrying absolute paths.
+ROOT = Path(__file__).resolve().parents[1]
 
 #: Statuses that mean the mapping is still unknown, and so still costable. Re-exported from the canonical
 #: module rather than restated here: two lists of one set of statuses is how a gap stops being priced.
@@ -105,6 +110,14 @@ def main():
     parser.add_argument("--no-format", action="store_true",
                         help="Format-removed comparison: no target at all, so no candidate can close. "
                              "This is what shows how much of a recovery came from the recording.")
+    parser.add_argument("--source", default=None,
+                        help="The recording these observations were made about. Optional, but when given it "
+                             "is enforced: an observation citing another file is refused rather than applied.")
+    parser.add_argument("--observations", default=None,
+                        help="A saved-observation file (boundary_observations): corrections to text a frame "
+                             "was read at one instant and seat, and stage labels read the same way. Entries "
+                             "outside their declared scope are refused, and none of them binds a participant "
+                             "or counts as an acceptance.")
     parser.add_argument("--output", default=None, help="Where to write the report.")
     parser.add_argument("--budget-file", default=None,
                         help="The attempt ledger that counted these answers, when one did. Report-only: "
@@ -130,10 +143,46 @@ def main():
     # stage text still applies, so the comparison is about *who is playing*, not about which round the
     # band says this is), with them, and with no target anywhere. From the canonical module, because a
     # report that ran its own three passes is a second implementation of the comparison.
+    # Saved observations arrive as data, and three things happen to them before anything is trusted: each is
+    # validated against its own declared scope (a correction outside its instant, or a claim of authority in
+    # a scope field, is refused with a reason), the run has to name the recording it is applying them to, and
+    # the stage labels join the readings the format policy already consumes. Nothing here knows a recording, a
+    # player or a timestamp; the file does.
+    observations = None
+    corrections, stage_rows, run_scope = [], [], None
+    if args.observations:
+        if not args.source:
+            raise SystemExit("--observations needs --source: a saved observation is a reading of one "
+                             "recording's frames, and with no recording named there is nothing for its scope "
+                             "to be checked against. Refusing to apply it is the honest answer.")
+        observations = boundary_observations.load(
+            args.observations, root=ROOT,
+            context={"source": args.source})
+        run_scope = boundary_observations.apply_to(observations, source=args.source)
+        corrections, stage_rows = run_scope["text_corrections"], run_scope["stage_readings"]
+    readings = list(saved["readings"] or []) + stage_rows
     tracked = be.adjudicate(evidence["observations"], rounds_per_game=args.rounds_per_game,
-                            games_per_set=games_per_set, header=saved, readings=saved["readings"],
-                            policy=policy, region=args.region)
+                            games_per_set=games_per_set, header=saved, readings=readings,
+                            policy=policy, region=args.region, text_corrections=corrections)
     recovered = be.recovery(evidence, tracked, header=saved, policy=policy)
+    if observations is not None:
+        # Counted per unique reading, and separately per candidate mention, because those are different facts
+        # and the earlier single number conflated them: one frame cited by two candidates is one observation
+        # and two references, and neither of them is "two corrections".
+        summary = boundary_observations.disposition(observations, tracked["assisted"]["sets"],
+                                                    source=args.source)
+        recovered["observations"] = dict(
+            boundary_observations.describe(observations),
+            run_scope={"source": args.source, "refused": run_scope["refused"],
+                       "applied_anything": run_scope["applied_anything"]},
+            text_observations_handed_to_tracker=len(corrections),
+            stage_observations_handed_to_tracker=len(stage_rows),
+            disposition=summary,
+            authoritative=False,
+            binds_no_participant_identity=True,
+            counts_as_acceptance=False,
+            meaning=("admitted is what a frame was read at; the disposition block is what the recovery did "
+                     "with each one, including the readings it preserved without using"))
     merge = dict(recovered["pip_evidence"]["merge"])
     # The key this report has always published, spelled as it was when the merge lived in the game-one
     # harness. Only the name is historical; the count comes from the shared merge. A state-only run has no

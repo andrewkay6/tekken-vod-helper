@@ -565,7 +565,7 @@ def load(window=None, rows=None, runs=None, state_only=False, fixture=None, root
 
 
 def adjudicate(observations, rounds_per_game=3, games_per_set=3, header=None, readings=None,
-               policy=None, region=None, source=None):
+               policy=None, region=None, source=None, text_corrections=()):
     # type: (Sequence[Dict[str, Any]], int, Any, Optional[Dict[str, Any]], Optional[Sequence[Dict[str, Any]]], Optional[Dict[str, Any]], Optional[Sequence[float]], Optional[Dict[str, Any]]) -> Dict[str, Any]
     """Run the three comparisons over one evidence base, so two tools cannot price different runs.
 
@@ -576,8 +576,13 @@ def adjudicate(observations, rounds_per_game=3, games_per_set=3, header=None, re
 
     ``unformatted`` is the same recording with no target anywhere: the distance between that column and
     ``assisted`` is what being told the rules bought, stated as a number instead of a claim.
+
+    ``text_corrections`` is passed to all three columns together. Applying a saved-frame reading of displayed
+    text to one arm and not the others would compare a corrected recording against an uncorrected one, and any
+    difference would be an artefact of the experiment rather than of the input under test.
     """
-    kwargs = {"rounds_per_game": rounds_per_game, "analysis_window": tuple(region) if region else None,
+    kwargs = {"rounds_per_game": rounds_per_game, "text_corrections": list(text_corrections or ()),
+              "analysis_window": tuple(region) if region else None,
               # Passed down so a candidate's leading/trailing limit is answered from the tape and the cache
               # rather than from whichever rows this query happened to receive. None is a real answer --
               # it means the caller cannot tell a window edge from a truncated recording -- and the tracker
@@ -585,8 +590,12 @@ def adjudicate(observations, rounds_per_game=3, games_per_set=3, header=None, re
               "source": source}
     plain = boundary_games.track_games(observations, games_per_set=games_per_set,
                                        format_policy=policy, stage_readings=readings, **kwargs)
+    # The shipped column is this one, so the stage text the caller named has to reach it too. Before saved
+    # observations existed the only stage text was the band's own, which the tracker reads off ``header``;
+    # a label read out of cached frames arrives in ``readings`` and nothing else, and an arm that ignored it
+    # would report the same candidate as ambiguous in the report and first-to-three in the project.
     assisted = boundary_games.track_games(observations, games_per_set=games_per_set, header=header,
-                                          format_policy=policy, **kwargs)
+                                          format_policy=policy, stage_readings=readings or None, **kwargs)
     unformatted = boundary_games.track_games(observations, games_per_set=None,
                                              stage_readings=readings if policy else None, **kwargs)
     return {"plain": plain, "assisted": assisted, "unformatted": unformatted}
@@ -806,6 +815,29 @@ def candidate_records(assisted, plain=None):
                     "game_wins_by_identity": s["attribution"].get("game_wins_by_identity"),
                     "attribution_withheld": s.get("attribution_withheld"),
                     "participant_hypotheses": s.get("participant_hypotheses"),
+                    # Carried, not recomputed: this is the lower tier -- who the broadcast graphic named on
+                    # each side, at what share, and which games it never named. It decides nothing about
+                    # grouping, targets or the authoritative winner above it, and dropping it here would
+                    # leave the operator package reporting that the pipeline saw no nameplate at all, which
+                    # is a different claim from the one the run actually made.
+                    "nameplate_hypotheses": s.get("nameplate_hypotheses"),
+                    # How much the names above are worth, and what the recording says about which fighter
+                    # sits where. Both are reports about the evidence rather than claims on top of it: the
+                    # estimate inside the first is inert, and the second says out loud that nothing here is
+                    # side-bound. Dropping them would leave a saved project holding the tally but not the
+                    # confidence anyone would need in order to decide whether to act on it.
+                    "attribution_confidence": s.get("attribution_confidence"),
+                    "character_bindings": s.get("character_bindings"),
+                    # What a saved frame was read at one instant, and the string the classifier wrote there.
+                    # Dropped here, the correction would look like it changed the recording rather than the
+                    # reading of it, and nobody downstream could tell which strings were verified.
+                    "display_text_observations": (s.get("attribution_confidence") or {}).get(
+                        "display_text_observations"),
+                    # The admitted-but-not-applied half of the same accounting. A candidate that only quotes
+                    # an observation as lookback context, or that refused it on a text mismatch, has to be
+                    # able to say so; otherwise every surviving entry reads as a correction that was used.
+                    "display_text_correction_refusals": (s.get("attribution_confidence") or {}).get(
+                        "display_text_correction_refusals"),
                     "applicable_formats": s.get("applicable_formats"),
                     "complete_under": s.get("complete_under"),
                     "open_under": s.get("open_under"),

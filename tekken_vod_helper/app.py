@@ -78,6 +78,19 @@ def _set_windows_app_user_model_id() -> None:
         pass
 
 
+def _is_structural_review_action(action: str) -> bool:
+    """Whether an action can move a boundary, and so has to rebuild the clip tree as well as the card.
+
+    Listed in one place because it is the whole difference between a tree that updates and one that keeps
+    showing a clip that is no longer there. Applying a machine proposal moves a boundary; rejecting one
+    leaves every row exactly where it was, which is why the two verbs are not the same case.
+    """
+    if action == "proposal:apply":
+        return True
+    return action.startswith(("answer:", "nudge:", "end:", "start:", "orientation:", "claim",
+                              "undo", "undo-last"))
+
+
 class TekkenVodHelperApp(AppWindow):
     def __init__(self) -> None:
         _set_windows_app_user_model_id()
@@ -1137,34 +1150,54 @@ class TekkenVodHelperApp(AppWindow):
         held_frame = ttk.Frame(body)
         held_frame.grid(row=4, column=0, sticky="nsew")
         held_frame.columnconfigure(0, weight=1)
-        held_frame.rowconfigure(2, weight=1)
+        held_frame.rowconfigure(3, weight=1)
         self._wrap_label(ttk.Label(held_frame, justify="left",
                                    text="Footage no export would write: clips on hold, and stretches of "
                                         "the recording no candidate covers")).grid(row=0, column=0,
                                                                                    sticky="ew")
         self.review_coverage_var = tk.StringVar(value="")
+        self.review_boundary_note_var = tk.StringVar(value="")
         self._wrap_label(ttk.Label(held_frame, textvariable=self.review_coverage_var,
                                        style="Muted.TLabel", justify="left")).grid(row=1, column=0,
                                                                                    sticky="ew",
                                                                                    pady=(0, 2))
+        self._wrap_label(ttk.Label(held_frame, textvariable=self.review_boundary_note_var,
+                                       style="Muted.TLabel", justify="left")).grid(row=2, column=0,
+                                                                                    sticky="ew")
         columns = ("kind", "edge", "from", "to", "seconds", "evidence", "why")
         self.review_unresolved_tree = ttk.Treeview(held_frame, columns=columns, show="headings",
                                                    height=5, selectmode="browse")
         for column, heading, width in (("kind", "What", 76), ("edge", "Where it is", 92),
                                        ("from", "From", 86), ("to", "To", 86),
                                        ("seconds", "Seconds", 66),
-                                       ("evidence", "Play seen here?", 96),
+                                       ("evidence", "Play in saved evidence?", 168),
                                        ("why", "Why it is on this list", 300)):
             self.review_unresolved_tree.heading(column, text=heading)
             self.review_unresolved_tree.column(column, width=width,
                                                stretch=(column == "why"), anchor="w")
-        self.review_unresolved_tree.grid(row=2, column=0, sticky="nsew")
+        self.review_unresolved_tree.grid(row=3, column=0, sticky="nsew")
         held_scroll = ttk.Scrollbar(held_frame, orient="vertical",
                                     command=self.review_unresolved_tree.yview)
-        held_scroll.grid(row=2, column=1, sticky="ns")
+        held_scroll.grid(row=3, column=1, sticky="ns")
         self.review_unresolved_tree.configure(yscrollcommand=held_scroll.set)
-        ttk.Button(held_frame, text="Play the selected footage",
-                   command=self._review_play_unresolved).grid(row=3, column=0, sticky="w", pady=(4, 2))
+        footage = ttk.Frame(held_frame)
+        footage.grid(row=4, column=0, sticky="w", pady=(4, 2))
+        ttk.Button(footage, text="Play the selected footage",
+                   command=self._review_play_unresolved).grid(row=0, column=0, sticky="w")
+        # Watching an unclaimed stretch and having nowhere to put the answer is how a match stays outside
+        # the export forever, so this list carries the two things a watcher can honestly say about it: make
+        # it a row, or write down what it was.
+        ttk.Button(footage, text="Claim it as a match",
+                   command=self._review_claim_unresolved).grid(row=0, column=1, sticky="w",
+                                                               padx=(6, 0))
+        self.review_dispose_var = tk.StringVar(value="Note what the footage was...")
+        # The wording comes from the controller's own list, so a button here cannot offer a disposition the
+        # journal does not recognise, and a new disposition shows up without touching this file.
+        self.review_dispose_choices = sorted(boundary_review.FOOTAGE_DISPOSITIONS.items())
+        dispose = ttk.Combobox(footage, textvariable=self.review_dispose_var, state="readonly", width=30,
+                               values=[label for _kind, label in self.review_dispose_choices])
+        dispose.grid(row=0, column=2, sticky="w", padx=(6, 0))
+        dispose.bind("<<ComboboxSelected>>", self._review_dispose_unresolved)
         self.review_held = self.review_unresolved_tree      # the driver's room-check name for this part
 
         self._wrap_label(ttk.Label(body, textvariable=self.review_message_var, style="Muted.TLabel",
@@ -1180,10 +1213,19 @@ class TekkenVodHelperApp(AppWindow):
                                        "No video chosen - the queue and its saved evidence still work, "
                                        "but nothing can be played")
             summary = view["summary"]
+            # Four counts, four names. "accepted" used to be one word doing the work of all of them, which
+            # is how an unreviewed candidate with no start evidence ended up reported as an accepted
+            # boundary; the label now has nowhere to collapse them back together.
             self.review_summary_var.set(
-                "{open} open - {deferred} unsure - {answered} answered - {held} held - "
-                "{exportable} exportable - {unplaced_seconds:.1f}s unplaced - no inference".format(
-                    **summary))
+                "{open} open - {deferred} unsure - {answered} answered | exportable {exportable}, "
+                "held {held} | start: {machine_supported_starts} supported / "
+                "{unknown_starts} unknown / {machine_contradicted_starts} contradicting | "
+                "{start_readings_conflict} have readings that disagree | "
+                "{openings_needing_review} need a reading | operator accepted "
+                "{operator_accepted}, {operator_approved_partials} approved as partial | independently "
+                "validated {independently_validated} | {machine_proposals_pending} machine proposals "
+                "awaiting a decision | {unplaced_seconds:.1f}s unplaced | "
+                "no inference".format(**summary))
             self.review_message_var.set(view["message"])
             self.review_tree.delete(*self.review_tree.get_children())
             for row in view["rows"]:
@@ -1278,6 +1320,26 @@ class TekkenVodHelperApp(AppWindow):
                          "the current time, nudge it, or accept the partial with a reason." % late)
         if earliest is not None:
             lines.append("Earliest opening the saved rows name: %.3f." % earliest)
+        offered = question.get("proposal")
+        if offered:
+            # The button under this block says "Apply this proposal", so the number it would apply, the number
+            # it would replace, and how wide the sampling says that instant is have to be on the screen first.
+            # Without them the reviewer is being asked to accept an invisible edit -- and a machine suggestion
+            # is only safe to expose because it is visibly a suggestion.
+            moved = offered.get("distance_seconds")
+            lines.append(
+                "Machine proposal (yours to apply, reject, or leave): move the %s from %.3f to %.3f, %s. "
+                "Sampling width %s. %s%s"
+                % (offered.get("kind") or "boundary", float(offered.get("current") or 0.0),
+                   float(offered.get("at") or 0.0),
+                   ("%+.3f s" % moved) if moved is not None else "distance unknown",
+                   offered.get("uncertainty_text") or "unknown", offered.get("why") or "",
+                   " Frame: %s." % offered["evidence"]["frame"]
+                   if (offered.get("evidence") or {}).get("frame") else ""))
+        if boundary.get("evidence_describes_boundary") is False:
+            # The row moved. Say which frame the saved reading belongs to instead of quoting it here.
+            lines.append("Start evidence: %s" % (boundary.get("needs_review_why")
+                                                 or "the saved reading no longer describes this instant"))
         return "\n".join(lines)
 
     def _review_fill_unresolved(self, view: Dict[str, object]) -> None:
@@ -1291,10 +1353,39 @@ class TekkenVodHelperApp(AppWindow):
                                 seconds_to_timestamp(row["from"] or 0.0),
                                 seconds_to_timestamp(row["to"] or 0.0) if row["to"] is not None else "-",
                                 ("%.1f" % row["seconds"]) if row.get("seconds") is not None else "-",
-                                {True: "play seen", False: "no play seen",
+                                # What the saved game spans say, never a claim that anybody watched the
+                                # stretch: "no play seen" reads like an empty segment somebody inspected,
+                                # and the only thing this column can prove is that no reconstructed game
+                                # span reaches this far.
+                                {True: "saved game span reaches it",
+                                 False: "no saved game span reaches it",
                                  None: "unknown"}[row.get("gameplay_seen_in_saved_evidence")],
                                 row["why"]))
         coverage = (view.get("coverage") or {})
+        sequence = coverage.get("sequence") or {}
+        boundary = coverage.get("boundary_summary") or {}
+        lines = []
+        if sequence:
+            lines.append("Saved sequence: %s (%s row(s)%s). %s"
+                         % (sequence.get("kind") or "none", sequence.get("rows_read", 0),
+                            ", digest %s" % sequence.get("sha256")
+                            if sequence.get("digest_matches") else "", sequence.get("reason") or ""))
+        if boundary.get("note"):
+            lines.append("Boundary claims: %s" % boundary["note"])
+        seen = view.get("footage_coverage") or {}
+        if seen.get("records"):
+            # The count of what was watched, said beside the count of what was not: a half-finished note
+            # pass is not a reviewed recording, and the page should not be able to suggest that it was.
+            lines.append("Footage somebody has described: %.1f s in %d record(s); %.1f s of the tape has "
+                         "no record at all. An annotation is an observation about footage, never a reviewed "
+                         "or validated boundary."
+                         % (seen.get("seconds_annotated") or 0.0, seen.get("records") or 0,
+                            seen.get("seconds_unwatched") or 0.0))
+        elif seen.get("seconds_unwatched") is not None:
+            lines.append("Nothing on this list has been described yet: all %.1f s of the tape is unwatched "
+                         "as far as this project knows." % seen["seconds_unwatched"])
+        if lines:
+            self.review_boundary_note_var.set("\n".join(lines))
         self.review_coverage_var.set(
             "Candidates cover {c:.1f} s; exports would write {j:.1f} s; uncovered by exports {u:.1f} s in "
             "{n} stretch(es) (tape is {d:.1f} s).".format(
@@ -1314,6 +1405,46 @@ class TekkenVodHelperApp(AppWindow):
         kind, start, end = chosen[0].split("|")
         self._review_press("play-interval:%s_%s" % (start, end if end != "None" else start))
 
+    def _review_claim_unresolved(self) -> None:
+        """Say what the list of unclaimed footage could never be told: that a match is in it.
+
+        The row arrives with no machine evidence, and its opening stays an open question; naming an end is
+        the operator's own decision about where the footage stops. Creating it accepts nothing and validates
+        nothing -- it only puts the stretch in front of the questions that can.
+        """
+        interval = self._review_selected_interval()
+        if interval is None:
+            return
+        self._review_press("claim-interval:" + interval)
+
+    def _review_dispose_unresolved(self, _event=None) -> None:
+        """Write down what a stretch of footage was, without pretending it was a reviewed boundary."""
+        interval = self._review_selected_interval()
+        if interval is None:
+            return
+        chosen = getattr(self, "review_dispose_var", None)
+        wanted = chosen.get() if chosen else ""
+        kind = next((key for key, label in self.review_dispose_choices if label == wanted), "")
+        if not kind:
+            self.log("Choose what the footage was first, from the list beside this button: the note has to "
+                     "say which of the five things you saw.")
+            return
+        self._review_press("dispose:%s:%s" % (kind, interval))
+
+    def _review_selected_interval(self) -> Optional[str]:
+        """The ``from_to`` pair the uncovered-footage list is standing on, or a nudge to pick a row."""
+        chosen = self.review_unresolved_tree.selection()
+        if not chosen:
+            self.log("Select a row in the uncovered-footage list first: each one is a stretch of this "
+                     "recording that no export would write.")
+            return None
+        kind, start, end = chosen[0].split("|")
+        if kind != "gap":
+            self.log("%s is footage a clip already claims and holds, not a stretch nobody marked: answer "
+                     "its own question instead of claiming it twice." % kind.upper())
+            return None
+        return "%s_%s" % (start, end if end != "None" else start)
+
     def _review_selected(self, _event=None) -> str:
         """Follow a reviewer's click, and only a click.
 
@@ -1328,7 +1459,6 @@ class TekkenVodHelperApp(AppWindow):
         if chosen:
             self._review_press("select:" + chosen)
         return ""
-
     def _review_press(self, action: str) -> None:
         if action == "bracket:pick":
             self._review_choose_bracket()
@@ -1337,8 +1467,7 @@ class TekkenVodHelperApp(AppWindow):
         panel.set_current_time(self.current_time)
         note = self.review_note_var.get().strip() if hasattr(self, "review_note_var") else ""
         message = panel.press(action, note=note)
-        structural = action.startswith(("answer:", "nudge:", "end:", "start:", "orientation:",
-                                   "undo", "undo-last"))
+        structural = _is_structural_review_action(action)
         if action.startswith("play") and panel.playback:
             self._review_play(panel.playback)
             panel.playback = None

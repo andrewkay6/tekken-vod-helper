@@ -178,6 +178,13 @@ class ProjectState:
     # what a person already settled before it touches the evidence underneath. ``to_dict`` used to omit it,
     # which meant Save in the app silently destroyed every answer.
     review: Dict[str, Any] = field(default_factory=dict)
+    # Where the saved sequence rows live, so an opening question can be answered from evidence already on
+    # disk instead of re-classifying footage: a path, a byte count and a digest, re-checked on every read.
+    # The sequence describes the **recording**, so it belongs here and not on a segment; ``sequence_rows``
+    # is the inline form for a caller already holding them (a test, or a small window), while the CLI
+    # writes the reference -- a BB9 timeline is 2,000 rows and the project file is rewritten per decision.
+    sequence_source: Dict[str, Any] = field(default_factory=dict)
+    sequence_rows: List[Dict[str, Any]] = field(default_factory=list)
     overlay: OverlayState = field(default_factory=OverlayState)
     obs: ObsSettings = field(default_factory=ObsSettings)
     startgg: StartggSettings = field(default_factory=StartggSettings)
@@ -254,6 +261,8 @@ class ProjectState:
             # Written only when present, so a project that never went through the review path keeps saving
             # exactly the fields it always had.
             **({"review": self.review} if self.review else {}),
+            **({"sequence_source": self.sequence_source} if self.sequence_source else {}),
+            **({"sequence_rows": self.sequence_rows} if self.sequence_rows else {}),
             "overlay": self.overlay.to_dict(),
             "obs": self.obs.to_dict(),
             "startgg": self.startgg.to_dict(),
@@ -281,6 +290,10 @@ class ProjectState:
                 if isinstance(item, dict)
             ],
             review=dict(data.get("review") or {}) if isinstance(data.get("review"), dict) else {},
+            sequence_source=(dict(data.get("sequence_source") or {})
+                             if isinstance(data.get("sequence_source"), dict) else {}),
+            sequence_rows=[row for row in (data.get("sequence_rows") or [])
+                           if isinstance(row, dict)],
             overlay=OverlayState.from_dict(data.get("overlay", {}) if isinstance(data.get("overlay"), dict) else {}),
             obs=ObsSettings.from_dict(data.get("obs", {}) if isinstance(data.get("obs"), dict) else {}),
             startgg=StartggSettings.from_dict(data.get("startgg", {}) if isinstance(data.get("startgg"), dict) else {}),

@@ -11,79 +11,114 @@ current authority for the set layer is `docs/set-recovery-stage5-plan.md`. Where
 removed document carried a command worth re-running, that command moved to "How the
 executed stages were run" near the end of this file.
 
-## Current status — 2026-11-06, Codex review of the running UI and evaluator frame times
+## Current status — recovery automation produces its own start corrections; attribution and independent validation are the open work, 2026-11-08
 
-Latest relevant Qwen session **d22e595e-2999-4275-8123-9e303255976f** finished at 22:33 UTC.
-The Boundary review tab is implemented through ReviewFlow/ReviewPanel: 37 questions, including all
-10 openings/endings, short playback, deferred/answered views, adjustments, bracket/orientation and
-persistent decisions. The exporter uses the same hold policy. Qwen's final real-widget driver reports
-PASS (seek/pause, undo, hold enforcement, save/reopen); Codex read its actual outputs and viewed the
-opening screenshot, but did not repeat the full driver. The clipped explanatory text has since been fixed:
-the "why" block is a wrapping read-only Text rather than two fixed-wraplength labels, and the follow-up
-driver asserts no part of the panel is collapsed or unreadable at the recorded size.
+**The operator procedure is `docs/boundary-workflow.md` ("Start here").** This section states what is verified.
 
-**Verification:** Codex independently verified all **156 selected tests** across two runs: 155 passed
-inside the sandbox; the single local-socket test blocked by sandbox permissions passed when rerun outside.
-Qwen's saved broad output reports **1262 passed, 1 skipped, 2 xfailed** (199.31 s), including Tk tests.
-The follow-up session's own saved run reports **1281 passed, 1 skipped, 2 xfailed** including the frame
-resolver, coverage and recovery regressions (`review-ui-followup-2026-11-06/pytest-full.log`), and its real
-widget driver passed end to end including playing an unclaimed stretch of the actual recording.
-The existing project-local Tk RPM unpack/runner was reused, with no new install or environment rebuild.
-The previous “UI missing” descriptions are superseded. Code, artifacts and extensive uncommitted work
-remain preserved. BB9 is **unsplit and not boundary-accepted**. Reconstruction remains 30 games /
-30 winners / 122 rounds, support 24 single-frame / 6 two-frame; these are hypotheses, not independent truth.
+The normal import now generates clip-start repairs from the declared cutting policy and the saved sequence
+alone: policy-preferred `stage_select` anchor → recovered round-opening cue → flagged load-in fallback, with
+the look-back context never promoted to a proposal, chains broken by `unknown` frames or a rival pairing, and
+proposals that would cross the previous set refused. On BB9 that is **10 machine-computed starts, 0 owner
+decisions** (3 preferred, 7 flagged fallbacks), including both late starts that previously required hand
+curating; every boundary remains where the pipeline put it. Suggestions are stored in `review["proposals"]`,
+outside `decisions`, so they cannot be read as answers, and the review tab renders the proposed bound beside
+the current one with its sampling width and source frame.
 
-**Major evaluator correction (measured, then re-measured offline):** Codex previously accepted Qwen's
-mislabeled screenshot audit without checking the filename-to-time mapping. The cache manifest records real
-PTS spaced ~1.001 s apart, so rounded seconds cannot select frame IDs. Rebuilding the mapping from the
-manifest covers far more than the two starts first noticed: **33 of the 40 blinded tiles named a frame that
-was not the instant they labelled** (16 of 20 controls, 9 of 10 ends, 8 of 10 starts), worst **6.896 s**
-(`review-ui-followup-2026-11-06/aligned/frame-identity-audit.json`, produced by
-`scripts/audit_frame_identities.py`). The evaluator now refuses such a mapping in code:
-`boundary_source.resolve_frame` looks an instant up in the manifest, returns the manifest's own path with a
-digest and the signed offset, and will not invent a filename for an out-of-tolerance or off-disk frame
-(`tests/test_frame_resolution.py`, 15 tests, including the real BB9 manifest).
+Open, as automation work rather than as UI clicks: **attribution** (30 games credit a side, 8 of 10 sets
+refuse a winner — whether that is missing evidence or evidence the pipeline omits is not yet settled),
+**independent validation** (BB9 is review-informed, so it cannot certify accuracy; an evaluator-only inventory
+against an unseen recording is still to be run), and **source/export verification at the media level** (only
+file metadata has been checked; playback and rendered clips have not). Headless widget checks stand at 49/49
+and 243 tests in the affected suites; none of that is a boundary-accuracy claim.
 
-Therefore **withdrawn, and not to be restated**: the five-late-start count, the "2 to 7 seconds inside a
-live round" figures, the precision/recall comparison against the reference, and the claim that the runtime's
-saved clock and a reference read contradicted each other at the same instant. All of them came off
-mislabeled tiles. What the aligned evidence actually supports:
+## Earlier status (2026-11-07) — the three disputed openings were interpretation errors; fixed
 
-* On the 8 starts where both the runtime and a correctly aligned read have a value, they **agree 8 of 8**
-  (`review-ui-followup-2026-11-06/clock-agreement-after-alignment.json`: 53.053/790.790/1588.587/2271.269/
-  3723.720/4464.460/5495.490/6486.480). Two starts (2771.769, 3247.244) have no legible clock in the aligned
-  strip, and remain unknown. There is no instrument conflict to explain.
-* A clock value at one cached instant is a bound on when its **round** was running. It is not a set boundary
-  and never becomes one by subtraction: 60 does not prove a first round, and `60 - clock` is not a start.
-* What does recover earlier openings is the saved **state sequence**, and it had not been used for this.
-  Behind a candidate the rows read `controller_prompt` -> `character_select` -> `vs_screen` -> `stage_intro`
-  -> `gameplay`, and the only way onto a stage select is a new game starting. `boundary_review.recover_opening`
-  walks that (`opening-recovery-from-saved-rows.json`, 10 starts, no inference): **7 openings resolve to an
-  earlier supported instant** (e.g. 2771.769 -> 2731.729, 6486.480 -> 6361.355, 2271.269 -> 2222.220),
-  **2 are contradicted** (790.790, 1588.587: play is already running behind them with no select screen, so
-  they are not openings at all), and **1 is consistent** (53.053). Each carries its bound -- the last fight
-  row behind the run -- and none of it moves a boundary: the reviewer gets an instant to look at.
-* Coverage of the clock is a row statistic, not a temporal one: 1091 of 2129 rows (51.2 %) carry a clock, but
-  those rows name only **1091 distinct whole seconds = 15.7 % of the 6928.4 s recording**. Say the second
-  thing, not the first.
+**Delivery clarification — mobile review:** Andy wants the decision/footage review usable on a phone,
+and has existing fullstack work to consider. The Tk UI is interim, not the final delivery assumption.
+See `docs/mobile-review-plan.md`; repository/branch location has been requested (not present among the
+current origin's listed branches). Inspect that work before new frontend development. Preserve the
+shared backend fixes currently running. No inference, encoding, deployment or host/network/service
+changes are authorized by this planning note. Earlier desktop completion estimates do not cover mobile.
 
-**Coverage and reconciliation, now fixed rather than listed.** The old figure **1676.693 s was between
-adjacent candidates only**; whole-recording arithmetic gives **1787.305 s of tape that no export job would
-write, in 11 stretches** -- the 9 between-gaps plus the leading **53.053 s** and the trailing **57.559 s**,
-the 110.612 s that were outside the calculation. Candidates cover **5141.116 s** and jobs would write
-**5141.116 s** (nothing is on hold on this import), reported as two accounts because a held clip covers tape
-and renders nothing. None of the 11 stretches has a saved game span reaching into it, so each is labelled
-"unclaimed", never "missed play"; the 5 unclaimed-gap states (`stage_select`, `vs_screen`, ...) are known
-absence, not menus assumed. `reconcile_import` no longer reports a deletion it did not perform: an unmatched
-row is `retained_without_candidate`, kept, and -- unless a person has already decided something about it --
-held, so it appears as footage no job will write. A known clipped opening is now a review consequence: the
-clip stays exportable, `boundary_accepted` is false, and `Start here anyway (partial)` requires a reason and
-still does not record acceptance.
+Work remains **/srv/projects/tekken-vod-helper**, Debian **.venv**, checkpoint **8cde55d** plus preserved
+uncommitted work. Follow `~/TVH-MIGRATION.md`; unattended work stays silent/headless. This pass sent
+**no inference**, decoded and encoded **nothing**, used **no subagent**, changed **no service, model or host
+setting**, and **committed and pushed nothing**. Evaluator observations and timestamps from the review
+directory reach **no runtime path** — verified by grep: no module under `tekken_vod_helper/` names
+`targeted-observations-evaluator-only.json` or `frame-provenance.json`.
 
-**Still open.** Boundary acceptance is unproved and BB9 is unsplit. The recovered openings are single-frame
-sequence readings at a 1 s sampling; nobody has watched the recording, so the required independent inventory
-of all gameplay and all set transitions does not exist and no percentage here certifies a boundary.
-## Current state — 2026-11-06 (latest): review path exists; boundary correctness is measured and failing
+**What was actually wrong.** The review layer read the classifier's coarse state word **`gameplay`** as
+"the round is being fought". That word describes what is *drawn*: Tekken renders the arena, health bars and
+timer behind a ROUND banner, behind a READY splash and behind an open pause menu exactly as it renders them
+mid-round. Measured on the saved 2,019-row timeline, 1,164 rows carry it and **192 of those are not active
+combat** (40 read as round-opening, 1 paused, 151 silent). So an intro frame and a paused frame became rival
+"live play" sightings, and two sightings of different frames became "this opening contradicts itself". A
+second defect made it worse: `_state_rows` read stored `round_clock`/`round_open_cue` fields that tracker rows
+do not carry, so the review saw **33 clocks and no cues** where the canonical extractor reads **1,091 clocks
+and 40 READY/FIGHT banners** from the same file.
+
+**What was done.** One combat-phase vocabulary — `active` / `round_opening` / `paused` / `unknown`, with
+`NON_COMBAT_PHASES` — derived in `boundary_games.round_phase_facts()` from the facts that module already
+extracts, called from `parse_round_facts()` so nothing re-parses prose in the review layer. Precedence is
+paused > opening > active prose > a clock below the opening > unknown, and it is reported with provenance
+(`combat_phase_basis`) and with contradictions kept visible (`combat_phase_notes`, `conflicts`). Prose is
+gated by negation **both** ways now: the existing backward window, and a post-clause denial for the corpus's
+own phrasing ("the 'READY'/round text **has cleared** …", one of 41 cue mentions). A clock counts as running
+play only when the HUD is drawn; absence of a cue is a missing sighting, never a state. Recovery is
+`boundary_games.opening_sequence()`: bounded backward walk (180 s), breaking on active play or a station
+screen, returning an **interval plus its sampling uncertainty** and three named clip-start options, never a
+cut. A dispute now needs two frames named **and** one that actually claims live play
+(`proves_play_was_running`), so a false contradiction cannot be presented as physical disagreement while a
+real one still is; both directions are asserted, the positive control in a synthetic two-frame project.
+
+**Result on the three cases.** Openings reported as self-disagreeing: **3 → 0**; openings needing a reading:
+**5 → 3**; 790.789958 stays `contradicted`, honestly, because its own frame reads clock 58. Each of the three
+now yields a recovered opening instead of a warning — 790.789958 → **785.784959** (ROUND 1) with first
+playable frame 790.789958, bounded to **5.004999 s** because nothing was sampled in between; 1588.586916 →
+**1587.585917** (READY), first active 1591.589916, 1.001 s; 2771.768854 → **itself** (the candidate *is* the
+ROUND 1 frame), first active 2777.774854. The last two instants are not one interval: where 2771's banner sits
+is bounded to 1.001 s and where its play starts is bounded to **5.005 s**, and the same follow-up pass that
+split them also bounded the forward walk, which had been reaching a fight across a station screen. Three
+clips (53.052997, 2771.768854, 3247.243829) were quoting a 1-second width for a 5-second onset. Nothing subtracted a clock (790.79 − 58 = 732.79 describes
+nothing on this tape), no cut was moved, no station screen was required, and 1588's preceding intro is no
+longer treated as proof of mid-game. Set membership was asked of the canonical link layer, not the review
+wording: **20 joined / 4 separated / 5 ambiguous** links, 2771's among them (dwell 168.168 s; "a preferred
+screen sits in the gap" and "nothing independent agrees: pairing verdict same, tally advanced"), with the
+three surviving readings — new game of the same set, button check or restart, new set against the same
+opponent — kept as named alternatives because no merged or split set can be un-done by re-reading a frame.
+
+**Also fixed, because this pass caused it:** the first phase lookup re-parsed 2,019 rows per clip and scanned
+the index per walked frame, which hung the review tab (a widget check timed out at 300 s). Memoised parse by
+row-listing identity plus a bisect index: `export_plan` **1.823 s → 0.195 s**, a full refresh 0.784 s, with
+byte-identical readings.
+
+**Checked by running it:** 357 tests across the six affected suites (24.0 s); the full suite
+**1416 passed, 1 skipped, 2 xfailed** (235.30 s); the headless widget check on a private Xvfb display,
+**31 checks**, with each seek recorded `played: false` and every operator/evidence file digest-unchanged; the
+package audit, **24 checks**; `build/work/bb9/check_doc_claims.py`, passing with its 2 archive-side checks
+unavailable (not counted as passes). Evidence:
+`build/work/bb9/disputed-openings-fixes-2026-11-07/` — operator package, runbook, before/after report,
+`implementation-report.md`, `verification.json`.
+
+**Still unverified, and now stated as such.** That the three openings are *correct* — they were settled by
+offline analysis of cached frames **after reading the predictions**, which is review, not verification;
+`independently_validated` is 0 on all ten clips and no button, answer or comparison here changes it. That the
+7 supported openings are right or the 3 contradicted ones wrong (one pipeline reading its own evidence). What
+the 1787.305402 s of unclaimed tape contains. Whether any of the 5 ambiguous links is a new set, including
+2771's. And whether the ROUND 1 frame at 785.784959 is where a clip *should* start — a footage decision
+belonging to the operator, not a measurement; the runbook's question to Andy is asked about the tape, not
+about cue ranking or algorithm validation. The previous runbook's claim that "only the user can inspect
+footage" was too broad and is corrected: agents can and did inspect cached frames offline; what they cannot
+do is accept a boundary, and neither act is blind evaluation.
+
+BB9 remains **unsplit and not independently boundary-accepted**, with no full independent gameplay
+inventory/unseen-VOD validation. Reconstruction 30 games / 30 winners / 122 rounds (24 single-frame /
+6 two-frame support), 10 candidates and 1787.305 s unclaimed remain baselines/accounting, not truth locks.
+No inference, rendering, subagents, transfer/service changes, commits or pushes are authorized.
+
+**Previous state of this section:** Codex's review of the three disputed openings (2026-11-07, morning) is superseded by the section above and by its own evidence directory, `build/work/bb9/disputed-openings-review-2026-11-07/`. Its 45-frame inspection was real and was the source of every finding here; what changed is that the findings have been fixed and re-measured, so its counts (three self-disagreeing openings, 5 needing a reading) and its instructions ("reuse/normalize shared phase evidence", "recover the earlier interval generically") are now history rather than the plan.
+
+## Ledger — 2026-11-06 desktop pass: review path exists; boundary correctness unproven
 
 **Historical diagnostic: timestamp-derived clock/edge claims below are withdrawn by the current status above.**
 *The bullets below this heading describe the 2026-11-06 model-only review path and are kept as the
