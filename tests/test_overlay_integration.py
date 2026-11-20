@@ -659,31 +659,14 @@ def test_startgg_tournament_sets_preserve_standard_api_order():
 
 def test_startgg_owned_tournaments_reads_all_pages(monkeypatch):
     def fake_graphql(_token, _query, variables):
-        if "ownerId" not in variables:
-            return {"data": {"currentUser": {"id": "42"}}}
-        page = variables["page"]
-        if page == 1:
-            return {
-                "data": {
-                    "tournaments": {
-                        "pageInfo": {"totalPages": 2},
-                        "nodes": [
-                            {"name": "Recent 1", "slug": "tournament/recent-1", "startAt": 30},
-                            {"name": "Recent 2", "slug": "tournament/recent-2", "startAt": 20},
-                        ],
-                    }
-                }
-            }
-        return {
-            "data": {
-                "tournaments": {
-                    "pageInfo": {"totalPages": 2},
-                    "nodes": [
-                        {"name": "Older", "slug": "tournament/older", "startAt": 10},
-                    ],
-                }
-            }
-        }
+        if variables["page"] == 1:
+            nodes = [
+                {"name": "Recent 1", "slug": "tournament/recent-1", "startAt": 30},
+                {"name": "Recent 2", "slug": "tournament/recent-2", "startAt": 20},
+            ]
+        else:
+            nodes = [{"name": "Older", "slug": "tournament/older", "startAt": 10}]
+        return {"data": {"currentUser": {"tournaments": {"pageInfo": {"totalPages": 2}, "nodes": nodes}}}}
 
     monkeypatch.setattr(startgg_client, "_graphql", fake_graphql)
 
