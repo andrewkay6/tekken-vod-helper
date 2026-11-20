@@ -11,3 +11,26 @@ build/pyinstaller/
 dist/
 *.zip
 *_matches/
+
+.env
+
+# Local configuration, credentials, and resumable upload sessions
+.env.*
+!.env.example
+!.env.sample
+credentials.json
+.credentials-*
+client_secret*.json
+client_secrets*.json
+oauth*.json
+token.json
+tokens.json
+*.pem
+*.key
+*.p12
+*.pfx
+*.state.json
+
+# Stray local screenshots
+/pil.png
+/window.png
