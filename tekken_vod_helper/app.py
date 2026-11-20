@@ -91,6 +91,30 @@ def _is_structural_review_action(action: str) -> bool:
                               "undo", "undo-last"))
 
 
+def cut_mode_disclosure(reencode: bool) -> str:
+    """One line saying what the configured cut mode can promise about the bounds the plan names.
+
+    The plan's start is a frame's presentation time. A copy cannot begin on one unless it happens to be a
+    keyframe, which is worth a reviewer knowing before the export starts rather than after playback.
+    """
+    if reencode:
+        return ("re-encode, so each clip is intended to begin on the frame the plan names; the delivered "
+                "range is still not measured")
+    return ("stream copy, which can only begin on a keyframe, so a clip may start up to one GOP before the "
+            "planned start and end after the planned end. Settings has 'Re-encode for more exact cuts'.")
+
+
+def receipt_path_for(job) -> str:
+    """The receipt beside the clip it describes, named after that clip.
+
+    Every clip is written flat into the upload folder, so a fixed filename would leave one receipt for a
+    whole export and it would belong to whichever clip finished last. The promise has to travel with the
+    footage it is about.
+    """
+    clip = Path(job.clip_path)
+    return str(clip.with_name(clip.stem + ".cut-receipt.json"))
+
+
 class TekkenVodHelperApp(AppWindow):
     def __init__(self) -> None:
         _set_windows_app_user_model_id()
@@ -3961,6 +3985,9 @@ class TekkenVodHelperApp(AppWindow):
         if not jobs:
             self.show_copyable_error("No clips", "No valid match ranges are available to export.")
             return
+        # Say what the cut mode can promise before the work starts, not after a reviewer has opened the
+        # folder and found a clip that begins during the previous round.
+        self.log("Cut mode: {}.".format(cut_mode_disclosure(self.project_state.reencode)))
 
         self._set_export_state("disabled")
         self.export_thread = threading.Thread(target=self._export_worker, args=(jobs, output_dir), daemon=True)
@@ -4001,7 +4028,7 @@ class TekkenVodHelperApp(AppWindow):
                 folder.mkdir(parents=True, exist_ok=True)
                 Path(job.clip_path).parent.mkdir(parents=True, exist_ok=True)
                 self._thread_log("Exporting match {}.".format(job.index))
-                slice_clip(
+                receipt = slice_clip(
                     self.project_state.video_path,
                     job.start,
                     job.end,
@@ -4009,7 +4036,9 @@ class TekkenVodHelperApp(AppWindow):
                     self.project_state.ffmpeg_path,
                     self.project_state.reencode,
                     logger=self._thread_log,
+                    ffprobe_path=self.project_state.ffprobe_path,
                 )
+                self._write_cut_receipt(job, receipt)
                 self._write_export_artifacts(job)
             self._write_youtube_manifest(jobs, output_root)
             self.log_queue.put(("done", "Export complete."))
@@ -4029,6 +4058,23 @@ class TekkenVodHelperApp(AppWindow):
             self.log_queue.put(("done", "Metadata generation complete."))
         except Exception as exc:
             self.log_queue.put(("error", str(exc)))
+
+    def _write_cut_receipt(self, job: ExportJob, receipt) -> None:
+        """Record, next to the clip, what the cut actually promised about its own bounds.
+
+        The plan's start is a frame-exact instant; a stream copy cannot honour one. Until now the export
+        said nothing about that, so a folder of clips looked as precise as the boundary table behind it.
+        The receipt names the requested bounds, the mode asked for and the mode used, and for a copy says
+        plainly that the delivered source range was not verified.
+        """
+        if not isinstance(receipt, dict):
+            return
+        try:
+            Path(receipt_path_for(job)).parent.mkdir(parents=True, exist_ok=True)
+            Path(receipt_path_for(job)).write_text(
+                json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        except OSError as exc:
+            self._thread_log("Could not write cut receipt for {}: {}".format(job.folder_name, exc))
 
     def _write_export_artifacts(self, job: ExportJob) -> None:
         make_thumbnail(
