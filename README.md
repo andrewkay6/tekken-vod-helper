@@ -107,6 +107,8 @@ The generated portrait filenames are normalized from the visible character names
 
 For offline use, `scripts/import_roster_html.py` still accepts a saved fighters HTML file.
 
+Larger knees-up / full-body renders from each fighter's tekken.com page can be saved as reference assets with `python scripts/sync_full_renders.py` (writes `portraits_full/` plus `manifest.json`; `--only-missing` adds new fighters only). The app does not use these; thumbnails still use `portraits/`.
+
 ## Export Notes
 
 By default, clips export next to the source video in a folder named `<video name>_matches`. Set an output override in **Settings** if you want a fixed export location.
