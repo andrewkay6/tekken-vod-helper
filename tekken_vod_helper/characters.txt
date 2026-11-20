@@ -3,6 +3,7 @@ Anna
 Armor King
 Asuka
 Azucena
+Bob
 Bryan
 Claudio
 Clive
@@ -33,6 +34,7 @@ Panda
 Paul
 Raven
 Reina
+ROGER Jr.
 Shaheen
 Steve
 Victor
