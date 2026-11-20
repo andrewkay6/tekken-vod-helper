@@ -381,3 +381,213 @@ def _json_request(request: urllib.request.Request) -> Dict[str, Any]:
         raise YouTubeApiError("YouTube API request failed with HTTP {}: {}".format(exc.code, detail)) from exc
     except urllib.error.URLError as exc:
         raise YouTubeApiError("YouTube API request failed: {}".format(exc.reason)) from exc
+
+
+# --- Resumable video upload -------------------------------------------------------------------------
+#
+# Full event VODs are 30-120 GB, so uploads use YouTube's resumable protocol: one session URI, sent in
+# fixed chunks (multiples of 256 KiB). The session URI is saved next to a state file so a crashed or
+# rebooted process resumes from the byte YouTube confirms, instead of starting over. Sessions last about
+# a week. Access tokens last an hour and are refreshed on a timer and on any 401.
+
+UPLOAD_CHUNK = 64 * 1024 * 1024
+_RETRYABLE = {500, 502, 503, 504}
+
+
+def upload_video(
+    path: str,
+    title: str,
+    description: str = "",
+    tags: Optional[List[str]] = None,
+    privacy_status: str = "unlisted",
+    state_path: Optional[str] = None,
+    chunk_size: int = UPLOAD_CHUNK,
+    max_retries: int = 8,
+    progress: Optional[Any] = None,
+    token_provider: Optional[Any] = None,
+    _sleep: Any = None,
+) -> Dict[str, Any]:
+    """Upload ``path`` and return the created video resource (``id`` is the video id).
+
+    ``state_path`` stores the session URI and file identity. If it exists and matches this file, the
+    upload resumes. ``progress(sent, total)`` is called after each confirmed chunk.
+    """
+    import http.client
+    import os
+    import time
+
+    if chunk_size % (256 * 1024):
+        raise ValueError("chunk_size must be a multiple of 256 KiB")
+    sleep = _sleep or time.sleep
+    get_token = token_provider or refresh_access_token
+    total = os.path.getsize(path)
+    stat = os.stat(path)
+    identity = {"path": os.path.abspath(path), "bytes": total, "mtime": int(stat.st_mtime)}
+
+    token = {"value": get_token(), "at": time.monotonic()}
+
+    def bearer() -> str:
+        if time.monotonic() - token["at"] > 40 * 60:
+            token["value"], token["at"] = get_token(), time.monotonic()
+        return "Bearer {}".format(token["value"])
+
+    def renew() -> None:
+        token["value"], token["at"] = get_token(), time.monotonic()
+
+    def request(method: str, url: str, body: bytes = b"", headers: Optional[Dict[str, str]] = None):
+        parts = urllib.parse.urlsplit(url)
+        conn_cls = http.client.HTTPSConnection if parts.scheme == "https" else http.client.HTTPConnection
+        conn = conn_cls(parts.netloc, timeout=300)
+        target = parts.path + ("?" + parts.query if parts.query else "")
+        all_headers = {"Authorization": bearer()}
+        all_headers.update(headers or {})
+        try:
+            conn.request(method, target, body=body, headers=all_headers)
+            resp = conn.getresponse()
+            data = resp.read()
+            return resp.status, {k.lower(): v for k, v in resp.getheaders()}, data
+        finally:
+            conn.close()
+
+    state: Dict[str, Any] = {}
+    if state_path and os.path.exists(state_path):
+        with open(state_path, "r", encoding="utf-8") as fh:
+            saved = json.load(fh)
+        if saved.get("identity") == identity and saved.get("session_uri"):
+            state = saved
+        elif saved.get("video_id"):
+            raise YouTubeApiError("state file {} records a finished upload ({}) of a different file".format(
+                state_path, saved["video_id"]))
+
+    def save_state() -> None:
+        if not state_path:
+            return
+        tmp = state_path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(state, fh, indent=2)
+        os.replace(tmp, state_path)
+
+    if state.get("video_id"):
+        return {"id": state["video_id"], "resumed": "already-complete"}
+
+    resuming = bool(state)
+    if not state:
+        metadata = {
+            "snippet": {"title": title, "description": description, "tags": tags or [], "categoryId": "20"},
+            "status": {"privacyStatus": privacy_status, "selfDeclaredMadeForKids": False},
+        }
+        url = "{}/videos?{}".format(YOUTUBE_UPLOAD_ROOT, urllib.parse.urlencode(
+            {"uploadType": "resumable", "part": "snippet,status"}))
+        body = json.dumps(metadata).encode("utf-8")
+        for attempt in range(max_retries + 1):
+            status, headers, data = request("POST", url, body, {
+                "Content-Type": "application/json; charset=UTF-8",
+                "X-Upload-Content-Length": str(total),
+                "X-Upload-Content-Type": "video/*",
+            })
+            if status == 401 and attempt == 0:
+                renew()
+                continue
+            if status in _RETRYABLE and attempt < max_retries:
+                sleep(min(2 ** attempt, 60))
+                continue
+            if status != 200 or "location" not in headers:
+                raise YouTubeApiError("could not start upload: HTTP {} {}".format(
+                    status, data.decode("utf-8", "replace")[:400]))
+            break
+        state = {"identity": identity, "session_uri": headers["location"], "title": title,
+                 "started": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
+        save_state()
+
+    session = state["session_uri"]
+
+    def confirmed_offset() -> int:
+        """Ask YouTube how many bytes it holds (308 + Range), or finish if it already has them all."""
+        status, headers, data = request("PUT", session, b"", {"Content-Range": "bytes */{}".format(total)})
+        if status in (200, 201):
+            raise _Finished(json.loads(data.decode("utf-8")))
+        if status == 308:
+            rng = headers.get("range")
+            return int(rng.rsplit("-", 1)[1]) + 1 if rng else 0
+        if status == 401:
+            renew()
+            raise _Retry("token expired")
+        if status in _RETRYABLE:
+            raise _Retry("HTTP {}".format(status))
+        raise YouTubeApiError("upload session check failed: HTTP {} {}".format(
+            status, data.decode("utf-8", "replace")[:400]))
+
+    failures = 0
+    offset = 0
+    if resuming:
+        try:
+            offset = confirmed_offset()
+        except _Finished as done:
+            return _finish(state, save_state, done.video)
+        except _Retry:
+            offset = 0  # the first chunk's 308 reply corrects this
+
+    with open(path, "rb") as fh:
+        while True:
+            try:
+                if offset >= total:
+                    offset = confirmed_offset()
+                    if offset >= total:
+                        raise YouTubeApiError("YouTube holds all bytes but has not returned the video")
+                fh.seek(offset)
+                chunk = fh.read(chunk_size)
+                end = offset + len(chunk) - 1
+                status, headers, data = request("PUT", session, chunk, {
+                    "Content-Length": str(len(chunk)),
+                    "Content-Range": "bytes {}-{}/{}".format(offset, end, total),
+                })
+                if status in (200, 201):
+                    if progress:
+                        progress(total, total)
+                    return _finish(state, save_state, json.loads(data.decode("utf-8")))
+                if status == 308:
+                    rng = headers.get("range")
+                    offset = int(rng.rsplit("-", 1)[1]) + 1 if rng else 0
+                    failures = 0
+                    if progress:
+                        progress(offset, total)
+                    continue
+                if status == 401:
+                    renew()
+                    raise _Retry("token expired")
+                if status in _RETRYABLE:
+                    raise _Retry("HTTP {}".format(status))
+                if status == 404:
+                    raise YouTubeApiError("upload session expired (404); delete {} to start a new one".format(
+                        state_path or "the state file"))
+                raise YouTubeApiError("chunk upload failed: HTTP {} {}".format(
+                    status, data.decode("utf-8", "replace")[:400]))
+            except _Finished as done:
+                return _finish(state, save_state, done.video)
+            except (_Retry, OSError, http.client.HTTPException) as exc:
+                failures += 1
+                if failures > max_retries:
+                    raise YouTubeApiError("upload gave up after {} retries: {}".format(max_retries, exc)) from exc
+                sleep(min(2 ** failures, 120))
+                try:
+                    offset = confirmed_offset()
+                except _Finished as done:
+                    return _finish(state, save_state, done.video)
+                except (_Retry, OSError, http.client.HTTPException):
+                    continue
+
+
+class _Finished(Exception):
+    def __init__(self, video: Dict[str, Any]):
+        super().__init__("finished")
+        self.video = video
+
+
+class _Retry(Exception):
+    pass
+
+
+def _finish(state: Dict[str, Any], save_state: Any, video: Dict[str, Any]) -> Dict[str, Any]:
+    state["video_id"] = video.get("id", "")
+    save_state()
+    return video

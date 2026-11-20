@@ -1,6 +1,10 @@
 import ctypes
+import json
+import os
 import sys
+import tempfile
 from ctypes import wintypes
+from pathlib import Path
 from typing import Optional
 
 
@@ -34,6 +38,46 @@ class CREDENTIALW(ctypes.Structure):
 CRED_TYPE_GENERIC = 1
 CRED_PERSIST_LOCAL_MACHINE = 2
 ERROR_NOT_FOUND = 1168
+
+#: Off Windows (the devbox), secrets live in one JSON file keyed by the same target names, readable
+#: only by its owner. $TVH_CREDENTIALS_FILE overrides the location.
+CREDENTIALS_FILE_ENV = "TVH_CREDENTIALS_FILE"
+
+
+def credentials_file() -> Path:
+    override = os.environ.get(CREDENTIALS_FILE_ENV)
+    if override:
+        return Path(override)
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
+    return Path(base) / "tvh" / "credentials.json"
+
+
+def _read_file_store() -> dict:
+    path = credentials_file()
+    if not path.exists():
+        return {}
+    if os.name == "posix" and path.stat().st_mode & 0o077:
+        raise CredentialError("{} is readable by other users; run chmod 600 on it".format(path))
+    data = json.loads(path.read_text(encoding="utf-8") or "{}")
+    if not isinstance(data, dict):
+        raise CredentialError("{} must hold a JSON object".format(path))
+    return data
+
+
+def _write_file_store(data: dict) -> None:
+    path = credentials_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    os.chmod(path.parent, 0o700)
+    fd, tmp = tempfile.mkstemp(prefix=".credentials-", dir=str(path.parent))
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+        os.replace(tmp, path)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
 
 
 def read_startgg_token() -> str:
@@ -75,7 +119,8 @@ def write_youtube_client_credentials(client_id: str, client_secret: str) -> None
 
 def read_credential(target: str) -> Optional[str]:
     if not sys.platform.startswith("win"):
-        return None
+        value = _read_file_store().get(target)
+        return None if value is None else str(value)
     advapi32 = ctypes.WinDLL("Advapi32.dll")
     advapi32.CredReadW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.POINTER(ctypes.POINTER(CREDENTIALW))]
     advapi32.CredReadW.restype = wintypes.BOOL
@@ -99,7 +144,10 @@ def read_credential(target: str) -> Optional[str]:
 
 def write_credential(target: str, secret: str) -> None:
     if not sys.platform.startswith("win"):
-        raise CredentialError("Windows Credential Manager is only available on Windows.")
+        data = _read_file_store()
+        data[target] = secret
+        _write_file_store(data)
+        return
     advapi32 = ctypes.WinDLL("Advapi32.dll")
     advapi32.CredWriteW.argtypes = [ctypes.POINTER(CREDENTIALW), wintypes.DWORD]
     advapi32.CredWriteW.restype = wintypes.BOOL
@@ -120,6 +168,9 @@ def write_credential(target: str, secret: str) -> None:
 
 def delete_credential(target: str) -> None:
     if not sys.platform.startswith("win"):
+        data = _read_file_store()
+        if data.pop(target, None) is not None:
+            _write_file_store(data)
         return
     advapi32 = ctypes.WinDLL("Advapi32.dll")
     advapi32.CredDeleteW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD]
