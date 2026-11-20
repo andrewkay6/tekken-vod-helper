@@ -616,7 +616,8 @@ def persist_probe(records, out_dir, arm, client=None, max_requests=8, endpoint=N
             errors.append("{}: {}".format(record["frame"], exc))
             break
         except ValueError as exc:
-            _write(path, arm, record, fingerprint, None, [], str(exc), asked_model)
+            _write(path, arm, record, fingerprint, None, [], str(exc), asked_model,
+                   attempt_receipt=getattr(client, "attempt_receipt", None))
             errors.append("{}: {}".format(record["frame"], exc))
             failed += 1
             if isinstance(exc, boundary_media.TransportUncertain):
@@ -626,7 +627,8 @@ def persist_probe(records, out_dir, arm, client=None, max_requests=8, endpoint=N
                 break
             continue
         parsed, problems = validate_reply(reply, [record], arm)
-        _write(path, arm, record, fingerprint, reply, parsed, "; ".join(problems), asked_model)
+        _write(path, arm, record, fingerprint, reply, parsed, "; ".join(problems), asked_model,
+               attempt_receipt=getattr(client, "attempt_receipt", None))
         if problems:
             failed += 1
             errors.extend(problems)
@@ -674,8 +676,9 @@ def persist_probe(records, out_dir, arm, client=None, max_requests=8, endpoint=N
             "observations": observations}
 
 
-def _write(path, arm, record, fingerprint, reply, observations, error, model=None):
-    # type: (Path, str, Dict[str, Any], str, Any, Sequence[Dict[str, Any]], Optional[str], Optional[str]) -> None
+def _write(path, arm, record, fingerprint, reply, observations, error, model=None,
+           attempt_receipt=None):
+    # type: (Path, str, Dict[str, Any], str, Any, Sequence[Dict[str, Any]], Optional[str], Optional[str], Optional[Dict[str, Any]]) -> None
     images = []
     for label, part in sorted((record.get("crops") or {}).items()):
         target = Path(part["path"])
@@ -700,6 +703,9 @@ def _write(path, arm, record, fingerprint, reply, observations, error, model=Non
                                 "identity": dict(arm_identity(arm), scale_as_sent=record.get("scale")),
                                 "reply": reply,
                                 "observations": list(observations),
+                                # Names the charged attempt this reply arrived on, so a resume can tell its
+                                # own spend from an earlier one without reading a timestamp.
+                                "attempt_receipt": attempt_receipt,
                                 "errors": [error] if error else []},
                                indent=2, sort_keys=True, default=str), encoding="utf-8")
 

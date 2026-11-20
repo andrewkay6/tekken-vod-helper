@@ -1737,6 +1737,10 @@ class InvestigationRun:
                                     "frame_paths": [f["path"] for f in frames],
                                     "question": ROUND_FACT_PROMPT,
                                     "reply": reply, "observations": observations,
+                                    # Which charged attempt this answer came back on, written by the ledger
+                                    # wrapper. A resume needs it because an answer file's mtime proves
+                                    # nothing about order on this storage; see AttemptLedger.
+                                    "attempt_receipt": getattr(self.client, "attempt_receipt", None),
                                     "errors": errors}, indent=2, default=str), encoding="utf-8")
 
 
@@ -2965,7 +2969,7 @@ def _owed(units):
 
 
 def answered_tags(out):
-    # type: (Path) -> Dict[str, float]
+    # type: (Path) -> Dict[str, Dict[str, Any]]
     """Every request this run's stores can prove was answered, named the way the ledger names it.
 
     Read from the stores and not from the current plan, and that is the whole point: a request the plan no
@@ -2973,9 +2977,12 @@ def answered_tags(out):
     reconciling only the planned set would leave its charged attempt hanging in flight forever. The store
     is the ground truth of what has an answer; the plan is only the ground truth of what is still missing.
 
-    The value is the answer file's own modification time, which is what lets the ledger refuse to credit a
-    reply written *before* an attempt was charged to it: an answer can only explain an attempt that could
-    have caused it.
+    The value is what the file can prove about itself: the ``attempt_receipt`` the transport stored with the
+    reply, plus the modification time for information only. Attribution runs on the receipt. The mtime is
+    kept in the report because a reader wants to see it, but it is not evidence of cause -- on this project's
+    ext4 storage inode times are quantised to a couple of milliseconds and trail the wall clock by about the
+    same, so a reply written after a charge can carry an mtime before it, and reading that as "the reply
+    predates the attempt" made every resumed attempt on the devbox look unanswerable.
     """
     tags = {}
     for route in ROUTE_ORDER:
@@ -2993,14 +3000,15 @@ def answered_tags(out):
                 written = path.stat().st_mtime
             except OSError:
                 written = None                 # no clock, so no attribution: the ledger will not guess
+            proof = {"receipt": document.get("attempt_receipt"), "mtime": written}
             if route == "state":
                 if document.get("fingerprint"):
-                    tags[_group_tag(document["fingerprint"])] = written
+                    tags[_group_tag(document["fingerprint"])] = proof
                 continue
             tag = route_answer_tag(route, document.get("frame")
                                    or (document.get("request") or {}).get("frame"))
             if tag:
-                tags[tag] = written
+                tags[tag] = proof
     return tags
 
 

@@ -24,18 +24,47 @@ import math
 import os
 import re
 import time
+import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Tuple, Any, Dict, List, Optional
 
 DEFAULT_CAP = 25
 DEFAULT_MINUTES = 25.0
 KIND = "attempt-ledger"
+
+#: A ledger that predates attempt receipts, or was written by hand: it has an identity now, but nothing
+#: it signed can ever be checked against it, because no receipt it produced carries one.
+LEGACY_RUN_ID = "legacy-run"
+
+#: Stands in the "which run" slot for a receipt that names none. It is not a run id: it is the absence of
+#: one, said in a place that expects to be told something.
+ANONYMOUS_RECEIPT = "unrecorded"
+
+#: What a persisted run identity looks like, so a hand-written ledger cannot claim an identity that no
+#: receipt could ever be signed with.
+RUN_ID_PATTERN = re.compile(r"[0-9a-f]{8,64}")
 
 
 def _finite_number(value):
     # type: (Any) -> bool
     return (isinstance(value, (int, float)) and not isinstance(value, bool)
             and math.isfinite(value))
+
+
+def _run_identity(value):
+    # type: (Any) -> str
+    """The ledger's own persisted name for itself, or a freshly minted one.
+
+    Never derived from the path: a migration to another machine, a directory rename, or this project's
+    own legacy ``/var/home`` symlinks all move a ledger file without moving the run, and a receipt
+    namespace that follows the path would strand every answer the run paid for. Never derived from the
+    content either: the entries grow with every charge, so a content hash would rename the run between
+    one attempt and the next.
+    """
+    text = str(value or "").strip()
+    if text == LEGACY_RUN_ID or RUN_ID_PATTERN.fullmatch(text):
+        return text
+    return uuid.uuid4().hex[:12]
 
 
 class BudgetStopped(RuntimeError):
@@ -103,10 +132,24 @@ def attach(client, ledger, purpose="primary", tag=None):
                 reason = reason or "interrupted_before_reply"
             ledger.settle(entry, "uncertain" if uncertain else "failed",
                           error=str(exc)[:200] or type(exc).__name__, reason=reason)
+            # No answer came back on this attempt, so the client must not carry an earlier attempt's
+            # receipt into the next file it writes.
+            client.attempt_receipt = None
             raise
-        ledger.settle(entry, "answered", tokens=(reply.get("usage") or {}))
+        receipt = {"attempt_id": entry.get("attempt_id"), "request": named, "n": entry.get("n"),
+                   # The run that paid, as the run names itself. ``ledger`` is where the file happened to
+                   # be sitting when the charge was written -- useful to a human reader, useless as
+                   # identity, since the same run answers under a relocated path and a different run
+                   # could very easily use the same name.
+                   "run_id": ledger.run_id, "ledger": str(ledger.path)}
+        ledger.settle(entry, "answered", tokens=(reply.get("usage") or {}), attempt_receipt=receipt)
+        # The writer of the answer file reads this back and stores it beside the reply, which is the only
+        # way a later process can tie a stored answer to the attempt that paid for it. It lives on the
+        # client rather than inside the reply so nothing a model said is rewritten by the ledger.
+        client.attempt_receipt = receipt
         return reply
 
+    client.attempt_receipt = None
     client._post = charged
     client.ledger = ledger
     return client
@@ -116,8 +159,8 @@ class AttemptLedger:
     """A shared cap on attempts and a single wall-time deadline across every command that uses it."""
 
     def __init__(self, path, cap=DEFAULT_CAP, minutes=DEFAULT_MINUTES, label="trial", clock=None,
-                 created_at=None, deadline_at=None, entries=None, dry_run=False):
-        # type: (Any, int, float, str, Any, Optional[float], Optional[float], Optional[List[Dict[str, Any]]], bool) -> None
+                 created_at=None, deadline_at=None, entries=None, dry_run=False, run_id=None):
+        # type: (Any, int, float, str, Any, Optional[float], Optional[float], Optional[List[Dict[str, Any]]], bool, Optional[str]) -> None
         self.path = Path(path)
         self.cap = int(cap)
         self.minutes = float(minutes)
@@ -127,6 +170,10 @@ class AttemptLedger:
         self.deadline_at = deadline_at
         self.entries = list(entries or [])
         self.dry_run = bool(dry_run)
+        # Which run owns an attempt. Set once, persisted, and carried into every receipt, because
+        # ``attempt_id`` alone is a per-ledger name: two runs over one recording charge request "x" as
+        # "x#1" and their receipts are otherwise indistinguishable.
+        self.run_id = _run_identity(run_id)
 
     # ------------------------------------------------------------------ construction
 
@@ -155,10 +202,17 @@ class AttemptLedger:
                 raise ValueError("ledger at {} was opened with a {} minute deadline; this command asks "
                                  "for {} -- the deadline is one clock across every command".format(
                                      path, data["minutes"], minutes))
+            # A ledger written before runs were named has no identity in it, and minting one silently
+            # would hand the next reader a run_id that no receipt it holds can ever match -- the ledger
+            # would look like it had answered nothing. Such a file keeps its legacy identity: its own
+            # attempts still close on the id they carry, and a receipt naming another run is refused.
+            stored = str(data.get("run_id") or "").strip()
+            if not RUN_ID_PATTERN.fullmatch(stored):
+                stored = LEGACY_RUN_ID
             return cls(path, cap=cap, minutes=minutes, label=data.get("label", label),
                        created_at=data.get("created_at"), deadline_at=data.get("deadline_at"),
                        entries=data.get("entries"), dry_run=data.get("dry_run", dry_run),
-                       clock=clock)
+                       clock=clock, run_id=stored)
         ledger = cls(path, cap=cap, minutes=minutes, label=label, dry_run=dry_run, clock=clock)
         ledger._write()
         return ledger
@@ -209,7 +263,9 @@ class AttemptLedger:
         # attempt, "is every request answered" is about a request, and a run that retried a frame it had
         # already paid for answers them differently. They are reported apart so neither can be read as
         # the other.
-        return {"kind": KIND, "path": str(self.path), "label": self.label, "cap": self.cap,
+        return {"kind": KIND, "path": str(self.path), "label": self.label,
+                "run_id": self.run_id, "legacy_run": self.run_id == LEGACY_RUN_ID,
+                "cap": self.cap,
                 "attempts_charged": self.used, "attempts_remaining": self.remaining,
                 "attempts_by_state": states,
                 "minutes": self.minutes, "created_at": self.deadline_at and self.created_at,
@@ -253,6 +309,14 @@ class AttemptLedger:
             self.deadline_at = self.created_at + self.minutes * 60.0
         entry = {"n": self.used + 1, "request": str(request), "purpose": str(purpose),
                  "charged_at": round(self.clock(), 3), "state": "in_flight",
+                 # A name an answer can carry back to *this* attempt. Charge time is not it: see
+                 # ``attempt_receipt`` -- on this project's ext4 mount an inode mtime is quantised to a
+                 # couple of milliseconds and trails time.time(), so a reply written seconds after a
+                 # charge can carry an older mtime than the charge recorded it.
+                 "attempt_id": "{}#{}".format(request, self.used + 1),
+                 # The attempt's owner. ``attempt_id`` is a per-ledger ordinal, so two runs of one
+                 # request charge the same name and only this field says which run paid for which reply.
+                 "run_id": self.run_id,
                  "deadline_at": self.deadline_at}
         self.entries.append(entry)
         self._write()          # durable before the socket opens
@@ -265,7 +329,8 @@ class AttemptLedger:
             raise ValueError("unknown settle state {!r}".format(state))
         entry["state"] = state
         entry["settled_at"] = round(self.clock(), 3)
-        entry.update({k: v for k, v in detail.items() if k in ("frames", "reason", "error", "tokens")})
+        entry.update({k: v for k, v in detail.items()
+                      if k in ("frames", "reason", "error", "tokens", "attempt_receipt")})
         self._write()
         return entry
 
@@ -273,25 +338,37 @@ class AttemptLedger:
         # type: (Any, str) -> Dict[str, Any]
         """Attribute an answer found on disk to one attempt, and never to more than one.
 
-        ``answered_requests`` is the set of request names with an answer file, or a mapping of name to the
-        answer's modification time. An answer proves the **request** was satisfied; it does not prove that
-        every attempt which carried that request got a reply, and the two facts used to be written into the
-        same field. A killed process leaves an attempt whose outcome is genuinely unknown, and a resume
-        that re-sends the frame and gets an answer has explained *its own* attempt -- the earlier spend
-        stays an unknown outcome, still charged, so a reader can see that the run paid twice for one
-        request. Closing it as answered would erase the only evidence of that.
+        ``answered_requests`` is a set of request names with an answer file, or a mapping of name to what
+        the file can prove about itself: ``{name: {"receipt": {...}, "mtime": ...}}`` as produced by
+        :func:`~tekken_vod_helper.boundary_investigate.answered_tags`, or, for a store written before
+        receipts existed, a bare modification time -- which proves a file exists and proves nothing about
+        which attempt answered it.
 
-        So an attempt is only closed when the answer can be tied to it: no other attempt for the same
-        request already explains the file (one that was settled answered by the transport, which is the
-        exact link), and no rival hanging attempt competes for the same single file. What cannot be
-        attributed is settled ``uncertain`` with the reason, and both cases carry
-        ``request_satisfied`` because that much the file does prove.
+        An answer proves the **request** was satisfied; it does not prove that every attempt which carried
+        that request got a reply. A killed process leaves an attempt whose outcome is genuinely unknown,
+        and a resume that re-sends the frame and gets an answer has explained *its own* attempt -- the
+        earlier spend stays unknown, still charged, so a reader can see the run paid twice for one request.
+        Closing it as answered would erase the only evidence of that.
+
+        Attribution is therefore about identity, not about clocks. A receipt naming this attempt closes it;
+        a receipt naming a different attempt of the same request must not; and a receipt signed by a
+        different run must not even when its request and ordinal coincide, because ``request#1`` is a name
+        every ledger gives its first charge -- the same request replayed by two runs produces two
+        indistinguishable receipts, and either one would close the other's attempt. A ledger keeps its
+        identity in the file rather than in its path, so moving a run's directory does not orphan the
+        answers it paid for. And a timestamp is not a causal receipt: measured on this project's own ext4
+        storage, an inode mtime is quantised to a couple of milliseconds and trails ``time.time()`` by
+        about that much, so a reply written *after* a charge can carry an mtime *before* it -- which is
+        exactly how every resumed attempt on the devbox was being
+        declared ``reply_predates_attempt``. Nothing here guesses an order from a difference the filesystem
+        cannot express: with no receipt, an attempt is left uncertain, and the reason says the proof was
+        missing rather than asserting a contradiction nobody measured.
 
         Nothing is refunded and nothing is re-sent: the entry count, and so ``attempts_charged``, only
         ever grows.
         """
-        times = dict(answered_requests.items()) if hasattr(answered_requests, "items") else {}
-        known = set(times) if times else set(answered_requests)
+        evidence = dict(answered_requests.items()) if hasattr(answered_requests, "items") else {}
+        known = set(evidence) if evidence else set(answered_requests)
         report = {"closed": [], "unattributable": [], "requests_satisfied": sorted(known)}
         # Satisfaction is stamped on every attempt that carried an answered request, whatever its own
         # outcome, because it is a fact about the request. Whether *this* attempt got a reply is the
@@ -315,30 +392,145 @@ class AttemptLedger:
         for entry in hanging:
             same = [by_id[id(other)] for other in self.entries
                     if other is not entry and other.get("request") == entry.get("request")]
-            explained = [other for other in same
-                         if other.get("state") == "answered" and other.get("settled_at") is not None]
             rivals = [other for other in hanging if other is not entry
                       and other.get("request") == entry.get("request")]
-            when = times.get(entry.get("request"))
-            if explained:
+            claimed, named_elsewhere, foreign, attributed_by = self._receipt_verdict(
+                entry, evidence.get(entry.get("request")))
+            if claimed:
+                entry["state"] = "answered"
+                entry["settled_at"] = round(self.clock(), 3)
+                entry["reason"] = reason
+                entry["answer_attributed_by"] = attributed_by
+                # Keep the receipt on the entry it closes. This is the only way a reopened or relocated
+                # ledger can tell its own answers from another run's, because ``run_id`` is not derivable
+                # from anything else once the file moves.
+                entry["attempt_receipt"] = evidence.get(entry.get("request"), {}).get("receipt")
+                report["closed"].append(entry.get("request"))
+            elif foreign is not None:
+                # A reply that names some other run, or names no run at all, says nothing about this spend.
+                # Saying so is the difference between "we cannot prove this was answered" and the old read,
+                # which let one run's reply settle another run's spend because both called their first
+                # attempt "x#1" -- or let an unlabelled reply do it because nobody had labelled it.
+                if foreign == ANONYMOUS_RECEIPT:
+                    self._close_unknown(
+                        entry, "the reply on disk names this attempt but carries no run identity, and this "
+                               "ledger's run is {}, so the answer cannot be shown to belong to this spend. "
+                               "An ordinal two runs reach by counting from one is not proof of ownership"
+                               .format(self.run_id),
+                        report, "reply_without_run_identity")
+                else:
+                    why_other = "" if self.run_id != LEGACY_RUN_ID else (
+                        " (this ledger predates run identities, so it can only credit a receipt that also "
+                        "names its own file)")
+                    self._close_unknown(
+                        entry, "the reply on disk is receipted to run {}, and this ledger is run {}, so it "
+                               "cannot be this attempt's answer{}".format(foreign, self.run_id, why_other),
+                        report, "reply_belongs_to_another_run")
+            elif named_elsewhere is not None:
+                self._close_unknown(entry, "the reply on disk is receipted to attempt {} of this request, "
+                                           "not this one".format(named_elsewhere), report,
+                                    "reply_belongs_to_another_attempt")
+            elif any(other.get("state") == "answered" and other.get("settled_at") is not None
+                     for other in same):
+                explained = next(other for other in same
+                                 if other.get("state") == "answered"
+                                 and other.get("settled_at") is not None)
                 self._close_unknown(entry, "the reply on disk is linked to attempt {} of this request, "
-                                           "not this one".format(explained[0].get("n")), report,
+                                           "not this one".format(explained.get("n")), report,
                                     "reply_belongs_to_another_attempt")
             elif rivals:
                 self._close_unknown(entry, "one answer file cannot be attributed between {} attempts "
                                            "left hanging for this request".format(len(rivals) + 1),
                                     report, "reply_not_attributable")
-            elif when is not None and entry.get("charged_at") is not None and when < entry["charged_at"]:
-                self._close_unknown(entry, "the reply on disk predates this attempt", report,
-                                    "reply_predates_attempt")
+            elif evidence:
+                self._close_unknown(entry, "the answer on disk carries no attempt receipt, so nothing "
+                                           "proves this attempt is the one it came back on", report,
+                                    "answer_without_attempt_receipt")
             else:
+                # The set form, or a mapping with nothing to say: the caller states only that a request
+                # was answered. That is the weakest evidence on the table, and it closes an attempt only
+                # when no stronger evidence contradicts it -- which is what it has always meant, and why
+                # the production caller passes the store's receipts instead.
                 entry["state"] = "answered"
                 entry["settled_at"] = round(self.clock(), 3)
                 entry["reason"] = reason
+                entry["answer_attributed_by"] = "request_name_only"
                 report["closed"].append(entry.get("request"))
         if touched:
             self._write()
         return report
+
+    def _receipt_verdict(self, entry, proof):
+        # type: (Dict[str, Any], Any) -> Tuple[bool, Optional[Any], Optional[Any], Optional[str]]
+        """Does the answer's receipt name this attempt, another one, or nothing at all?
+
+        Returns ``(claimed_by_me, attempt_id_named_other, run_named_elsewhere, attributed_by)``. An answer
+        written before receipts existed claims nothing, so the caller falls back to the conservative paths
+        rather than to a clock.
+
+        The pair of facts a receipt has to carry is *which run* and *which attempt of that run*. A reply
+        from a different run is not evidence about this spend even when it names the same request and the
+        same ordinal -- and it cannot be, because ``request#1`` is what every ledger calls its first
+        attempt at ``request``.
+
+        A receipt that names **no** run is refused on the same principle, which is the part the first cut
+        of this rule got wrong: it read a missing identity as a matching one, so an old-style answer copied
+        from anywhere closed a freshly minted ledger's attempt on a coincident ordinal alone. A local
+        ordinal is not proof of ownership, and an absent claim is not a claim of agreement. The one case
+        that keeps working is a ledger that never had an identity either -- a store written before runs
+        were named, whose own receipts are anonymous by construction -- and there the credit is given only
+        when the receipt points at this very file, and it is recorded as ``attempt_id_unscoped`` so a
+        reader can see the weaker basis it rests on. Relocation is unaffected: a ledger that has an
+        identity is recognised by that identity alone, never by where it is stored.
+        """
+        receipt = None
+        if isinstance(proof, dict):
+            receipt = proof.get("receipt") or proof.get("attempt_receipt")
+        if not isinstance(receipt, dict) or not receipt.get("attempt_id"):
+            return False, None, None, None
+        attempt_id = receipt["attempt_id"]
+        if attempt_id != entry.get("attempt_id"):
+            if self._records(attempt_id):
+                return False, attempt_id, None, None
+            # The receipt names an attempt this ledger never charged -- a different process, or a run whose
+            # answer file landed in this store. That is not proof about this attempt either.
+            return False, attempt_id, (str(receipt.get("run_id") or "") or ANONYMOUS_RECEIPT), None
+        receipt_run = str(receipt.get("run_id") or "")
+        if receipt_run == self.run_id and self.run_id != LEGACY_RUN_ID:
+            return True, None, None, "attempt_receipt"
+        if not receipt_run and self.run_id == LEGACY_RUN_ID and self._names_this_file(receipt):
+            return True, None, None, "attempt_id_unscoped"
+        # Either this ledger has an identity and the reply does not, or the reply names a run that is not
+        # this one. Both leave the attempt exactly as unexplained as a coincident ordinal ought to.
+        return False, None, (receipt_run or ANONYMOUS_RECEIPT), None
+
+    def _names_this_file(self, receipt):
+        # type: (Dict[str, Any]) -> bool
+        """Whether an identity-less receipt points at this ledger's own file, symlinks and all.
+
+        Only ever consulted for a legacy ledger, which has no run identity to compare against and whose
+        receipts are therefore anonymous by construction. A path is not durable identity -- that is why it
+        is never asked of a ledger that has one -- but as corroboration inside a single store it is worth
+        more than an ordinal two runs share by accident.
+        """
+        claimed = str(receipt.get("ledger") or "")
+        if not claimed:
+            return False
+        try:
+            return os.path.realpath(claimed) == os.path.realpath(str(self.path))
+        except (OSError, ValueError):
+            return False
+
+    def _records(self, attempt_id):
+        # type: (Any) -> bool
+        """Whether this ledger charged the attempt a receipt names.
+
+        Entries written before runs were named carry no run id and belong to this file by construction; an
+        entry stamped with somebody else's run id got here by rewriting the ledger, and it is not this
+        run's answer to point at.
+        """
+        return any(other.get("attempt_id") == attempt_id
+                   and other.get("run_id") in (None, self.run_id) for other in self.entries)
 
     def _close_unknown(self, entry, detail, report, reason):
         # type: (Dict[str, Any], str, Dict[str, Any], str) -> None

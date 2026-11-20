@@ -22,6 +22,7 @@ Three things are checked about every claim here:
 import json
 import re
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -703,6 +704,84 @@ def test_a_reply_to_a_retry_does_not_answer_the_attempt_it_replaced(tmp_path, mo
     assert unanswered_request in document["requests_satisfied_by_an_answer_file"]
 
 
+def test_a_second_run_s_reply_does_not_answer_the_first_run_s_hanging_attempt(tmp_path, monkeypatch):
+    """Two ledgers over one store, one request name: the receipt has to say which run it belongs to.
+
+    The interrupted run charged ``frame-0100`` as its first attempt and died. A second run, pointed at the
+    same answers with its own budget file, charges the same request as *its* first attempt and gets a
+    reply. Both receipts read ``frame-0100#1``, so before the run identity existed the first ledger closed
+    that spend as answered on the strength of an answer that never came back to it -- a clean bill for a
+    send nobody saw the end of, and one fewer question an operator would ever think to ask.
+    """
+    first = tmp_path / "first-ledger.json"
+    cutting = FakeTransport(cancel_after=0)
+    with pytest.raises(KeyboardInterrupt):
+        run_live(tmp_path, monkeypatch, budget_file=str(first), max_requests=4, budget_cap=40,
+                 transport=cutting)
+    assert groups_on(tmp_path) == [], "the send died before anything was stored"
+    document = json.loads(first.read_text(encoding="utf-8"))
+    hung = [entry for entry in document["entries"] if entry["state"] == "uncertain"][0]
+    tag = hung["request"]
+    # Not an interrupt this time: a process killed between the durable charge and the settle, which is the
+    # state a later run actually inherits -- the attempt is still owed its own outcome.
+    hung["state"] = "in_flight"
+    hung.pop("settled_at", None)
+    hung.pop("attempt_receipt", None)
+    document["in_flight"] = 1
+    first.write_text(json.dumps(document), encoding="utf-8")
+
+    second = tmp_path / "second-ledger.json"
+    resumed, transport = run_live(tmp_path, monkeypatch, budget_file=str(second), max_requests=4,
+                                  budget_cap=40, resume=True)
+    assert transport.requests, "the second run is the one that actually re-sent the missing group"
+    answered = next(path for path in groups_on(tmp_path)
+                    if bi._group_tag(json.loads(path.read_text(encoding="utf-8"))["fingerprint"]) == tag)
+    other_run = json.loads(answered.read_text(encoding="utf-8"))["attempt_receipt"]
+    assert other_run["run_id"] == json.loads(second.read_text(encoding="utf-8"))["run_id"]
+    assert other_run["attempt_id"] == hung["attempt_id"], "the two runs name their attempt the same thing"
+
+    replayed, third = run_live(tmp_path, monkeypatch, budget_file=str(first), max_requests=4,
+                               budget_cap=40, resume=True)
+    assert replayed["requests_sent"] == 0
+    assert third.requests == [], "the answer exists now, so nothing is re-sent or re-charged"
+    states = [entry for entry in json.loads(first.read_text(encoding="utf-8"))["entries"]
+              if entry["request"] == tag]
+    assert len(states) == 1, "the other run's spend is not this ledger's to count"
+    settled = states[0]
+    assert settled["state"] == "uncertain", "another run's reply was credited to this attempt"
+    assert settled["outcome_reason"] == "reply_belongs_to_another_run"
+    assert settled["request_satisfied"] is True, "the request is answered once, by whomever paid for it"
+    assert settled["run_id"] != other_run["run_id"]
+
+
+def test_a_moved_ledger_reconciles_the_answers_its_run_paid_for(tmp_path, monkeypatch):
+    """A run's identity travels inside its file, because runs get copied and directories get renamed.
+
+    This project has been migrated between machines and still reads its history through legacy paths, so a
+    receipt that keyed on where the ledger was stored would leave every hanging attempt of a moved run
+    unanswerable -- and a resume would then re-ask, or refuse, work the run had already paid for.
+    """
+    ledger_path = tmp_path / "attempts.json"
+    run_live(tmp_path, monkeypatch, budget_file=str(ledger_path), max_requests=1, budget_cap=40)
+    answered = json.loads(groups_on(tmp_path)[0].read_text(encoding="utf-8"))
+    tag = bi._group_tag(answered["fingerprint"])
+    document = json.loads(ledger_path.read_text(encoding="utf-8"))
+    hung = [entry for entry in document["entries"] if entry["request"] == tag][0]
+    hung["state"] = "in_flight"
+    hung.pop("settled_at", None)
+    document["in_flight"] = 1
+    ledger_path.write_text(json.dumps(document), encoding="utf-8")
+
+    moved = tmp_path / "run-two-years-later.json"
+    moved.write_text(ledger_path.read_text(encoding="utf-8"), encoding="utf-8")
+    run_live(tmp_path, monkeypatch, budget_file=str(moved), max_requests=1, budget_cap=40, resume=True)
+
+    after = json.loads(moved.read_text(encoding="utf-8"))
+    assert after["run_id"] == document["run_id"], "the run is named by the file, not by its path"
+    closed = [entry for entry in after["entries"] if entry["request"] == tag][0]
+    assert closed["state"] == "answered" and closed["answer_attributed_by"] == "attempt_receipt"
+
+
 def test_resume_is_refused_when_the_evidence_base_changed(tmp_path, monkeypatch):
     """Reusing a group answered against a different corpus would present one join's wins as another's."""
     ledger = tmp_path / "attempts.json"
@@ -931,3 +1010,137 @@ def test_the_audit_publishes_clip_ends_and_carries_them_into_its_claim_compariso
     row = audit.claims({"recovery": {"candidates": summaries}})[0]
     assert row[-1] == 1, "the conflict count is not part of what a marking fault is diffed against"
     assert row[-2] is not None, "the clip uncertainty is not part of what a marking fault is diffed against"
+
+
+def test_a_crashed_attempt_is_closed_by_the_receipt_its_answer_carries_exactly_once(tmp_path, monkeypatch):
+    """Durable attribution, end to end: crash after the write, resume, close once, never re-charge.
+
+    The reconciliation used to decide this with the answer file's modification time against the rounded
+    wall-clock charge. On the devbox's ext4 that comparison is not merely fragile: inode times are
+    quantised to a couple of milliseconds and trail ``time.time()`` by about as much, so the reply written
+    by the attempt that is being judged carried an mtime *before* its own charge and every resume came back
+    ``uncertain``. The answer now carries the identity of the attempt that produced it, so the question is
+    a lookup, and a second resume has nothing left to settle.
+    """
+    ledger_path = tmp_path / "attempts.json"
+    run_live(tmp_path, monkeypatch, budget_file=str(ledger_path), max_requests=2, budget_cap=40)
+    answered = json.loads(groups_on(tmp_path)[0].read_text(encoding="utf-8"))
+    tag = bi._group_tag(answered["fingerprint"])
+
+    document = json.loads(ledger_path.read_text(encoding="utf-8"))
+    hung = [entry for entry in document["entries"] if entry["request"] == tag]
+    assert len(hung) == 1
+    attempt_id = hung[0]["attempt_id"]
+    hung[0]["state"] = "in_flight"                     # died after the write, before the settle
+    hung[0].pop("settled_at", None)
+    hung[0].pop("request_satisfied", None)
+    document["in_flight"] = 1
+    ledger_path.write_text(json.dumps(document), encoding="utf-8")
+
+    resumed, transport = run_live(tmp_path, monkeypatch, budget_file=str(ledger_path), max_requests=2,
+                                  budget_cap=40, resume=True)
+    assert transport.requests == [], "a reused answer must not be paid for twice"
+    states = {entry["request"]: entry for entry in
+              json.loads(ledger_path.read_text(encoding="utf-8"))["entries"]}
+    closed = states[tag]
+    assert closed["state"] == "answered" and closed["reason"] == "answer on disk"
+    assert closed["answer_attributed_by"] == "attempt_receipt", "closed by identity, not by a clock"
+    charged = json.loads(ledger_path.read_text(encoding="utf-8"))["attempts_charged"]
+    settled_at = closed["settled_at"]
+
+    # The answer file on disk is what proves it: it names the attempt, and it names the same one.
+    on_disk = json.loads((tmp_path / "inv" / "requests" / ("group-%s.json" % tag[6:])).read_text(
+        encoding="utf-8"))
+    assert on_disk["attempt_receipt"]["attempt_id"] == attempt_id == closed["attempt_id"]
+
+    again, second_transport = run_live(tmp_path, monkeypatch, budget_file=str(ledger_path),
+                                       max_requests=2, budget_cap=40, resume=True)
+    after = {entry["request"]: entry for entry in
+             json.loads(ledger_path.read_text(encoding="utf-8"))["entries"]}
+    assert second_transport.requests == []
+    assert after[tag]["settled_at"] == settled_at, "a settlement is not applied twice"
+    assert json.loads(ledger_path.read_text(encoding="utf-8"))["attempts_charged"] == charged
+
+
+def test_an_answer_written_before_receipts_exist_stays_uncertain(tmp_path, monkeypatch):
+    """Backwards compatibility is conservative: an un-receipted answer proves the request, not the attempt.
+
+    Stores from before the receipt exist on disk and must not be re-billed, but they also must not be
+    credited to a hanging attempt on the strength of a timestamp. The attempt stays charged and uncertain,
+    and the run reuses the answer instead of sending again.
+    """
+    ledger_path = tmp_path / "attempts.json"
+    run_live(tmp_path, monkeypatch, budget_file=str(ledger_path), max_requests=2, budget_cap=40)
+    answered = json.loads(groups_on(tmp_path)[0].read_text(encoding="utf-8"))
+    tag = bi._group_tag(answered["fingerprint"])
+    path = tmp_path / "inv" / "requests" / ("group-%s.json" % tag[6:])
+    document = json.loads(path.read_text(encoding="utf-8"))
+    document.pop("attempt_receipt", None)
+    path.write_text(json.dumps(document), encoding="utf-8")
+
+    ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+    hung = [entry for entry in ledger["entries"] if entry["request"] == tag][0]
+    hung["state"] = "in_flight"
+    hung.pop("settled_at", None)
+    hung.pop("attempt_receipt", None)
+    ledger["in_flight"] = 1
+    ledger_path.write_text(json.dumps(ledger), encoding="utf-8")
+
+    resumed, transport = run_live(tmp_path, monkeypatch, budget_file=str(ledger_path), max_requests=2,
+                                  budget_cap=40, resume=True)
+    states = {entry["request"]: entry for entry in
+              json.loads(ledger_path.read_text(encoding="utf-8"))["entries"]}
+    assert transport.requests == [], "reuse is unaffected by the missing receipt"
+    assert resumed["groups_resumed"] == 2
+    assert states[tag]["state"] == "uncertain"
+    assert states[tag]["outcome_reason"] == "answer_without_attempt_receipt"
+    assert states[tag]["request_satisfied"] is True, "the request is answered; only the attempt is unknown"
+
+
+def test_an_unreceipted_answer_does_not_answer_a_new_run_s_attempt(tmp_path, monkeypatch):
+    """A reply that says nothing about who it was for cannot be read as saying it was for *this* one.
+
+    The store holds an answer written before receipts named a run -- an id, a request, a ledger path, and no
+    run. A fresh run with its own hanging attempt at the same request name sees the same id, because
+    ``frame-0100#1`` is what every ledger calls its first attempt there. Crediting it would report a spend
+    as answered on the strength of a reply that predates the question, and the run would then never ask it.
+    The attempt is left uncertain, the request is still recorded satisfied, the spend stays charged, and
+    nothing is re-sent: three facts kept apart, which is the whole shape of this fix.
+    """
+    first = tmp_path / "first-ledger.json"
+    run_live(tmp_path, monkeypatch, budget_file=str(first), max_requests=1, budget_cap=40)
+    answered = json.loads(groups_on(tmp_path)[0].read_text(encoding="utf-8"))
+    tag = bi._group_tag(answered["fingerprint"])
+
+    # Age the answer file: strip the run identity from its receipt, exactly as a pre-identity store has it.
+    aged = dict(answered)
+    aged["attempt_receipt"] = {key: value for key, value in (answered["attempt_receipt"] or {}).items()
+                              if key != "run_id"}
+    assert "run_id" not in aged["attempt_receipt"]
+    path = next(store for store in groups_on(tmp_path)
+                if bi._group_tag(json.loads(store.read_text(encoding="utf-8"))["fingerprint"]) == tag)
+    path.write_text(json.dumps(aged), encoding="utf-8")
+
+    # A second run, its own ledger, one attempt at the same request left hanging after the durable charge.
+    second = tmp_path / "second-ledger.json"
+    document = {"kind": "attempt-ledger", "label": "trial", "cap": 40, "minutes": 25.0,
+                "created_at": time.time(), "deadline_at": time.time() + 1500.0, "in_flight": 1,
+                "entries": [{"n": 1, "request": tag, "purpose": "an interrupted send",
+                             "charged_at": time.time(), "state": "in_flight",
+                             "attempt_id": "%s#1" % tag, "deadline_at": time.time() + 1500.0}]}
+    second.write_text(json.dumps(document), encoding="utf-8")
+
+    resumed, transport = run_live(tmp_path, monkeypatch, budget_file=str(second), max_requests=1,
+                                 budget_cap=40, resume=True)
+    assert transport.requests == [], "the store did answer this request; the run is not asked to pay twice"
+    entries = [entry for entry in json.loads(second.read_text(encoding="utf-8"))["entries"]
+               if entry["request"] == tag]
+    assert len(entries) == 1, "and no new attempt was charged either"
+    settled = entries[0]
+    assert settled["state"] == "uncertain"
+    assert settled["outcome_reason"] == "reply_without_run_identity"
+    assert settled["request_satisfied"] is True
+    assert settled.get("answer_attributed_by") is None, "nothing here may be called an attributed answer"
+    assert json.loads(second.read_text(encoding="utf-8"))["attempts_charged"] == 1, "still paid for"
+    # The first run, which really did issue that receipt, is untouched by any of this.
+    assert json.loads(first.read_text(encoding="utf-8"))["in_flight"] == 0

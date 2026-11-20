@@ -1044,7 +1044,8 @@ def persist_readings(requests, out_dir, client=None, max_requests=8, endpoint=No
             errors.append("{}: {}".format(request["id"], exc))
             break
         except ValueError as exc:
-            record = _write_group(path, request, fingerprint_value, None, [], str(exc), asked_model)
+            record = _write_group(path, request, fingerprint_value, None, [], str(exc), asked_model,
+                                  attempt_receipt=getattr(client, "attempt_receipt", None))
             groups.append(record)
             errors.append("{}: {}".format(request["id"], exc))
             failed += 1
@@ -1054,7 +1055,8 @@ def persist_readings(requests, out_dir, client=None, max_requests=8, endpoint=No
             continue
         parsed, problems = validate_reply(reply, [request])
         record = _write_group(path, request, fingerprint_value, reply, parsed,
-                              "; ".join(problems), asked_model)
+                              "; ".join(problems), asked_model,
+                              attempt_receipt=getattr(client, "attempt_receipt", None))
         groups.append(record)
         if problems:
             failed += 1
@@ -1085,7 +1087,8 @@ def persist_readings(requests, out_dir, client=None, max_requests=8, endpoint=No
             "evidence_class": UNVALIDATED_PIP_PROVENANCE["evidence_class"]}
 
 
-def _write_group(path, request, fingerprint_value, reply, observations, error, model=None):
+def _write_group(path, request, fingerprint_value, reply, observations, error, model=None,
+                 attempt_receipt=None):
     # type: (Path, Dict[str, Any], str, Any, Sequence[Dict[str, Any]], Optional[str], Optional[str]) -> Dict[str, Any]
     """One answer, its identity, and everything that would have to match for it to mean the same thing."""
     payload = {"kind": "header-group", "arm": ARM, "version": VERSION,
@@ -1104,6 +1107,8 @@ def _write_group(path, request, fingerprint_value, reply, observations, error, m
                "images": [{"path": i["path"], "sha256": i["sha256"], "size": i["size"],
                            "box": i["box"]} for i in request["images"]],
                "observations": list(observations), "reply": reply,
+               # The attempt this reply came back on, for a resume that cannot trust inode times.
+               "attempt_receipt": attempt_receipt,
                # The quarantine travels with the stored answer, so a reader who never opened this module
                # still cannot mistake a band count for a measured pip row.
                "pip_evidence": dict(UNVALIDATED_PIP_PROVENANCE),
