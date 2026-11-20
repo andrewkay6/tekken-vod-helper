@@ -1,0 +1,62 @@
+{
+  "note": "Stages already used as clip-thumbnail backgrounds. The finder rejects any candidate Qwen judges to be the same stage as a reference image.",
+  "used": [
+    {
+      "event": "Basement Brawl #1",
+      "stage": "night shrine with torii gate, red trees and lanterns",
+      "reference": "docs/thumbnail-backgrounds/bb1.jpg"
+    },
+    {
+      "event": "Basement Brawl #2",
+      "stage": "neon Japanese city street at night",
+      "reference": "docs/thumbnail-backgrounds/bb2.jpg"
+    },
+    {
+      "event": "Basement Brawl #3",
+      "stage": "cherry blossoms with paper lanterns at night",
+      "reference": "docs/thumbnail-backgrounds/bb3.jpg"
+    },
+    {
+      "event": "Basement Brawl #4",
+      "stage": "misty forest with light rays",
+      "reference": "docs/thumbnail-backgrounds/bb4.jpg"
+    },
+    {
+      "event": "Basement Brawl #5",
+      "stage": "dark ruins / cave with a beam of light",
+      "reference": "docs/thumbnail-backgrounds/bb5.jpg"
+    },
+    {
+      "event": "Basement Brawl #7",
+      "stage": "ruined smoking city buildings",
+      "reference": "docs/thumbnail-backgrounds/bb7.jpg"
+    },
+    {
+      "event": "Basement Brawl #8",
+      "stage": "toy room with checkered walls and floor (Kinder Gym)",
+      "reference": "docs/thumbnail-backgrounds/bb8.jpg"
+    },
+    {
+      "event": "Basement Brawl #9",
+      "stage": "stadium arena with stars-and-stripes floor and spotlights",
+      "reference": "docs/thumbnail-backgrounds/bb9.jpg"
+    },
+    {
+      "event": "Basement Brawl #10",
+      "stage": "Tekken 8 tiered cage arena with red arch lights",
+      "reference": "docs/thumbnail-backgrounds/bb10.jpg"
+    },
+    {
+      "event": "Basement Brawl #11",
+      "stage": "Rebel Hideout",
+      "reference": "docs/thumbnail-backgrounds/basement-brawl--11.jpg",
+      "source": "https://w.wallhaven.cc/full/vp/wallhaven-vpervm.jpg",
+      "page": "https://wallhaven.cc/w/vpervm",
+      "resolution": "1920x1080",
+      "sha256": "8e5a975fefc53d76736369b4fd621f6142cbbf24c79b4704813f79b3afc63a2e",
+      "file": "build/work/bb11/owner-reviewed-20261120/bb11-thumbnail-background.jpg",
+      "picked": "2026-11-20",
+      "picked_via": "thumbnail_chooser web page"
+    }
+  ]
+}
