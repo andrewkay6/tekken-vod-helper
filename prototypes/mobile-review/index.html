@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0c0f14">
+<title>TVH Review</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-mark" aria-hidden="true">▚</span>
+    <div>
+      <h1>TVH review</h1>
+      <p class="eyebrow"><span class="pill pill-proto">Review prototype · draft edits</span></p>
+    </div>
+  </div>
+  <div class="coverage" id="coverage" aria-live="polite">
+    <div class="coverage-num" id="coverage-pct">–</div>
+    <div class="coverage-label">of the recording<br>claimed by draft clips</div>
+  </div>
+</header>
+
+<main>
+  <nav class="tabs" id="tabs" role="tablist" aria-label="Review mode" hidden>
+    <button class="tab" role="tab" id="tab-questions" aria-controls="question-view" aria-selected="true">Questions <span class="tab-count" id="tab-count"></span></button>
+    <button class="tab" role="tab" id="tab-editor" aria-controls="editor-view" aria-selected="false">Clip editor</button>
+  </nav>
+
+  <div id="question-view" role="tabpanel" aria-labelledby="tab-questions" hidden>
+    <div class="q-progress" id="q-progress" aria-label="Questions"></div>
+
+    <section class="q-card" id="q-card">
+      <p class="q-eyebrow" id="q-eyebrow"></p>
+      <h2 class="q-title" id="q-title"></h2>
+      <p class="q-text" id="q-text"></p>
+      <p class="q-callout" id="q-callout" hidden></p>
+
+      <div class="q-video">
+        <video id="q-player" playsinline controls preload="metadata"></video>
+      </div>
+      <div class="q-transport">
+        <button class="btn btn-mini" data-q-hop="-10">−10s</button>
+        <button class="btn btn-mini" data-q-hop="-2">−2s</button>
+        <span class="q-now mono" id="q-now">--:--</span>
+        <button class="btn btn-mini" data-q-hop="2">+2s</button>
+        <button class="btn btn-mini" data-q-hop="10">+10s</button>
+      </div>
+      <div class="q-jumps" id="q-jumps">
+        <button class="btn btn-mini" id="q-rewind"></button>
+        <button class="btn btn-mini" id="q-flag"></button>
+      </div>
+      <div class="q-spots" id="q-spots" hidden></div>
+
+      <fieldset class="q-answer">
+        <legend>Your answer</legend>
+        <div class="q-choices" id="q-choices" role="radiogroup"></div>
+        <div class="q-set" id="q-set" hidden></div>
+        <datalist id="dl-players"></datalist>
+        <datalist id="dl-characters"></datalist>
+        <datalist id="dl-rounds"></datalist>
+
+        <div class="q-mark" id="q-mark" hidden>
+          <p class="q-mark-prompt" id="q-mark-prompt"></p>
+          <div class="q-mark-row">
+            <span class="q-mark-value mono" id="q-mark-value">not marked</span>
+            <button class="btn" id="q-mark-btn">Mark the current video time</button>
+          </div>
+          <p class="hint">Pause on the moment, then tap the button. Times are in the full recording.</p>
+        </div>
+
+        <label class="field" for="q-note" id="q-note-label">Anything else (optional)</label>
+        <textarea id="q-note" rows="2"></textarea>
+      </fieldset>
+
+      <div class="q-actions">
+        <button class="btn btn-quiet" id="q-prev">◀ Back</button>
+        <button class="btn btn-primary" id="q-save">Save answer</button>
+        <button class="btn btn-quiet" id="q-skip">Skip ▶</button>
+      </div>
+      <p class="save-state" id="q-save-state" aria-live="polite"></p>
+
+      <details class="q-context">
+        <summary>Why this question?</summary>
+        <p id="q-observations"></p>
+      </details>
+    </section>
+
+    <section class="q-done" id="q-done" hidden>
+      <h2>All questions answered</h2>
+      <p class="hint" id="q-done-help"></p>
+      <ol class="q-summary" id="q-summary"></ol>
+      <div class="row"><button class="btn" id="q-export">Export answers</button></div>
+    </section>
+    <p class="hint q-footnote" id="q-footnote"></p>
+  </div>
+
+  <div id="editor-view" role="tabpanel" aria-labelledby="tab-editor">
+  <section class="player-card" aria-label="Clip player">
+    <div class="player-head">
+      <div>
+        <h2 id="clip-title">Loading…</h2>
+        <p id="clip-sub" class="muted"></p>
+        <button class="btn btn-mini btn-quiet confidence-note" id="confidence-note" hidden
+                aria-label="How much to trust these names"></button>
+      </div>
+      <p id="clip-status" class="pill"></p>
+    </div>
+
+    <div class="video-wrap" id="stage">
+      <video id="player" playsinline preload="metadata"></video>
+
+      <!-- YouTube-shaped transport: tap toggles chrome, double-tap an edge to skip, a thin bar scrubs.
+           Native controls are off, so every affordance they provided is repeated here as a real button. -->
+      <div class="tap-layer" id="tap-layer">
+        <div class="tap-zone tap-back" id="tap-back" role="button" tabindex="-1"
+             aria-label="Back 5 seconds"><span class="ripple"></span><em class="hop hop-back">5s</em></div>
+        <div class="tap-zone tap-fwd" id="tap-fwd" role="button" tabindex="-1"
+             aria-label="Forward 5 seconds"><span class="ripple"></span><em class="hop hop-fwd">5s</em></div>
+      </div>
+
+      <button class="big-play" id="big-play" aria-label="Play or pause">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5v14l11-7z"/></svg>
+      </button>
+
+      <div class="badge-row">
+        <span id="mode-badge" class="pill pill-mode">clip</span>
+        <span id="map-badge" class="pill pill-warn" hidden>approximate source mapping</span>
+      </div>
+
+      <div class="chrome" id="chrome">
+        <div class="scrub" id="scrub" role="slider" tabindex="0" aria-label="Seek"
+             aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+          <div class="rail"><div class="buffered" id="buffered"></div><div class="fill" id="fill">
+            <span class="knob"></span></div></div>
+        </div>
+        <div class="chrome-row">
+          <button class="cbtn" id="c-play" aria-label="Play"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5v14l11-7z"/></svg></button>
+          <button class="cbtn cbtn-hop" data-hop="-5" aria-label="Back 5 seconds"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5V1L7 6l5 5V7a5 5 0 1 1-5 5H5a7 7 0 1 0 7-7z"/></svg><span>5</span></button>
+          <button class="cbtn cbtn-hop flip" data-hop="5" aria-label="Forward 5 seconds"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5V1L7 6l5 5V7a5 5 0 1 1-5 5H5a7 7 0 1 0 7-7z"/></svg><span>5</span></button>
+          <span class="ctime mono" id="ctime">0:00 / 0:00</span>
+          <span class="cspacer"></span>
+          <button class="cbtn cbtn-word" id="c-cut" aria-label="Watch this cut">CUT</button>
+          <button class="cbtn" id="c-full" aria-label="Fullscreen"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 14H5v5h5v-2H7v-3zm-2-4h2V7h3V5H5v5zm12 7h-3v2h5v-5h-2v3zM14 5v2h3v3h2V5h-5z"/></svg></button>
+        </div>
+      </div>
+    </div>
+
+    <div class="player-meta">
+      <p id="time-readout" class="mono"><span class="muted">--:--</span> / <span class="muted">--:--</span></p>
+      <p id="boundary-readout" class="hint"></p>
+    </div>
+
+    <div class="row">
+      <button class="btn" id="prev-clip" aria-label="Previous clip">◀ Prev</button>
+      <button class="btn btn-wide" id="toggle-mode">Watch this cut</button>
+      <button class="btn" id="next-clip" aria-label="Next clip">Next ▶</button>
+    </div>
+    <p class="hint" id="mode-hint">“Watch this cut” plays the recording itself between the boundaries below, so
+      moving an edge reveals the footage on the other side of it. The draft clip only contains what was already
+      cut.</p>
+
+    <div class="row quality-row" role="group" aria-label="Playback quality and diagnostics">
+      <span class="quality-label">Source</span>
+      <button class="btn btn-mini btn-quiet" id="mode-scrub">Scrub the whole recording</button>
+      <button class="btn btn-mini btn-quiet" id="diagnose">Why is it buffering?</button>
+      <button class="btn btn-mini" id="preview-toggle" hidden>Play the smooth preview</button>
+      <button class="btn btn-mini" id="edge-start" aria-label="Jump to the start of the cut">◀ start</button>
+      <button class="btn btn-mini" id="edge-end" aria-label="Jump to the end of the cut">end ▶</button>
+      <span class="muted quality-note" id="quality-note"></span>
+    </div>
+
+    <fieldset class="nudges">
+      <legend>Propose boundary changes <span class="muted">(nothing is re-cut; "Watch this cut" previews
+        against the recording itself)</span></legend>
+      <div class="nudge-group">
+        <span class="nudge-label">Start</span>
+        <button class="btn btn-nudge" data-edge="start" data-delta="-5" aria-label="Start 5 seconds earlier">−5s</button>
+        <button class="btn btn-nudge" data-edge="start" data-delta="-1" aria-label="Start 1 second earlier">−1s</button>
+        <button class="btn btn-nudge" data-edge="start" data-delta="1" aria-label="Start 1 second later">+1s</button>
+        <button class="btn btn-nudge" data-edge="start" data-delta="5" aria-label="Start 5 seconds later">+5s</button>
+        <button class="btn btn-set" data-edge="start">Set at playhead</button>
+      </div>
+      <div class="nudge-group">
+        <span class="nudge-label">End</span>
+        <button class="btn btn-nudge" data-edge="end" data-delta="-5" aria-label="End 5 seconds earlier">−5s</button>
+        <button class="btn btn-nudge" data-edge="end" data-delta="-1" aria-label="End 1 second earlier">−1s</button>
+        <button class="btn btn-nudge" data-edge="end" data-delta="1" aria-label="End 1 second later">+1s</button>
+        <button class="btn btn-nudge" data-edge="end" data-delta="5" aria-label="End 5 seconds later">+5s</button>
+        <button class="btn btn-set" data-edge="end">Set at playhead</button>
+      </div>
+      <p id="proposed-readout" class="proposed" hidden></p>
+    </fieldset>
+
+    <div class="verdicts" role="group" aria-label="Review verdict">
+      <button class="btn btn-verdict" data-status="good">Good</button>
+      <button class="btn btn-verdict" data-status="adjust">Needs adjustment</button>
+      <button class="btn btn-verdict btn-danger" data-status="inaccurate">Too inaccurate</button>
+      <button class="btn btn-verdict btn-quiet" data-status="unsure">Unsure</button>
+    </div>
+
+    <label class="field" for="note-input">Note for this clip</label>
+    <textarea id="note-input" rows="2" placeholder="What a re-cut should know"></textarea>
+
+    <div class="row row-actions">
+      <button class="btn btn-quiet" id="undo">Undo</button>
+      <button class="btn btn-quiet" id="reset">Reset all</button>
+      <button class="btn btn-quiet" id="export">Export notes</button>
+    </div>
+    <p class="save-state" id="save-state" aria-live="polite"></p>
+  </section>
+
+  <section class="timeline-card" aria-label="Recording coverage timeline">
+    <div class="section-head">
+      <h2>Coverage</h2>
+      <div class="row zoom-row">
+        <button class="btn btn-mini" id="zoom-out">−</button>
+        <span id="zoom-label" class="muted mono">whole recording</span>
+        <button class="btn btn-mini" id="zoom-in">+</button>
+        <button class="btn btn-mini" id="zoom-fit-clip">Fit clip</button>
+        <button class="btn btn-mini" id="zoom-all">Fit all</button>
+      </div>
+    </div>
+    <p class="legend">
+      <span><i class="swatch swatch-clip"></i> clip</span>
+      <span><i class="swatch swatch-sel"></i> selected</span>
+      <span><i class="swatch swatch-gap"></i> unclaimed</span>
+      <span><i class="swatch swatch-ghost"></i> proposed</span>
+      <span><i class="swatch swatch-note"></i> your note</span>
+    </p>
+    <div class="timeline-scroll" id="timeline-scroll">
+      <div class="timeline-inner" id="timeline-inner">
+        <div class="ticks" id="ticks"></div>
+        <div class="lane" id="lane"></div>
+        <div class="ruler" id="ruler"></div>
+      </div>
+    </div>
+    <p class="hint" id="timeline-hint">Tap a strip to play that clip. Tap a gap for source context or to mark a missing clip.</p>
+
+    <div class="missing-bar">
+      <button class="btn btn-mark" id="mark-mode">Mark missing from here</button>
+      <span class="muted" id="mark-help">Drag across the timeline to give it a range.</span>
+    </div>
+  </section>
+
+  <section class="clips-card" aria-label="Clip list">
+    <div class="section-head"><h2>Set clips</h2><p class="muted" id="clips-count"></p></div>
+    <ul class="clip-list" id="clip-list"></ul>
+  </section>
+
+  <section class="notes-card" aria-label="Your draft notes">
+    <div class="section-head"><h2>Your notes</h2><p class="muted">mock · stored only for this prototype</p></div>
+    <div id="notes-list" class="notes-list"></div>
+  </section>
+
+  </div>
+
+  <details class="about">
+    <summary>About these files</summary>
+    <p id="about-body" class="muted"></p>
+  </details>
+</main>
+
+<div class="sheet-backdrop" id="sheet-backdrop" hidden>
+  <div class="sheet" role="dialog" aria-modal="true" aria-labelledby="sheet-title">
+    <h3 id="sheet-title"></h3>
+    <p id="sheet-body" class="muted"></p>
+    <div class="sheet-actions" id="sheet-actions"></div>
+  </div>
+</div>
+
+<p class="sr-only" id="live" aria-live="polite"></p>
+<script src="app.js"></script>
+</body>
+</html>
