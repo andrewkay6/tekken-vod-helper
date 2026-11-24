@@ -72,7 +72,7 @@ def test_metadata_folder_loads_sidecars_after_export_folder_is_moved(tmp_path):
     match_folder.mkdir()
     metadata = match_folder / "youtube.json"
     metadata.write_text(json.dumps({"upload_id": "tvh-001-388e6a", "title": "Restored title"}))
-    old_metadata_path = "C:/Users/KWTekken/Videos/oct 01_matches/01_Pillaibro_vs_gandhi_Dragunov_vs_Lee/youtube.json"
+    old_metadata_path = (tmp_path / "gone" / "oct 01_matches" / "01_Pillaibro_vs_gandhi_Dragunov_vs_Lee" / "youtube.json").as_posix()
     (upload_root / "manifest.json").write_text(
         json.dumps(
             {

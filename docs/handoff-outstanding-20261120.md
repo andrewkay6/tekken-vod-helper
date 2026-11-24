@@ -1,10 +1,25 @@
 # Handoff: what's outstanding (written 2026-11-20)
 
+## Latest checkpoint — 2026-11-21
+
+The synthetic OBS/Source Record capacity test is complete, and the streaming PC is safe to power down.
+See `docs/handoff-multisource-recording.md` for measured streaming overhead, the camera frame-rate metadata
+tool, unresolved synchronization/quality checks, and the VM-suitable code work. Copied short samples and
+logs are in devbox project storage. Local follow-up added a verified repair CLI and an offline overlay-clock
+mapper; 33 targeted tests pass. Camera timing still varies in the short sample, and ten-minute drift needs
+precise late media from the existing PC recordings. Checkpoint collection, persistent OBS client and compositing
+integration remain. Production OBS configuration is unchanged. A Qwen/Codex checkpoint-collector loop is now
+queued behind the active full-stack packet 11 task, with FFmpeg declared through the existing guest-dependency
+path. Its plan was accepted with no missing capabilities; actual execution/verification remains pending.
+No architecture or host package change was required. See the multisource handoff for the task/run identifiers.
+Separate feeds remain ahead of live boundary work and HUD-masking experiments. The new local tools/tests
+are uncommitted.
+
 For the next agent (Codex). Read `~/AGENTS.md` first. It covers the Qwen permission rules, the admin
 boundary (no sudo, do not access the owner's separate admin login), 12-hour times when writing to Andy, and no AI attribution in commits
 or PRs. BB12 is about two weeks out (early December 2026).
 
-## Current state (verified 2026-11-20)
+## Earlier state (verified 2026-11-20; latest checkpoint above takes precedence)
 
 **Repo:** `/srv/projects/tekken-vod-helper`, branch `wip/devbox-migration-20261107T023740Z`, pushed to GitHub at
 `b1a56ec`. Recent commits:
@@ -42,7 +57,7 @@ at collection because they read gitignored `build/work/bb9/...` data. That's exp
    `tests/test_app_export_jobs.py::test_metadata_folder_loads_sidecars_after_export_folder_is_moved` hardcodes
    `C:/Users/KWTekken/Videos/oct 01_matches/...youtube.json`, and that real file exists on the PC, so the test reads
    the real BB8 title. Fix: use a path that can't exist (for example under `tmp_path / "gone"`).
-4. **Live boundary detection:** see `docs/handoff-realtime-boundaries.md`. Andy ranks this above multi-source. The
+4. **Live boundary detection (deferred behind separate feeds):** see `docs/handoff-realtime-boundaries.md`. The
    first step needs neither the PC nor Qwen: move `build/work/bb10/draft-detect/` (gitignored kNN classifier) into
    the repo, removing its hardcoded BB9 paths. Run it offline at 1 frame per second over the BB11 1080p original,
    and compare against the 12 owner-reviewed BB11 sets. Then do BB10 the same way. Report hits, misses and timing
@@ -50,8 +65,8 @@ at collection because they read gitignored `build/work/bb9/...` data. That's exp
    not a clean game source.
 5. **Multi-source recording:** see `docs/handoff-multisource-recording.md`. The immediate webcam fix is to set the
    webcam source's Scale Filtering to Area in OBS. The renderer proof of concept is blocked on headless Chromium
-   (`libatk` missing, and installing it needs admin) and on the loop VM's `media-ffmpeg-v1` being off (owner
-   decision).
+   (`libatk` missing, and installing it needs admin). The earlier VM FFmpeg blocker was a misread:
+   the existing repository profile supports declared guest FFmpeg packages; see the queued-loop checkpoint.
 6. **One combined streaming-PC dry run (about 10 minutes, PC plugged in):** this serves both items 4 and 5. Get the
    GPU model and NVENC count (`nvidia-smi -q`). Check that OBS WebSocket on port 4455 is reachable from the devbox
    through the Windows firewall. Send one `GetSourceScreenshot` per second while streaming to a private target with

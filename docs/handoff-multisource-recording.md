@@ -1,5 +1,140 @@
 # Handoff: record game, webcam and overlay separately, composite in post
 
+## Checkpoint — 2026-11-21
+
+**The streaming PC can be powered down.** The synthetic OBS benchmark is complete. Required telemetry,
+logs, frame samples and short video samples are on the devbox under
+`build/work/obs-synthetic-stress-20261120/`. The portable OBS instance, temporary SSH tunnel, synthetic RTMP
+receivers and test scheduled tasks were closed or removed. No live broadcast was sent. Six production OBS
+configuration files were hash-checked with **zero changes**; Source Record was installed only in the portable
+test copy, not in the production OBS installation.
+
+Tested OBS 32.1.2 with Source Record 0.4.8 on the GTX 1660 Ti (6 GB). Sources were generated patterns with
+frame numbers and flash/beep markers. Streaming used a 6 Mbps H.264 loopback RTMP receiver; the main recording
+used the existing HEVC CQP 25 / p7 configuration. Extra recordings used HEVC p5, CQP 18 for clean game and
+CQP 20 for camera, with the camera encoder set to a frame-rate divisor of two.
+
+| Synthetic workload | Duration | Mean OBS CPU | Mean encoder utilization | OBS render/encode skips |
+|---|---:|---:|---:|---:|
+| Main recording only | 2 minutes | 5.1% | 51.6% | 0 / 0 |
+| Main recording + stream | 2 minutes | 5.5% | 60.4% | 0 / 0 |
+| Above + clean game + camera | 10 minutes | 8.5% | 82.5% | 0 / 0 |
+
+Both streaming stages transmitted real bytes to local receivers, with no reconnecting state at the final
+sample and zero reported network drops. The full stage held 59.94 fps; steady-window encoder utilization
+peaked at 85%, GPU render utilization at 18%, and temperature at 58 C. This measures synthetic-scene capacity,
+not capture-card/USB reliability or internet upload stability. The two baselines were retained across a
+test-only watchdog restart; the final ten-minute stage was uninterrupted.
+
+### Qwen loop queued — 2026-11-21
+
+Andy authorized proceeding with FFmpeg in the Qwen loop. **No sandbox architecture, host package,
+service or global profile change was needed.** The existing `repo-python-v1` path supports native guest
+packages through `dependencies.debian: ["ffmpeg"]`. Declaring this also makes the `ffmpeg` capability
+available for that job. The separate `media-ffmpeg-v1: false` flag does not prohibit this supported path;
+previous notes treating that flag as a blanket FFmpeg blocker were incorrect.
+
+- Task: `task-2a6c3e73eabd40b58606687c`.
+- Saved loop: `/srv/projects/ai-sandbox-dev/review-runs/tvh-recording-checkpoints-20261121`.
+- Qwen implements; Codex reviews. It is queued after the active `tvh-fullstack-packet11-20261121` loop,
+  using the existing FIFO and shared Qwen lease. No second inference job was started.
+- First scope: persistent, read-only OBS status polling and checkpoint collection directly consumable by
+  the offline mapper, with explicit calibration uncertainty, safe partial output, restart/clock guards and
+  synthetic tests. Existing captured files must stay byte-identical. Compositing is a later task.
+- The sandbox accepted the reviewed plan as ready, with no missing capabilities. **Native FFmpeg execution
+  in this new job is still pending.** Baseline/final/fresh-verifier checks require FFmpeg, ffprobe, libx265,
+  actual synthetic HEVC repair tests and zero skipped media tests; acceptance is not decode proof.
+- Source packet: `build/work/multisource-qwen-loop-20261121/`. Twelve selected source/test files were
+  attached after checking configured secret values; no credentials, footage, private logs or host settings
+  were attached. Public internet is off; the configured package gateway handles the declared guest dependency.
+- Outputs remain sandbox review artifacts. There is no automatic host apply, commit, push or deployment.
+  Existing local work and unrelated skill/Discord changes remain untouched. The streaming PC can stay off.
+
+Inspect with:
+
+```bash
+python3 -B /srv/projects/ai-sandbox-dev/review_loop.py status /srv/projects/ai-sandbox-dev/review-runs/tvh-recording-checkpoints-20261121
+```
+
+### Local follow-up completed — 2026-11-21
+
+- **Reusable metadata repair:** `scripts/repair_recording_metadata.py` inspects or writes a separate HEVC/MKV
+  copy, with an explicitly supplied intended rate. It verifies every decoded picture, per-stream presentation
+  timestamps, non-video packet payloads, and the unchanged original before publishing the copy and a JSON receipt.
+  It refuses existing output/receipt paths and rejects timestamp rounding by FFmpeg. The original sample's 421
+  pictures passed, with corrected `30000/1001` rate fields. The container duration changes by about 17 ms because
+  the nominal final-frame duration is corrected. This is an offline tool; it is not yet called by the event pipeline.
+- **One pre-existing camera gap:** the copied camera sample has one unfilled presentation slot at its intended
+  rate. The repair preserves and reports it. This is separate from OBS's zero render/encoding skip counters;
+  the sample does not establish the gap's cause.
+- **Timestamp-based short-sample check:** `short-sample-clocks.json` compares visible synthetic frame markers
+  against decoded presentation timestamps, with no output-frame duplication from the incorrect camera header.
+  In the approximately fourteen-second prefixes, main, clean game and received stream each have less than 1 ms
+  of marker-origin range. Camera has about 50 ms. Relative median marker phases are approximately +83 ms clean,
+  +167 ms camera and +463 ms received stream versus main. These are phases of independently looping synthetic
+  sources, modulo their 10.01-second loop; they are **not calibrated production source offsets**.
+- **Shared offline time mapper:** `tekken_vod_helper/recording_clock.py` and `scripts/map_overlay_history.py`
+  map overlay epochs using saved checkpoints with explicit recording IDs and calibration uncertainty. They
+  preserve an interval when a pause's location is unknown, refuse extrapolation/restarts, and leave uncalibrated
+  clocks unknown. Independent sources require measured offsets; mapping after a possible main-recording pause
+  is refused unless shared pause behavior is explicitly established. A constant offset does not correct drift.
+  Checkpoint collection and OBS/app integration remain to be built.
+- **Validation:** 33 targeted tests pass, including real FFmpeg repair, picture/timestamp preservation,
+  timestamp-rounding rejection, overwrite/publication races, pause ambiguity, restart guards and the mapper CLI.
+  The source and tests are local, uncommitted work. Unrelated skill/Discord edits were left untouched.
+
+Example inspection and repair (only after the recording has finished):
+
+```bash
+.venv/bin/python scripts/repair_recording_metadata.py camera.mkv --expected-fps 30000/1001 --inspect
+.venv/bin/python scripts/repair_recording_metadata.py camera.mkv camera-repaired.mkv --expected-fps 30000/1001
+```
+
+The mapper CLI takes checkpoint JSON, overlay JSONL, a new output report path and `--recording-id`.
+Its module/CLI docstrings describe the checkpoint and offset schema. An unknown capture/encoder latency is
+not replaced with zero or bounded by WebSocket round-trip time alone. It writes an offline report and does
+not alter overlay history, operator marks, recordings, or app state.
+
+### Findings that remain open
+
+- **Synchronization is not accepted.** The previous early/late PNG calculation mixed seeking and container
+  endpoint assumptions; its 0.1–0.4 second residuals are not a validated ten-minute drift measurement. The new
+  actual-PTS check covers only short prefixes and still shows camera timing variation. Next time the PC is on,
+  export precise late clips with their original timestamps from the existing full recordings, or copy the full
+  files, and compare them with the early clips. No benchmark rerun is needed just to obtain that evidence.
+  Do not use the camera's WebSocket duration directly: with the frame-rate divisor it reports half time.
+- **Quality is not certified.** The sampled files decode, but the experimental SSIM comparisons include
+  alignment and color-conversion effects. Raw values are in `media-analysis.json`; they are not a gameplay
+  quality acceptance test. Real game/camera capture and perceptual review remain necessary.
+
+### Resume here
+
+1. Review the local repair/mapper code, integrate a checkpoint collector and persistent OBS client, then build
+   the compositing command builder. This code work needs no streaming PC. Establish capture-clock and source
+   offset calibration before using mapped times for final output.
+2. The client/collector loop above is queued with guest FFmpeg; the compositor remains a later VM task.
+   Hardware benchmarks stay on the streaming PC. Long-run sync needs precise late media from its existing
+   recordings; no private footage was attached to the queued job.
+3. Install/configure Source Record in the production OBS setup only when ready, then run a real-device dry
+   run with the capture card and webcam, plus an explicitly chosen private streaming destination. The existing
+   production profile and webcam scale filtering have not been changed by this benchmark.
+4. Live boundary work and the HUD-masking backtest are deferred behind separate feeds, per Andy's direction.
+
+The small CPU-only analysis packet is `build/work/obs-synthetic-stress-20261120/vm-packet/packet.json`.
+It includes sanitized counters, GPU measurements, analysis code and six passing unit tests; no credentials,
+media, host connection details, or network access are required. That earlier analysis packet was not
+submitted. The new source-only checkpoint loop above is queued separately; the analysis is already complete.
+
+Primary evidence: `run.json`, `analysis.json`, `pc-results/file-checks/files.json`, `media-analysis.json`,
+`camera-metadata-repair.json`, `camera-verified-tool-repair-report.json`, `short-sample-clocks.json`,
+and `pc-results/production-config-check.json` in the run directory.
+Benchmark scripts/evidence are gitignored. Unrelated in-progress skill and Discord changes were left untouched.
+
+## Earlier planning notes (2026-11-20)
+
+The older estimates and blockers below are retained as history; the measurements above supersede the GPU
+capacity estimates. Production deployment and real-device validation remain unfinished.
+
 Written 2026-11-20 at the end of the BB11 pipeline session. Status: idea checked on paper. A proof of concept was
 started and paused. Nothing has been changed on the streaming PC.
 
@@ -57,9 +192,8 @@ Blockers hit:
   (`tekken_vod_helper/overlay_static/`, which polls `state.json` once a second). Options: ask the owner to install
   the Chromium deps; render on the streaming PC (it has a browser and is the source of truth for the look anyway);
   or reimplement the scoreboard in PIL using `overlay_static/assets/scoreboard.svg` and the CSS.
-- **The loop VM can't do media work.** `sandbox-task capabilities` shows profile `media-ffmpeg-v1: false`. Enabling
-  it is a sandbox architecture change, so it's an owner decision. Qwen there can only write code against
-  synthetic tests.
+- **Superseded FFmpeg blocker:** `media-ffmpeg-v1: false` was previously read as a blanket media limitation.
+  The existing repository profile can declare FFmpeg as a guest dependency; see the queued-loop checkpoint above.
 - A true test of webcam quality needs a real separate webcam recording. BB11's cam is baked in at stream quality.
 
 ## Immediate webcam fix (no new pipeline needed)
