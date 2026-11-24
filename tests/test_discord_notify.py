@@ -46,3 +46,12 @@ def test_pick_does_not_confuse_prefix_slugs():
 
 def test_pick_none_when_nothing_upcoming():
     assert dn.pick_unannounced_tournament([TournamentSummary("old", "tournament/x", 5)], [], now=10) is None
+
+
+def test_post_as_reply_sets_message_reference_without_pings(monkeypatch):
+    sent = {}
+    client = dn.DiscordClient("token")
+    monkeypatch.setattr(client, "_request", lambda method, path, body=None: sent.update(body=body) or {"id": "9"})
+    client.post("123", "All the videos are up now.", mention_everyone=False, reply_to="456")
+    assert sent["body"]["message_reference"]["message_id"] == "456"
+    assert sent["body"]["allowed_mentions"] == {"parse": [], "replied_user": False}

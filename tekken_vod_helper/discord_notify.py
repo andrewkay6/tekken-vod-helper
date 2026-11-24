@@ -102,11 +102,17 @@ class DiscordClient:
     def recent_messages(self, channel_id: str, limit: int = 50) -> List[Dict[str, Any]]:
         return self._request("GET", "/channels/{}/messages?limit={}".format(channel_id, limit))
 
-    def post(self, channel_id: str, content: str, mention_everyone: bool = True) -> Dict[str, Any]:
+    def post(self, channel_id: str, content: str, mention_everyone: bool = True,
+             reply_to: Optional[str] = None) -> Dict[str, Any]:
+        """Post ``content``. ``reply_to`` makes it a Discord reply to that message id in the same channel
+        (shown with a link back to it); the reply never pings the original author."""
         body = {
             "content": content,
-            "allowed_mentions": {"parse": ["everyone"] if mention_everyone else []},
+            "allowed_mentions": {"parse": ["everyone"] if mention_everyone else [], "replied_user": False},
         }
+        if reply_to:
+            body["message_reference"] = {"message_id": str(reply_to), "channel_id": str(channel_id),
+                                         "fail_if_not_exists": False}
         return self._request("POST", "/channels/{}/messages".format(channel_id), body)
 
     def leave_guild(self, guild_id: str) -> None:

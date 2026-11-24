@@ -164,7 +164,11 @@ Final, ..., Winners Round 1, as BB10 does. It sets each thumbnail and is resumab
 post is needed. As soon as the full VOD is public and
 first in the playlist, post this heads-up **without asking** (standing approval, 2026-11-20), with no @everyone, via
 `DiscordClient.post(CHANNEL_VODS, text, mention_everyone=False)`, and skip it if the link is already in the channel:
-"The Basement Brawl #N playlist is live with the full VOD. Individual match videos are coming shortly.\n<playlist url>"
+"The Basement Brawl #N playlist is live with the full VOD. Individual match videos are coming shortly.\n<playlist url>" Save
+the posted message id. When every clip is uploaded **and** processed (watch `processingDetails` / `uploadStatus` =
+processed), post **without asking** (standing approval, 2026-11-20) a Discord **reply** to that heads-up, with no link
+and no pings: "All the Basement Brawl #N match videos are up now." Use
+`DiscordClient.post(CHANNEL_VODS, text, mention_everyone=False, reply_to=<heads-up id>)`.
 
 ## 8. Delete the upscale (only after clips are cut)
 
