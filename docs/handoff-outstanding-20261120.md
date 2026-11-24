@@ -1,6 +1,14 @@
 # Handoff: what's outstanding (written 2026-11-20)
 
-## Latest checkpoint — 2026-11-21
+## Latest checkpoint — 2026-11-23
+
+Headless streaming-PC session (see the 2026-11-23 checkpoint in `docs/handoff-multisource-recording.md`).
+Recording tools and the Discord reply change are committed and pushed (`29f9348`, `93d0ad1`); the PC is on
+`691d7ca`. Items 3 and 8 (first half) are done; items 2 and 6 are partly done. Still parked because they need
+someone at the PC: the overlay/UI part of the smoke test, the webcam Area scaling (item 5) and the real-device
+dry run (B4).
+
+## Earlier checkpoint — 2026-11-21
 
 The synthetic OBS/Source Record capacity test is complete, and the streaming PC is safe to power down.
 See `docs/handoff-multisource-recording.md` for measured streaming overhead, the camera frame-rate metadata
@@ -52,11 +60,14 @@ at collection because they read gitignored `build/work/bb9/...` data. That's exp
    Validation: see the commit preparation update below.
 2. **App smoke test on the streaming PC (Andy, in person):** launch TVH, check the overlay works, and use the
    start.gg tournament fetch to confirm BB12 shows up (this tests `c656e8f`). Change a score once and check that
-   `~/Videos/tvh-overlay-history/` gets a line. Not done yet. Only the automated tests have run there.
+   `~/Videos/tvh-overlay-history/` gets a line. **Partly done 2026-11-23 (headless):** the start.gg admin
+   fetch, run in the console session with the stored token, lists Basement Brawl #12
+   (`tournament/basement-brawl-12-caf-edition`) first. The history writer produced correct lines in a job folder
+   during the B2 run. Still needs Andy: launch TVH, check the overlay renders in OBS, change a score in the app.
 3. **Test collision on the PC (small, optional):**
    `tests/test_app_export_jobs.py::test_metadata_folder_loads_sidecars_after_export_folder_is_moved` hardcodes
    `C:/Users/KWTekken/Videos/oct 01_matches/...youtube.json`, and that real file exists on the PC, so the test reads
-   the real BB8 title. Fix: use a path that can't exist (for example under `tmp_path / "gone"`).
+   the real BB8 title. Fix: use a path that can't exist (for example under `tmp_path / "gone"`). **Done 2026-11-23 (`691d7ca`)**; passes on the PC.
 4. **Live boundary detection (deferred behind separate feeds):** see `docs/handoff-realtime-boundaries.md`. The
    first step needs neither the PC nor Qwen: move `build/work/bb10/draft-detect/` (gitignored kNN classifier) into
    the repo, removing its hardcoded BB9 paths. Run it offline at 1 frame per second over the BB11 1080p original,
@@ -64,20 +75,24 @@ at collection because they read gitignored `build/work/bb9/...` data. That's exp
    error. The classifier was trained on full composited program frames, so keep screenshotting the program feed,
    not a clean game source.
 5. **Multi-source recording:** see `docs/handoff-multisource-recording.md`. The immediate webcam fix is to set the
-   webcam source's Scale Filtering to Area in OBS. The renderer proof of concept is blocked on headless Chromium
+   webcam source's Scale Filtering to Area in OBS. (Parked 2026-11-23: needs Andy to judge by eye; OBS backup already taken.) The renderer proof of concept is blocked on headless Chromium
    (`libatk` missing, and installing it needs admin). The earlier VM FFmpeg blocker was a misread:
    the existing repository profile supports declared guest FFmpeg packages; see the queued-loop checkpoint.
 6. **One combined streaming-PC dry run (about 10 minutes, PC plugged in):** this serves both items 4 and 5. Get the
    GPU model and NVENC count (`nvidia-smi -q`). Check that OBS WebSocket on port 4455 is reachable from the devbox
    through the Windows firewall. Send one `GetSourceScreenshot` per second while streaming to a private target with
    all recordings on, and watch OBS Stats for "skipped frames due to encoding lag".
+   **2026-11-23:** GPU facts recorded and port 4455 confirmed reachable (auth is off). The streaming dry run
+   itself is still open (deferred by Andy).
 7. **Shared code to build once, not twice:**
    - A mapper from overlay-log wall-clock time to VOD offset. Live mode should use OBS `GetRecordStatus`
      `outputDuration`. Post-event mode uses the recording's file name, which is only accurate to the second and
      breaks if the recording was paused.
    - `obs_client.py` opens and authenticates a new WebSocket for every request. Add a persistent connection before
      polling once a second.
-8. **Cleanup:** once Andy confirms, delete the PC's backup branch and stash. Later, fold the WIP branch into
+8. **Cleanup:** once Andy confirms, delete the PC's backup branch and stash. **Done 2026-11-23** with Andy's OK. They were not strict
+   ancestors of the WIP branch, but every differing hunk is an older version of code the WIP branch has; both
+   were saved first to `C:\Users\KWTekken\tvh-jobs\pc-backups-20261123.bundle` (verified). Later, fold the WIP branch into
    `main`. GitHub `main` (`c7428d3`) is well behind.
 
 ## Don't

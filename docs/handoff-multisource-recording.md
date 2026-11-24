@@ -1,5 +1,44 @@
 # Handoff: record game, webcam and overlay separately, composite in post
 
+## Checkpoint — 2026-11-23 (streaming PC session, headless)
+
+Done without anyone at the PC. Production OBS settings unchanged (backup taken first:
+`C:\Users\KWTekken\tvh-jobs\obs-studio-backup-20261123-190955.zip`). Nothing was streamed.
+
+- **Long-run sync (B1).** 12 s stream-copy clips cut with `-copyts` at 4 s and 586 s from the 600 s
+  stream-and-separate-feeds run, so PTS stay on the original timeline. Script and results:
+  `build/work/obs-synthetic-stress-20261120/late-clips/check_early_late.py` and `early-late-clocks.json`.
+  Offset vs the main recording, early -> late: clean game +83.4 -> +83.4 ms; received stream +463.3 -> +463.5 ms;
+  camera +167 -> +117 ms. So main, clean game and stream hold a constant offset over ~10 minutes (all three share
+  a +33 ms common-mode shift against the synthetic source, which is the source's timing, not the outputs').
+  The camera feed (frame-rate divisor 2) moved **-50 ms**, about 1.5 of its frames, with ~34 ms marker spread
+  per clip. The compositor must re-anchor the camera periodically, or accept sub-2-frame lip-sync error per
+  10 minutes. Early offsets match the 2026-11-21 short-sample check.
+- **GPU (B3).** NVIDIA GeForce GTX 1660 Ti, Turing, 6 GB, driver 610.88 (CUDA 13.3), VBIOS 90.16.20.40.7b.
+  Idle: 0 active encoder sessions.
+- **WebSocket reachability (B2).** Production OBS WebSocket listens on 4455 with **authentication off**; TCP
+  4455 is reachable from the devbox (192.168.0.199) through the Windows firewall. No firewall change made.
+- **Real checkpoint collection (B2).** Production OBS launched in the console session via a one-shot schtasks
+  /IT task. A 3-minute local recording only (`C:\Users\KWTekken\Videos\2026-11-23 19-15-42.mkv`, 180.4 s),
+  started and stopped over WebSocket by a driver script; the collector itself only sent `GetRecordStatus`
+  (180 samples, 1 s interval, exit 0, `sample_limit_reached`). Four scoreboard changes were written through the
+  real `OverlayServer` history writer into a job folder (not the production history), 20/50/90/140 s after
+  StartRecord was sent. Evidence: `build/work/b2-checkpoints-20261123/`.
+  - `outputDuration` vs wall clock: rate 0.999999, residual max 18 ms (stdev 5 ms). The recording started
+    0.40 s after StartRecord was sent.
+  - Mapped score changes: 19.65 / 49.63 / 89.61 / 139.62 s, i.e. each wall time minus that 0.4 s start lag.
+    Consistent.
+  - Gap found: run without `--calibration-error-seconds`, the checkpoints carry no uncertainty and the mapper
+    returns `capture_clock_not_calibrated` for every event (no seconds at all). The numbers above come from a
+    re-map of a copy with a 0.05 s bound (`checkpoints-bound-0.05.json`, `mapped-bound-0.05.json`). For event
+    use, pass `--calibration-error-seconds 0.05` (or a measured bound) to the collector.
+  - Not covered: TVH itself was not running, so the overlay's appearance in OBS and a score change through
+    the app UI remain for the in-person smoke test.
+- **Deferred:** Source Record in production and the real-device dry run (B4). Andy noted streaming and
+  recording will sometimes happen together; the synthetic benchmark covered that (82.5% mean / 85% peak
+  encoder, 0 skips), but headroom is thin and B4 is the real test with the capture card, webcam and internet
+  upload.
+
 ## Checkpoint — 2026-11-21
 
 **The streaming PC can be powered down.** The synthetic OBS benchmark is complete. Required telemetry,
